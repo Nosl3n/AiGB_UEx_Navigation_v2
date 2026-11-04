@@ -1,0 +1,100 @@
+# plant_concept — the plants of the field as individuals: ONE `plant` node plant_<id> per plant, its parts (trunk,
+# canopy, ...) as ATTRIBUTES of it. Contract: active_inference/conceptos.md; model: src/specificworker.h.
+# Replaces trunk_concept + vegetation_concept (their [Trunk] / [Vegetation] sections live here now).
+
+[Proxies]
+# No required Ice interfaces (DSR is the comms plane).
+
+[Agent]
+id = 29   # MUST be unique across the shared graph: robot=6 controller=8 retina=9 human=13 residual=14 openfield=25
+          # vegetation=26 trunk=27 row=28. A collision = CRDT actor-id clash -> SIGSEGV.
+name = "plant_concept"
+configFile = ""
+domain = 0
+tree = false
+graph = false
+"2d" = false
+"3d" = false
+
+[Period]
+Compute = 50        # 20 Hz: drains retina's masks node and the helios plane
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+[Presence]
+required_agent_names = ["robot_concept", "retina"]
+optional_agent_names = ["openfield_concept", "human_concept", "residual_concept", "controller", "row_metaconcept"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 5000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+nodes = ["plant_concept 29", "plant_*"]
+
+[Trunk]   # the trunk part: ZED band proposal + helios confirmation (src/trunk_map.h)
+KeepoutRadiusM = 0.5      # the disc around a trunk the robot may not enter (2.5 m rows: leaves 0.75 m to the corridor
+                          # centre line) -> plant_keepout_radius_m
+PersonRadiusM = 0.4       # a person as an occluder of the camera's view
+# The trunk band: 'tree' pixels between the ground/beds and the first branch. MEASURED in husky_apple.wbt:
+# 93.5% of 'tree' points in 0.30-0.55 m lie within 0.12 m of a real trunk (99.2% within 0.25 m).
+BandZMinM = 0.30
+BandZMaxM = 0.55
+ClusterRadiusM = 0.15     # a trunk + its stake
+BirthMass = 8.0           # cell-frames of band evidence before the LiDAR is asked to confirm. ★PER REFERENCE LOOK,
+                          # like LlrHit/LlrMiss: each ZED look weighs min(1, time since the previous look /
+                          # LookPeriodMs), so the evidence per second does not depend on retina's semantic rate
+                          # (decimation 1, the model size, TensorRT). 530 ms = the ~1.9 looks/s these were tuned at.
+LookPeriodMs = 530
+LlrHit = 1.0              # log-odds per reference look the trunk is seen
+LlrMiss = -0.6            # ... per unoccluded in-view reference look it is not, before p_vis weighting
+LidarConfirmPoints = 3    # helios band returns on the candidate IN ONE SWEEP: the multimodal birth ...
+LidarConfirmDzM = 0.08    # ... spread over this much height (a trunk is vertical; ground noise grazing the band is not)
+AssocGateM = 0.25
+MinSeparationM = 0.75     # two trunks cannot stand closer (planting distance here 1.25 m). At 0.5 the tips of fruit-laden
+                          # low branches, which droop into the band ~0.6 m from their trunk, were born as trunks
+RemovalProb = 0.1         # removed once P(exists) < 0.1 — only from unoccluded, in-view looks
+ZedMaxRangeM = 4.0        # absence is charged only this close: a 7 cm trunk is ~7 px at 5 m, and the mask's 5 px
+                          # morphological opening (retina [Semantic].mask_morph_kernel) erases it beyond that
+ZedMinRangeM = 1.0        # ... and not closer: the band can fall below the image
+ZedHalfFovRad = 0.85
+TrunkLabels = ["tree", "palm"]                        # ADE20K classes that have a trunk
+LidarEvery = 2
+
+[Ablation]
+# Ablation switches. Both true = the normal model; leave them so.
+LidarConfirm = true       # false: a ZED (semantic) candidate becomes a trunk without the LiDAR confirming it
+VisibilityModel = true    # false: absence charged on every in-view look (no occlusion test, no range p_vis)
+
+[Canopy]  # the canopy part: vegetation evidence grid (src/vegetation_map.h)
+# Canopy radius seen from above. A tall-spindle apple tree in an intensive open-field orchard is ~1 m across
+# (typical value, to confirm against the orchard's own data), so 0.5 m. Every plant gets this radius: the
+# disc is "the space this plant occupies", the same role the person disc plays.
+RadiusM = 0.5
+# ADE20K-150 classes that are plants (any of them on a frame = the semantic model ran: a real look for the trunk) (retina [Semantic].accepted_labels publishes exactly these). Not grass or
+# field: low ground cover is drivable.
+Labels = ["tree", "plant", "palm", "flower"]
+CellM = 0.10          # evidence grid resolution
+ZMinM = 0.30          # drop vegetation points below this (mask bleed onto the soil and the 0.20 m beds)
+ZMaxM = 6.0
+# Evidence a disc must hold for a plant to be born, in cell-frames (one unit per cell per frame it was seen).
+# A disc is ~78 cells; one view lights 20-50 of them, so 150 asks for several views (~1-2 s of looking).
+# ★In REFERENCE looks: each frame weighs min(1, time since the previous one / LookPeriodMs), so the evidence per
+# second does not depend on retina's semantic rate (decimation, model size, TensorRT). 530 ms = the ~1.9 looks/s
+# BirthMass was tuned at.
+BirthMass = 150.0
+LookPeriodMs = 530
+
+[Plants]
+UpdatePeriodMs = 500        # model update + graph publication
+MasksStallTimeoutMs = 5000  # primary-input gate: no masks frame for this long -> Waiting

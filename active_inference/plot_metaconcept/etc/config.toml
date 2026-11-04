@@ -1,0 +1,47 @@
+# plot_metaconcept — the plots (parcelas) of the field (world -> field -> plot -> row -> plant) as `metaconcept` nodes
+# plot_<id>. See src/specificworker.h for the contract and common/vegetation/plots.h for the inference.
+
+[Proxies]
+# No required Ice interfaces (DSR is the comms plane).
+
+[Agent]
+id = 30   # MUST be unique across the shared graph: robot=6 controller=8 retina=9 human=13 residual=14 openfield=25
+          # vegetation=26 trunk=27 row=28 plant=29 plot=30 field=31. A collision = CRDT actor-id clash -> SIGSEGV.
+name = "plot_metaconcept"
+configFile = ""
+domain = 0
+tree = false
+graph = false
+"2d" = false
+"3d" = false
+
+[Period]
+Compute = 100
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+[Presence]
+required_agent_names = ["row_metaconcept"]
+optional_agent_names = ["openfield_concept", "field_metaconcept"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 5000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+nodes = ["plot_metaconcept 30", "plot_*"]
+
+[Plots]
+ParallelTolRad = 0.17   # rows of one plot share a direction up to this (~10 deg of planting error)
+SpacingFactor = 1.5     # a neighbour row up to this many planting spacings away is the same plot's next row
+UpdatePeriodMs = 1000

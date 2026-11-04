@@ -1,0 +1,494 @@
+{
+  "DSRModel": {
+    "symbols": {
+      "100": {
+        "id": "100",
+        "name": "root",
+        "type": "root",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "SeaGreen"
+          },
+          "level": {
+            "type": 1,
+            "value": 0
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 0.0
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 0.0
+          }
+        },
+        "links": [
+          {
+            "dst": "200",
+            "label": "RT",
+            "src": "100",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "200": {
+        "id": "200",
+        "name": "husky",
+        "type": "robot",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "Blue"
+          },
+          "level": {
+            "type": 1,
+            "value": 1
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 172.6
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 86.5
+          },
+          "parent": {
+            "type": 7,
+            "value": "100"
+          },
+          "path": {
+            "type": 0,
+            "value": "meshes/husky_a300.obj"
+          },
+          "robot_ref_adv_speed": {
+            "type": 2,
+            "value": 0
+          },
+          "robot_ref_rot_speed": {
+            "type": 2,
+            "value": 0
+          },
+          "robot_ref_side_speed": {
+            "type": 2,
+            "value": 0
+          }
+        },
+        "links": [
+          {
+            "dst": "250",
+            "label": "RT",
+            "src": "200",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              }
+            }
+          },
+          {
+            "dst": "260",
+            "label": "has",
+            "src": "200",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "250": {
+        "id": "250",
+        "name": "body",
+        "type": "body",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "SteelBlue"
+          },
+          "level": {
+            "type": 1,
+            "value": 2
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 150.3
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 155.0
+          },
+          "parent": {
+            "type": 7,
+            "value": "200"
+          },
+          "width_m": {
+            "type": 2,
+            "value": 0.686
+          },
+          "depth_m": {
+            "type": 2,
+            "value": 0.99
+          },
+          "height_m": {
+            "type": 2,
+            "value": 1.1
+          }
+        },
+        "links": [
+          {
+            "dst": "211",
+            "label": "RT",
+            "src": "250",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0.0,
+                  -0.25,
+                  0.95
+                ]
+              }
+            }
+          },
+          {
+            "dst": "220",
+            "label": "RT",
+            "src": "250",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  -0.2618,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0.0,
+                  0.42,
+                  0.55
+                ]
+              }
+            }
+          },
+          {
+            "dst": "230",
+            "label": "RT",
+            "src": "250",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0.0,
+                  0.0,
+                  0.2251
+                ]
+              }
+            }
+          },
+          {
+            "dst": "270",
+            "label": "RT",
+            "src": "250",
+            "linkAttribute": {
+              "rt_rotation_euler_xyz": {
+                "type": 3,
+                "value": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "rt_translation": {
+                "type": 3,
+                "value": [
+                  0.0,
+                  -0.25,
+                  1.02
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "220": {
+        "id": "220",
+        "name": "zed",
+        "type": "rgbd",
+        "attribute": {
+          "cam_depth": {
+            "type": 5,
+            "value": []
+          },
+          "cam_depthFactor": {
+            "type": 2,
+            "value": 1
+          },
+          "cam_depth_focalx": {
+            "type": 1,
+            "value": 448
+          },
+          "cam_depth_focaly": {
+            "type": 1,
+            "value": 448
+          },
+          "cam_depth_height": {
+            "type": 1,
+            "value": 720
+          },
+          "cam_depth_width": {
+            "type": 1,
+            "value": 1280
+          },
+          "cam_fov": {
+            "type": 2,
+            "value": 1.9198
+          },
+          "cam_rgb": {
+            "type": 5,
+            "value": []
+          },
+          "cam_rgb_alivetime": {
+            "type": 7,
+            "value": "1779219459051"
+          },
+          "cam_rgb_cameraID": {
+            "type": 1,
+            "value": 0
+          },
+          "cam_rgb_depth": {
+            "type": 1,
+            "value": 3
+          },
+          "cam_rgb_focalx": {
+            "type": 1,
+            "value": 448
+          },
+          "cam_rgb_focaly": {
+            "type": 1,
+            "value": 448
+          },
+          "cam_rgb_height": {
+            "type": 1,
+            "value": 720
+          },
+          "cam_rgb_width": {
+            "type": 1,
+            "value": 1280
+          },
+          "color": {
+            "type": 0,
+            "value": "Orange"
+          },
+          "level": {
+            "type": 1,
+            "value": 3
+          },
+          "parent": {
+            "type": 7,
+            "value": "250"
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 128.099014
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 223.428207
+          }
+        },
+        "links": []
+      },
+      "230": {
+        "id": "230",
+        "name": "imu",
+        "type": "imu",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "Plum"
+          },
+          "level": {
+            "type": 1,
+            "value": 3
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 28.6
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 86.5
+          },
+          "parent": {
+            "type": 7,
+            "value": "250"
+          }
+        },
+        "links": []
+      },
+      "211": {
+        "id": "211",
+        "name": "helios",
+        "type": "laser",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "Orange"
+          },
+          "laser_X": {
+            "type": 3,
+            "value": []
+          },
+          "laser_Y": {
+            "type": 3,
+            "value": []
+          },
+          "laser_Z": {
+            "type": 3,
+            "value": []
+          },
+          "laser_timestamp": {
+            "type": 7,
+            "value": "1779219459141"
+          },
+          "level": {
+            "type": 1,
+            "value": 3
+          },
+          "parent": {
+            "type": 7,
+            "value": "250"
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 289.1
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 225.0
+          }
+        },
+        "links": []
+      },
+      "270": {
+        "id": "270",
+        "name": "gps",
+        "type": "gps",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "Gold"
+          },
+          "level": {
+            "type": 1,
+            "value": 3
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 230.0
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 225.0
+          },
+          "parent": {
+            "type": 7,
+            "value": "250"
+          }
+        },
+        "links": []
+      },
+      "260": {
+        "id": "260",
+        "name": "mind",
+        "type": "mind",
+        "attribute": {
+          "color": {
+            "type": 0,
+            "value": "Pink"
+          },
+          "level": {
+            "type": 1,
+            "value": 2
+          },
+          "pos_x": {
+            "type": 2,
+            "value": 60.0
+          },
+          "pos_y": {
+            "type": 2,
+            "value": 150.0
+          },
+          "parent": {
+            "type": 7,
+            "value": "200"
+          }
+        },
+        "links": []
+      }
+    }
+  }
+}

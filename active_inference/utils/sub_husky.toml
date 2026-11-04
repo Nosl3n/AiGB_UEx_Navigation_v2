@@ -1,0 +1,45 @@
+# Sensorimotor layer for the Husky A300 in the apple orchard.
+#   python3 subcognitive.py sub_husky.toml
+# The launcher starts Webots with no world argument: open webots-agri/worlds/husky_apple.wbt in it
+# (../../apple.bash does it for you). The robot's DEF must be "husky" (bridge Robot.Def).
+#
+# The Husky carries the helios LiDAR, the ZED, the IMU and a GPS served by the bridge itself
+# (Endpoints.GPS = 10009, interface RoboCompGPS).
+#
+# Every cwd points INSIDE this repo (~/robocomp/AiGB_UEx_Navigation_v2), not to ~/robocomp/components
+# like sub_shadow.toml does. Each component needs its bin/ built in place first
+# (cmake -B build && make -C build).
+
+[[components]]
+name = "bridge"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/webots-bridge"
+cmd = "bin/Webots2Robocomp etc/config_husky"
+ice_name = "Webots2Robocomp:tcp -h localhost -p 10006"
+
+[[components]]
+name = "helios"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/robocomp-robolab/components/hardware/laser/lidar3d_dds"
+# OMP_WAIT_POLICY=PASSIVE: without it libgomp's idle workers busy-wait between scans (~12 cores at 17 Hz,
+# measured 2026-10-01). It is read when the library loads, so it can only come from the environment.
+cmd = "env OMP_WAIT_POLICY=PASSIVE bin/lidar3d_dds etc/config_helios_husky_webots.toml"
+ice_name = "Lidar3D:tcp -h localhost -p 11990"
+
+# Bridges the Webots IMU (bridge's Endpoints.IMU = 10007) onto the DDS media plane
+# (domain 7, rc/imu/data). On the Husky the orientation comes from the proto's InertialUnit.
+[[components]]
+name = "imu"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/robocomp-robolab/components/hardware/imu/imu_dds"
+cmd = "bin/imu_dds etc/config.toml"
+ice_name = "mediaplanedds:tcp -h localhost -p 11891"
+
+[[components]]
+name = "zed"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/robocomp-robolab/components/hardware/camera/zed_camera"
+cmd = "bin/zed_camera etc/configHuskyWebot.toml"
+ice_name = "Zed:tcp -h localhost -p 12001"
+
+[[components]]
+name = "joy"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/robocomp-robolab/components/hardware/external_control/python_xbox_controller"
+cmd = "bin/python_xbox_controller etc/config_husky"
+# No ice_name: the joystick only PUBLISHES (IceStorm topic JoystickAdapter), it serves no endpoint to ping.

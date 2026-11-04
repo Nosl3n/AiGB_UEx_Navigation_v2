@@ -1,0 +1,11 @@
+
+Component retina
+{
+    Communications
+    {
+    };
+    language Cpp11;
+    options dsr;
+
+};
+

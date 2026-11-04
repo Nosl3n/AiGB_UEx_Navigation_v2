@@ -1,0 +1,37 @@
+# Xbox controller -> Webots2Robocomp (Husky A300). Derived from config_shadow, with two fixes:
+#   * TopicManager on 9999, the rcnode/IceStorm the bridge uses (config_shadow pointed to 1237, where
+#     no IceStorm listens here -- in a Webots session that port is Webots' own extern-controller port).
+#   * No "side" axis: a skid-steer cannot strafe (the bridge would drop it anyway).
+
+# This property is used by the clients to connect to IceStorm.
+Proxies.TopicManager = "IceStorm/TopicManager:default -p 9999"
+
+# Proxies for publishes interfaces
+Proxies.JoystickAdapterPrefix = ""
+
+Period.Compute = 16
+Period.Emergency = 500
+
+# Joystick device and axis/button mapping (parsed by SpecificWorker)
+# Xbox Series X|S under pygame: 0 LX, 1 LY, 2 LT, 3 RX, 4 RY, 5 RT (checked 2026-09-30).
+# Units as the bridge expects them: advance in mm/s, rotate in rad/s.
+# Husky A300 tops out at ~2 m/s; 1000 mm/s is a safer teleop ceiling.
+joystickUniversal.Device = "/dev/input/js0"
+joystickUniversal.NumAxes = 2
+#                          name     axis  min    max   inverted  dead_zone
+joystickUniversal.Axis_0 = "advance, 1, -1000, 1000, true, 0.1"
+# Rotate on the RIGHT stick's horizontal axis (3), advance on the left stick: two-stick driving, so
+# a straight run is not disturbed by sideways drift of the left stick. (Axis 0, the left stick's
+# horizontal, is unused: config_shadow had "side" there, and a skid-steer cannot strafe.)
+joystickUniversal.Axis_1 = "rotate,  3,   -1,    1,  true, 0.1"
+
+joystickUniversal.NumButtons = 3
+#                            name              button  step
+joystickUniversal.Button_0 = "block,            1, 1"
+joystickUniversal.Button_1 = "stop,             3, 1"
+joystickUniversal.Button_2 = "joystick_control, 2, 1"
+
+Ice.Warn.Connections = "0"
+Ice.Trace.Network = "0"
+Ice.Trace.Protocol = "0"
+Ice.MessageSizeMax = "20004800"

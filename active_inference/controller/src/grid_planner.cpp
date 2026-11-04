@@ -1,0 +1,1125 @@
+/*
+ * grid_planner.cpp — see grid_planner.h
+ */
+
+#include "grid_planner.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <format>
+#include <istream>
+#include <set>
+#include <limits>
+#include <ostream>
+#include <queue>
+
+namespace rc
+{
+
+namespace
+{
+bool point_in_polygon(const std::vector<Eigen::Vector2f>& poly, const Eigen::Vector2f& p)
+{
+    bool inside = false;
+    const std::size_t n = poly.size();
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+        if (((poly[i].y() > p.y()) != (poly[j].y() > p.y())) and
+            (p.x() < (poly[j].x() - poly[i].x()) * (p.y() - poly[i].y()) / (poly[j].y() - poly[i].y()) + poly[i].x()))
+            inside = not inside;
+    return inside;
+}
+}  // namespace
+
+void GridPlanner::rebuild_offsets()
+{
+    // Only recompute when the geometry that determines coverage actually changed — this is per-heading
+    // rasterisation of the footprint and it would otherwise dominate a per-cycle rebuild.
+    if (offsets_.size() == kHeadings and std::abs(offsets_cell_ - cell_) < 1e-6f
+        and std::abs(offsets_margin_ - params.safety_margin_m) < 1e-6f)
+        return;
+    footprint.set_safety_margin(params.safety_margin_m);
+    offsets_.assign(kHeadings, {});
+    offsets_legacy_.assign(kHeadings, {});
+    for (int h = 0; h < kHeadings; ++h)
+    {
+        // ── HEADING INDEX h IS A YAW, AND THE FOOTPRINT'S OWN THETA IS NOT ───────────────────────
+        // h means "travelling in direction (DX[h], DY[h])", i.e. a room YAW: forward = +x at h = 0.
+        // Every caller agrees — pose_free is handed target.yaw_rad and robot theta + pi/2, and plan()'s
+        // move table is (cos, sin) of this same angle. RobotFootprint's theta is a DIFFERENT quantity:
+        // its forward axis is +y, so a yaw becomes a footprint theta only after a quarter turn. That is
+        // the entire reason support_radius_yaw() exists, and this line is where it was missing.
+        // ★WHAT IT COST. The body is 0.2716 m half-width laterally and 0.2300 m half-length. Rotated
+        // 90 deg from its direction of travel, the planner modelled it 4.2 cm too NARROW across the
+        // track — where a corridor closes — and 4.2 cm too LONG along it, where a standoff or a pocket
+        // does. At the configured 0.05 m margin that left 8.4 mm of genuine standoff sideways instead
+        // of 50, which is the difference between a comfortable pass and a scrape. Silent, because the
+        // hull is nearly symmetric and nothing ever throws.
+        const float yaw = 2.0f * static_cast<float>(M_PI) * h / kHeadings;
+        offsets_[h] = footprint.cell_offsets_yaw(cell_, yaw);
+        // MIGRATION MONITOR — see orientation_census() / pose_free_legacy(). The pre-correction
+        // rasterisation, kept ONLY so the change can be measured against the world the robot is
+        // actually in rather than argued about. Delete both, and the census, once it is trusted.
+        offsets_legacy_[h] = footprint.cell_offsets(cell_, yaw);
+    }
+    offsets_cell_ = cell_;
+    offsets_margin_ = params.safety_margin_m;
+}
+
+bool GridPlanner::cell_free_legacy(int ix, int iy, int h) const
+{ return cell_free_in(offsets_legacy_, ix, iy, h); }
+
+int GridPlanner::heading_bucket(float yaw) const
+{
+    const float two_pi = 2.0f * static_cast<float>(M_PI);
+    float t = std::fmod(yaw, two_pi);
+    if (t < 0) t += two_pi;
+    return static_cast<int>(std::lround(t / two_pi * kHeadings)) % kHeadings;
+}
+
+bool GridPlanner::pose_free_legacy(const Eigen::Vector2f& pos_world, float yaw) const
+{
+    int ix, iy;
+    if (not world_to_cell(pos_world, ix, iy)) return false;
+    const_cast<GridPlanner*>(this)->rebuild_offsets();
+    return cell_free_legacy(ix, iy, heading_bucket(yaw));
+}
+
+GridPlanner::OrientationCensus GridPlanner::orientation_census() const
+{
+    OrientationCensus c;
+    if (w_ <= 0 or h_ <= 0) return c;
+    const_cast<GridPlanner*>(this)->rebuild_offsets();
+    if (offsets_.size() != kHeadings or offsets_legacy_.size() != kHeadings) return c;
+    for (int iy = 0; iy < h_; ++iy)
+        for (int ix = 0; ix < w_; ++ix)
+            for (int hh = 0; hh < kHeadings; ++hh)
+            {
+                ++c.states;
+                const bool now = cell_free(ix, iy, hh);
+                const bool was = cell_free_legacy(ix, iy, hh);
+                c.free_now += now;
+                c.free_legacy += was;
+                c.lost += (was and not now);
+                c.gained += (now and not was);
+            }
+    return c;
+}
+
+void GridPlanner::set_world(const std::vector<Eigen::Vector2f>& world_polygon,
+                            const std::vector<std::vector<Eigen::Vector2f>>& obstacles,
+                            const OccupiedCells& cells)
+{
+    cell_ = std::max(0.02f, params.cell_size_m);
+    dist_valid_ = false;          // the world changed; any cached distance field describes the old one
+    if (world_polygon.size() < 3) { w_ = h_ = 0; occ_.clear(); dist_.clear(); return; }
+
+    float xmn = world_polygon[0].x(), xmx = xmn, ymn = world_polygon[0].y(), ymx = ymn;
+    for (const auto& p : world_polygon)
+    { xmn = std::min(xmn, p.x()); xmx = std::max(xmx, p.x()); ymn = std::min(ymn, p.y()); ymx = std::max(ymx, p.y()); }
+    // A margin of one circumscribed radius so the footprint of a robot near the boundary is representable.
+    const float pad = footprint.circumscribed_radius() + params.safety_margin_m + cell_;
+    xmin_ = xmn - pad; ymin_ = ymn - pad;
+    w_ = std::max(1, static_cast<int>(std::ceil((xmx + pad - xmin_) / cell_)));
+    h_ = std::max(1, static_cast<int>(std::ceil((ymx + pad - ymin_) / cell_)));
+    occ_.assign(static_cast<std::size_t>(w_) * h_, 0);
+    last_obstacle_count_ = static_cast<int>(obstacles.size());
+
+    // OUTSIDE the room is occupied. Walls therefore need no separate representation and cannot be
+    // accidentally omitted — a cell is free only if it is positively inside the room polygon.
+    //
+    // ...UNLESS the polygon turns out to be unusable, in which case this single input would brick the whole
+    // planner: every cell reads "outside", every goal is infeasible, and the robot never moves again. That is
+    // exactly what was observed live — 27018 of 27018 cells occupied — while the same code on a known-good
+    // polygon marks ~39%. A planner must not be one bad input away from total failure, so the room mask is
+    // applied only if it leaves a plausible amount of free space; otherwise it is DISCARDED and planning
+    // continues on the obstacle set alone. That is strictly better than refusing to move: obstacles still
+    // block, the robot is merely no longer confined by a boundary we cannot trust. It is loud about it,
+    // because navigating without a room boundary is a degraded mode, not a normal one.
+    long outside = 0;
+    for (int iy = 0; iy < h_; ++iy)
+        for (int ix = 0; ix < w_; ++ix)
+            if (not point_in_polygon(world_polygon, cell_to_world(ix, iy)))
+                { occ_[idx(ix, iy)] = 1; ++outside; }
+    world_mask_usable_ = outside < static_cast<long>(0.95 * w_ * h_);
+    if (not world_mask_usable_)
+    {
+        std::fill(occ_.begin(), occ_.end(), 0);          // discard it; obstacles are re-applied below
+        static int rc = 0;
+        if ((rc++ % 50) == 0)
+            std::printf("[grid-world] ROOM POLYGON UNUSABLE — %zu verts, bbox x[%.2f,%.2f] y[%.2f,%.2f] marks "
+                        "%ld/%d cells (%.0f%%) as outside. Discarding it and planning on obstacles only "
+                        "(DEGRADED: no room boundary). Check delimiting_polygon_x/y on the room node.\n",
+                        world_polygon.size(), xmn, xmx, ymn, ymx, outside, w_ * h_,
+                        100.0 * outside / std::max(1, w_ * h_));
+        std::fflush(stdout);
+    }
+
+    // Obstacles at TRUE extent — no inflation anywhere. Rasterised over each polygon's bbox; a cell counts as
+    // occupied if its centre is inside. Sub-cell slivers are missed by design at this resolution, which is why
+    // the safety margin exists and why it is ONE number rather than a per-stage guess.
+    for (const auto& poly : obstacles)
+    {
+        if (poly.size() < 3) continue;
+        float pxn = poly[0].x(), pxx = pxn, pyn = poly[0].y(), pyx = pyn;
+        for (const auto& p : poly)
+        { pxn = std::min(pxn, p.x()); pxx = std::max(pxx, p.x()); pyn = std::min(pyn, p.y()); pyx = std::max(pyx, p.y()); }
+        int ix0, iy0, ix1, iy1;
+        world_to_cell({pxn, pyn}, ix0, iy0);
+        world_to_cell({pxx, pyx}, ix1, iy1);
+        for (int iy = std::max(0, iy0); iy <= std::min(h_ - 1, iy1); ++iy)
+            for (int ix = std::max(0, ix0); ix <= std::min(w_ - 1, ix1); ++ix)
+                if (not occ_[idx(ix, iy)] and point_in_polygon(poly, cell_to_world(ix, iy)))
+                    occ_[idx(ix, iy)] = 1;
+    }
+    // ── RESIDUAL'S OCCUPANCY, MARKED DIRECTLY ────────────────────────────────────────────────────
+    // One cell of residual covers a square of its own resolution; mark every planner cell that square
+    // touches. Rounding is OUTWARD (a planner cell is marked if the squares overlap at all), which is
+    // the conservative direction for an obstacle and keeps this exact at any pair of resolutions.
+    if (cells.cell_size_m > 0.f and not cells.centres.empty())
+    {
+        const float h = 0.5f * cells.cell_size_m;
+        for (const auto& c : cells.centres)
+        {
+            int ix0, iy0, ix1, iy1;
+            world_to_cell({c.x() - h, c.y() - h}, ix0, iy0);
+            world_to_cell({c.x() + h, c.y() + h}, ix1, iy1);
+            for (int iy = std::max(0, iy0); iy <= std::min(h_ - 1, iy1); ++iy)
+                for (int ix = std::max(0, ix0); ix <= std::min(w_ - 1, ix1); ++ix)
+                    occ_[idx(ix, iy)] = 1;
+        }
+    }
+    rebuild_offsets();
+
+    // ── THE MAP'S IDENTITY ───────────────────────────────────────────────────────────────────────
+    // A verdict read off this grid — "the body does not fit there", "there is no route from here" —
+    // is a function of the grid, the pose it was asked from, and the cell. It stays true until the
+    // GRID changes, which is what this identifies. Cheap: one pass over the occupancy the rasteriser
+    // has just written, FNV-1a, no allocation. Without it a caller has no way to know whether the
+    // answer it remembers describes the world in front of it or one two seconds stale.
+    std::size_t h = 1469598103934665603ull;
+    for (const auto v : occ_) { h ^= static_cast<std::size_t>(v); h *= 1099511628211ull; }
+    h ^= static_cast<std::size_t>(w_) * 73856093ull;
+    h ^= static_cast<std::size_t>(h_) * 19349663ull;
+    world_hash_ = h;
+}
+
+bool GridPlanner::world_to_cell(const Eigen::Vector2f& p, int& ix, int& iy) const
+{
+    ix = static_cast<int>(std::floor((p.x() - xmin_) / cell_));
+    iy = static_cast<int>(std::floor((p.y() - ymin_) / cell_));
+    return in_bounds(ix, iy);
+}
+
+Eigen::Vector2f GridPlanner::cell_to_world(int ix, int iy) const
+{
+    return {xmin_ + (static_cast<float>(ix) + 0.5f) * cell_, ymin_ + (static_cast<float>(iy) + 0.5f) * cell_};
+}
+
+long GridPlanner::occupied_cells() const
+{
+    long n = 0;
+    for (const auto v : occ_) n += v;
+    return n;
+}
+
+// ── Snapshot ─────────────────────────────────────────────────────────────────────────────────────
+// One row of '0'/'1' per grid row, preceded by everything needed to place it in the room frame. Text
+// rather than binary: a world snapshot is something a person reads and greps while working out why a
+// route came out the way it did, and 30k cells cost nothing.
+void GridPlanner::write_grid(std::ostream& os) const
+{
+    os << "grid " << cell_ << ' ' << xmin_ << ' ' << ymin_ << ' ' << w_ << ' ' << h_ << ' '
+       << params.safety_margin_m << ' ' << (world_mask_usable_ ? 1 : 0) << '\n';
+    os << "occ\n";
+    std::string row(static_cast<std::size_t>(std::max(0, w_)), '0');
+    for (int iy = 0; iy < h_; ++iy)
+    {
+        for (int ix = 0; ix < w_; ++ix) row[ix] = occ_[idx(ix, iy)] ? '1' : '0';
+        os << row << '\n';
+    }
+}
+
+bool GridPlanner::read_grid(std::istream& is)
+{
+    w_ = h_ = 0; occ_.clear(); dist_.clear(); dist_valid_ = false;
+    std::string tok;
+    while (is >> tok and tok != "grid") is.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    if (tok != "grid") return false;
+    int usable = 1;
+    if (not (is >> cell_ >> xmin_ >> ymin_ >> w_ >> h_ >> params.safety_margin_m >> usable)) return false;
+    if (w_ <= 0 or h_ <= 0 or cell_ <= 0.f) { w_ = h_ = 0; return false; }
+    world_mask_usable_ = usable != 0;
+    params.cell_size_m = cell_;
+    while (is >> tok and tok != "occ") {}
+    if (tok != "occ") { w_ = h_ = 0; return false; }
+    occ_.assign(static_cast<std::size_t>(w_) * h_, 0);
+    for (int iy = 0; iy < h_; ++iy)
+    {
+        std::string row;
+        if (not (is >> row) or static_cast<int>(row.size()) != w_) { w_ = h_ = 0; occ_.clear(); return false; }
+        for (int ix = 0; ix < w_; ++ix) occ_[idx(ix, iy)] = row[ix] == '1' ? 1 : 0;
+    }
+    // The footprint rasterisation depends on cell size and margin, both of which just changed.
+    offsets_.clear();
+    rebuild_offsets();
+    return true;
+}
+
+// ── Exact Euclidean distance transform (Felzenszwalb & Huttenlocher) ──────────────────────────────
+// Two O(n) passes of a 1-D squared-distance transform — down the columns, then across the rows —
+// give the EXACT squared distance to the nearest occupied cell. The 1-D transform works by finding
+// the lower envelope of the parabolas rooted at each sample; `v` holds the parabolas currently on
+// the envelope and `z` the boundaries between them.
+namespace
+{
+void dt_1d(const std::vector<float>& f, std::vector<float>& d, int n,
+           std::vector<int>& v, std::vector<float>& z)
+{
+    constexpr float kInf = std::numeric_limits<float>::max();
+    int k = 0;
+    v[0] = 0;
+    z[0] = -kInf;
+    z[1] = kInf;
+    for (int q = 1; q < n; ++q)
+    {
+        const auto sq = [](float a) { return a * a; };
+        float s = ((f[q] + sq(static_cast<float>(q))) - (f[v[k]] + sq(static_cast<float>(v[k]))))
+                / (2.f * static_cast<float>(q) - 2.f * static_cast<float>(v[k]));
+        while (k > 0 and s <= z[k])
+        {
+            --k;
+            s = ((f[q] + sq(static_cast<float>(q))) - (f[v[k]] + sq(static_cast<float>(v[k]))))
+              / (2.f * static_cast<float>(q) - 2.f * static_cast<float>(v[k]));
+        }
+        ++k;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = kInf;
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q)
+    {
+        while (z[k + 1] < static_cast<float>(q)) ++k;
+        const float dq = static_cast<float>(q - v[k]);
+        d[q] = dq * dq + f[v[k]];
+    }
+}
+}  // namespace
+
+void GridPlanner::build_distance_field() const
+{
+    if (dist_valid_) return;
+    if (w_ <= 0 or h_ <= 0) { dist_.clear(); dist_valid_ = true; return; }
+
+    constexpr float kInf = std::numeric_limits<float>::max();
+    const std::size_t n = static_cast<std::size_t>(w_) * static_cast<std::size_t>(h_);
+    std::vector<float> g(n);
+    for (std::size_t i = 0; i < n; ++i) g[i] = occ_[i] ? 0.f : kInf;
+
+    const int maxdim = std::max(w_, h_);
+    std::vector<float> f(maxdim), d(maxdim), z(maxdim + 1);
+    std::vector<int> v(maxdim);
+
+    for (int ix = 0; ix < w_; ++ix)                       // columns
+    {
+        for (int iy = 0; iy < h_; ++iy) f[iy] = g[idx(ix, iy)];
+        dt_1d(f, d, h_, v, z);
+        for (int iy = 0; iy < h_; ++iy) g[idx(ix, iy)] = d[iy];
+    }
+    for (int iy = 0; iy < h_; ++iy)                       // rows
+    {
+        for (int ix = 0; ix < w_; ++ix) f[ix] = g[idx(ix, iy)];
+        dt_1d(f, d, w_, v, z);
+        for (int ix = 0; ix < w_; ++ix) g[idx(ix, iy)] = d[ix];
+    }
+
+    dist_.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+        dist_[i] = (g[i] >= kInf) ? 1e6f : std::sqrt(g[i]) * cell_;   // cells -> metres
+    dist_valid_ = true;
+}
+
+float GridPlanner::distance_at(const Eigen::Vector2f& pos_world) const
+{
+    if (w_ <= 0 or h_ <= 0) return 1e6f;      // no world: wide open, never a spurious obstacle
+    build_distance_field();
+    if (dist_.empty()) return 1e6f;
+
+    // Bilinear interpolation on cell CENTRES, so the field is continuous rather than blocky.
+    const float fx = (pos_world.x() - xmin_) / cell_ - 0.5f;
+    const float fy = (pos_world.y() - ymin_) / cell_ - 0.5f;
+    const int ix = static_cast<int>(std::floor(fx));
+    const int iy = static_cast<int>(std::floor(fy));
+    const float tx = fx - static_cast<float>(ix);
+    const float ty = fy - static_cast<float>(iy);
+    // Outside the grid is outside the room, which set_world already marked occupied — so clamping to the
+    // border reports the border cell's distance rather than inventing free space beyond the world.
+    const auto at = [this](int cx, int cy)
+    {
+        return dist_[idx(std::clamp(cx, 0, w_ - 1), std::clamp(cy, 0, h_ - 1))];
+    };
+    const float d00 = at(ix, iy),     d10 = at(ix + 1, iy);
+    const float d01 = at(ix, iy + 1), d11 = at(ix + 1, iy + 1);
+    return (1.f - tx) * (1.f - ty) * d00 + tx * (1.f - ty) * d10
+         + (1.f - tx) * ty * d01 + tx * ty * d11;
+}
+
+Eigen::Vector2f GridPlanner::distance_gradient_at(const Eigen::Vector2f& pos_world, float fd_cells) const
+{
+    const float e = std::max(0.25f, fd_cells) * cell_;
+    const float dx = distance_at({pos_world.x() + e, pos_world.y()}) - distance_at({pos_world.x() - e, pos_world.y()});
+    const float dy = distance_at({pos_world.x(), pos_world.y() + e}) - distance_at({pos_world.x(), pos_world.y() - e});
+    return {dx / (2.f * e), dy / (2.f * e)};
+}
+
+bool GridPlanner::cell_free_in(const std::vector<std::vector<Eigen::Vector2i>>& offsets,
+                              int ix, int iy, int h) const
+{
+    if (offsets.size() != kHeadings) return false;
+    for (const auto& o : offsets[h])
+    {
+        const int nx = ix + o.x(), ny = iy + o.y();
+        if (not in_bounds(nx, ny)) return false;      // footprint off the map == unsafe
+        if (occ_[idx(nx, ny)]) return false;
+    }
+    return true;
+}
+
+bool GridPlanner::cell_free(int ix, int iy, int h) const { return cell_free_in(offsets_, ix, iy, h); }
+
+bool GridPlanner::cell_free_at(const Eigen::Vector2f& pos_world, int heading_index) const
+{
+    int ix, iy;
+    if (not world_to_cell(pos_world, ix, iy)) return false;
+    const_cast<GridPlanner*>(this)->rebuild_offsets();
+    return cell_free(ix, iy, heading_index);
+}
+
+bool GridPlanner::pose_free(const Eigen::Vector2f& pos_world, float theta) const
+{
+    int ix, iy;
+    if (not world_to_cell(pos_world, ix, iy)) return false;
+    return cell_free(ix, iy, heading_bucket(theta));
+}
+
+float GridPlanner::pose_clearance(const Eigen::Vector2f& pos_world, float theta) const
+{
+    int ix, iy;
+    if (not world_to_cell(pos_world, ix, iy)) return 0.f;
+    const_cast<GridPlanner*>(this)->rebuild_offsets();
+    const_cast<GridPlanner*>(this)->build_distance_field();
+    if (offsets_.size() != kHeadings or dist_.empty()) return 0.f;
+    const int h = heading_bucket(theta);
+    float worst = std::numeric_limits<float>::max();
+    for (const auto& o : offsets_[h])
+    {
+        const int nx = ix + o.x(), ny = iy + o.y();
+        if (not in_bounds(nx, ny)) return 0.f;   // off the map counts as touching, same as cell_free
+        worst = std::min(worst, dist_[idx(nx, ny)]);
+    }
+    return worst == std::numeric_limits<float>::max() ? 0.f : worst;
+}
+
+GridPlanner::RotationSweep GridPlanner::rotation_sweep(const Eigen::Vector2f& pos_world,
+                                                      float theta_from, float theta_to) const
+{
+    // The SHORT way round, because that is the arc the alignment controller actually drives
+    // (yaw_err = wrap_pi(desired - current), and it servos that to zero).
+    const float two_pi = 2.0f * static_cast<float>(M_PI);
+    float sweep = std::remainder(theta_to - theta_from, two_pi);
+    // Sample finely enough that no planner heading bucket can be skipped, plus both endpoints exactly.
+    const int n = std::max(2, static_cast<int>(std::ceil(std::abs(sweep) / (two_pi / (4 * kHeadings)))));
+    RotationSweep r;
+    r.min_clearance_m = std::numeric_limits<float>::max();
+    r.feasible = true;
+    for (int i = 0; i <= n; ++i)
+    {
+        const float th = theta_from + sweep * (static_cast<float>(i) / static_cast<float>(n));
+        if (not pose_free(pos_world, th)) r.feasible = false;
+        if (const float c = pose_clearance(pos_world, th); c < r.min_clearance_m)
+        { r.min_clearance_m = c; r.worst_heading_rad = th; }
+    }
+    if (r.min_clearance_m == std::numeric_limits<float>::max()) r.min_clearance_m = 0.f;
+    return r;
+}
+
+std::optional<Eigen::Vector2f> GridPlanner::nearest_free(const Eigen::Vector2f& pos_world, float theta,
+                                                         float max_radius_m) const
+{
+    return nearest_free_where(pos_world, theta, {}, max_radius_m);
+}
+
+std::optional<Eigen::Vector2f> GridPlanner::nearest_free_where(
+    const Eigen::Vector2f& pos_world, float theta,
+    const std::function<bool(const Eigen::Vector2f&)>& admissible, float max_radius_m) const
+{
+    const auto ok = [&](const Eigen::Vector2f& w)
+    { return pose_free(w, theta) and (not admissible or admissible(w)); };
+
+    if (ok(pos_world)) return pos_world;
+    const int max_r = static_cast<int>(std::ceil(max_radius_m / cell_));
+    int cx, cy;
+    world_to_cell(pos_world, cx, cy);
+    // Expanding ring search on the same predicate the planner uses, so a repaired pose is feasible by
+    // construction — the old repair used its own clearance number and could return a pose the controller
+    // then refused, leaving the robot hunting at a goal it was never allowed to reach.
+    for (int r = 1; r <= max_r; ++r)
+    {
+        std::optional<Eigen::Vector2f> best;
+        float best_d2 = std::numeric_limits<float>::max();
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx)
+            {
+                if (std::max(std::abs(dx), std::abs(dy)) != r) continue;   // ring only
+                const int nx = cx + dx, ny = cy + dy;
+                if (not in_bounds(nx, ny)) continue;
+                const auto w = cell_to_world(nx, ny);
+                if (not ok(w)) continue;
+                const float d2 = (w - pos_world).squaredNorm();
+                if (d2 < best_d2) { best_d2 = d2; best = w; }
+            }
+        if (best.has_value()) return best;
+    }
+    return std::nullopt;
+}
+
+bool GridPlanner::can_turn_here(const Eigen::Vector2f& pos_world) const
+{
+    for (int h = 0; h < kHeadings; ++h)
+        if (not cell_free_at(pos_world, h)) return false;
+    return true;
+}
+
+GridPlanner::TurnBlock GridPlanner::why_cannot_turn(const Eigen::Vector2f& pos_world) const
+{
+    TurnBlock b;
+    int ix, iy;
+    if (not world_to_cell(pos_world, ix, iy)) { b.blocked = true; b.off_map = true; return b; }
+    const_cast<GridPlanner*>(this)->rebuild_offsets();
+    if (offsets_.size() != kHeadings) { b.blocked = true; return b; }
+
+    float best = std::numeric_limits<float>::max();
+    // A cell can sit under several headings' footprints; count it once so "cells_blocked" reads as the
+    // size of the obstruction and not as how thoroughly we looked at it.
+    std::set<std::pair<int, int>> seen;
+    for (int h = 0; h < kHeadings; ++h)
+    {
+        bool this_heading = false;
+        for (const auto& o : offsets_[h])
+        {
+            const int nx = ix + o.x(), ny = iy + o.y();
+            if (not in_bounds(nx, ny)) { this_heading = true; b.off_map = true; continue; }
+            if (not occ_[idx(nx, ny)]) continue;
+            this_heading = true;
+            seen.insert({nx, ny});
+            const auto w = cell_to_world(nx, ny);
+            if (const float d = (w - pos_world).norm(); d < best)
+            {
+                best = d;
+                b.nearest_cell = w;
+                b.nearest_m = d;
+                b.nearest_bearing_deg = std::atan2(w.y() - pos_world.y(), w.x() - pos_world.x())
+                                      * 180.f / static_cast<float>(M_PI);
+            }
+        }
+        if (this_heading) ++b.headings_blocked;
+    }
+    b.cells_blocked = static_cast<int>(seen.size());
+    b.blocked = b.headings_blocked > 0;
+    return b;
+}
+
+std::optional<Eigen::Vector2f> GridPlanner::nearest_rotatable(const Eigen::Vector2f& pos_world,
+                                                              float max_radius_m) const
+{
+    const auto turnable = [&](const Eigen::Vector2f& w) { return can_turn_here(w); };
+    // Best on the ORIGINAL spot still wins: never move a target that is already fine.
+    if (turnable(pos_world)) return pos_world;
+
+    const int max_r = static_cast<int>(std::ceil(max_radius_m / cell_));
+    int cx, cy;
+    if (not world_to_cell(pos_world, cx, cy)) return std::nullopt;
+    for (int r = 1; r <= max_r; ++r)
+    {
+        std::optional<Eigen::Vector2f> best;
+        float best_clear = -1.f;
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx)
+            {
+                if (std::max(std::abs(dx), std::abs(dy)) != r) continue;   // this ring only
+                const int nx = cx + dx, ny = cy + dy;
+                if (not in_bounds(nx, ny)) continue;
+                const auto w = cell_to_world(nx, ny);
+                if (not turnable(w)) continue;
+                // Among candidates the ring admits, the roomiest — "more clearance", as a preference
+                // over equally-near options rather than a bar anything has to clear.
+                if (const float c = pose_clearance(w, 0.f); c > best_clear) { best_clear = c; best = w; }
+            }
+        if (best.has_value()) return best;
+    }
+    return std::nullopt;
+}
+
+std::optional<Eigen::Vector2f> GridPlanner::nearest_reachable(const Eigen::Vector2f& start_world,
+                                                              const Eigen::Vector2f& goal_world)
+{
+    if (w_ <= 0 or h_ <= 0) return std::nullopt;
+    rebuild_offsets();
+    int sx, sy;
+    if (not world_to_cell(start_world, sx, sy)) return std::nullopt;
+
+    // The transition rule is COPIED FROM plan() on purpose: a move to (nx,ny) adopts the heading of its
+    // own direction of travel, so feasibility is tested at that heading. Any other rule here would return
+    // poses the planner then refuses — the precise failure this function exists to end.
+    constexpr int DX[kHeadings] = {1, 1, 0, -1, -1, -1, 0, 1};
+    constexpr int DY[kHeadings] = {0, 1, 1, 1, 0, -1, -1, -1};
+    const int n_states = w_ * h_ * kHeadings;
+    const auto sid = [&](int ix, int iy, int hh) { return (iy * w_ + ix) * kHeadings + hh; };
+
+    std::vector<std::uint8_t> seen(static_cast<std::size_t>(n_states), 0);
+    std::queue<int> q;
+    for (int hh = 0; hh < kHeadings; ++hh)
+        if (cell_free(sx, sy, hh)) { seen[sid(sx, sy, hh)] = 1; q.push(sid(sx, sy, hh)); }
+    if (q.empty()) return std::nullopt;   // cannot even stand where we are; the caller's escape path owns this
+
+    // If the goal itself turns out to be reachable this must return it EXACTLY, not the centre of the
+    // cell containing it: the caller may hold this mode for as long as a target lives, and half a cell
+    // of drift applied to an affordance standpoint every cycle is a bug of its own.
+    int ggx, ggy;
+    const bool goal_in_grid = world_to_cell(goal_world, ggx, ggy);
+
+    std::optional<Eigen::Vector2f> best;
+    float best_d2 = std::numeric_limits<float>::max();
+    while (not q.empty())
+    {
+        const int s = q.front(); q.pop();
+        const int cell = s / kHeadings;
+        const int ix = cell % w_, iy = cell / w_;
+        if (goal_in_grid and ix == ggx and iy == ggy) return goal_world;
+        if (const float d2 = (cell_to_world(ix, iy) - goal_world).squaredNorm(); d2 < best_d2)
+        { best_d2 = d2; best = cell_to_world(ix, iy); }
+        for (int nh = 0; nh < kHeadings; ++nh)
+        {
+            const int nx = ix + DX[nh], ny = iy + DY[nh];
+            if (not in_bounds(nx, ny) or seen[sid(nx, ny, nh)]) continue;
+            if (not cell_free(nx, ny, nh)) continue;
+            seen[sid(nx, ny, nh)] = 1;
+            q.push(sid(nx, ny, nh));
+        }
+    }
+    return best;
+}
+
+std::optional<std::vector<Eigen::Vector2f>> GridPlanner::plan(const Eigen::Vector2f& start_world,
+                                                              const Eigen::Vector2f& goal_world)
+{
+    last_failure_.clear();
+    if (w_ <= 0 or h_ <= 0) { last_failure_ = "grid not built (no room polygon)"; return std::nullopt; }
+    rebuild_offsets();
+
+    int sx, sy, gx, gy;
+    if (not world_to_cell(start_world, sx, sy))
+    { last_failure_ = std::format("start ({:.2f},{:.2f}) outside the grid", start_world.x(), start_world.y()); return std::nullopt; }
+    if (not world_to_cell(goal_world, gx, gy))
+    { last_failure_ = std::format("goal ({:.2f},{:.2f}) outside the grid", goal_world.x(), goal_world.y()); return std::nullopt; }
+
+    // The goal must be feasible at SOME heading, else no amount of searching helps and the caller should be
+    // told to move the target rather than left to retry forever.
+    bool goal_ok = false;
+    for (int h = 0; h < kHeadings and not goal_ok; ++h) goal_ok = cell_free(gx, gy, h);
+    if (not goal_ok)
+    {
+        // Report the MAP state with it. "goal infeasible" alone cannot distinguish a genuinely tight spot
+        // from a map that is occupied nearly everywhere, and those need opposite fixes — move the target vs
+        // fix the obstacle source. The room-boundary-only baseline for this apartment is ~39% occupied.
+        last_failure_ = std::format("goal ({:.2f},{:.2f}) is not footprint-feasible at any heading "
+                                    "(robot needs {:.2f} m of width) | grid {}x{} cells, {} occupied ({:.0f}%), "
+                                    "{} obstacle polygons",
+                                    goal_world.x(), goal_world.y(), 2.f * footprint.inscribed_radius(),
+                                    w_, h_, occupied_cells(),
+                                    100.0 * static_cast<double>(occupied_cells()) / std::max(1, w_ * h_),
+                                    last_obstacle_count_);
+        return std::nullopt;
+    }
+
+    const int n_cells = w_ * h_;
+    const int n_states = n_cells * kHeadings;
+    auto sid = [&](int ix, int iy, int h) { return (iy * w_ + ix) * kHeadings + h; };
+
+    std::vector<float> g(n_states, std::numeric_limits<float>::infinity());
+    std::vector<int> parent(n_states, -1);
+    using QE = std::pair<float, int>;
+    std::priority_queue<QE, std::vector<QE>, std::greater<>> open;
+
+    const auto goal_w = cell_to_world(gx, gy);
+    auto heur = [&](int ix, int iy) { return (cell_to_world(ix, iy) - goal_w).norm(); };
+
+    // Seed every heading the start is feasible at.
+    bool seeded = false;
+    for (int h = 0; h < kHeadings; ++h)
+        if (cell_free(sx, sy, h))
+        { g[sid(sx, sy, h)] = 0.f; open.push({heur(sx, sy), sid(sx, sy, h)}); seeded = true; }
+
+    // START IN COLLISION. Seeding the start's headings is not enough on its own: if the robot is properly
+    // inside an obstacle then its NEIGHBOURS are infeasible too, so the search cannot take a single step and
+    // dies after 8 expansions — which is precisely how the robot stayed bricked. So walk out first: a BFS that
+    // ignores collision entirely finds the nearest footprint-feasible cell, and the plan starts from there
+    // with the original position prepended. "Get out, then navigate" — the same thing a person would do.
+    const bool start_in_collision = not seeded;
+    Eigen::Vector2f escape_from = start_world;
+    if (start_in_collision)
+    {
+        if (not params.allow_start_in_collision)
+        { last_failure_ = "start is not footprint-feasible"; return std::nullopt; }
+        std::vector<std::uint8_t> seen(static_cast<std::size_t>(n_cells), 0);
+        std::queue<std::pair<int, int>> q;
+        q.push({sx, sy});
+        seen[idx(sx, sy)] = 1;
+        int ex = -1, ey = -1;
+        while (not q.empty() and ex < 0)
+        {
+            const auto [cx, cy] = q.front();
+            q.pop();
+            constexpr int NX[4] = {1, -1, 0, 0}, NY[4] = {0, 0, 1, -1};
+            for (int d = 0; d < 4; ++d)
+            {
+                const int nx = cx + NX[d], ny = cy + NY[d];
+                if (not in_bounds(nx, ny) or seen[idx(nx, ny)]) continue;
+                seen[idx(nx, ny)] = 1;
+                for (int h = 0; h < kHeadings; ++h)
+                    if (cell_free(nx, ny, h)) { ex = nx; ey = ny; break; }
+                if (ex >= 0) break;
+                q.push({nx, ny});
+            }
+        }
+        if (ex < 0)
+        { last_failure_ = "start is inside an obstacle and NO footprint-feasible cell is reachable from it"; return std::nullopt; }
+        escape_from = cell_to_world(ex, ey);
+        sx = ex; sy = ey;
+        for (int h = 0; h < kHeadings; ++h)
+            if (cell_free(sx, sy, h))
+            { g[sid(sx, sy, h)] = 0.f; open.push({heur(sx, sy), sid(sx, sy, h)}); }
+    }
+
+    constexpr int DX[kHeadings] = {1, 1, 0, -1, -1, -1, 0, 1};
+    constexpr int DY[kHeadings] = {0, 1, 1, 1, 0, -1, -1, -1};
+    int goal_state = -1, expansions = 0;
+    // Hoisted out of the expansion loop; also FORCES the EDT to exist, since cell_free may have been
+    // satisfied without ever needing it. Reading dist_ unbuilt would silently disable the preference.
+    const float clearance_w = std::max(0.f, params.clearance_weight);
+    const float clearance_d = std::max(0.01f, params.clearance_pref_m);
+    if (clearance_w > 0.f) build_distance_field();
+
+    while (not open.empty())
+    {
+        const auto [f, s] = open.top();
+        open.pop();
+        const int h = s % kHeadings, cell = s / kHeadings;
+        const int ix = cell % w_, iy = cell / w_;
+        if (f > g[s] + heur(ix, iy) + 1e-6f) continue;
+        if (ix == gx and iy == gy) { goal_state = s; break; }
+        if (++expansions > params.max_expansions)
+        { last_failure_ = std::format("search exceeded {} expansions", params.max_expansions); return std::nullopt; }
+
+        for (int nh = 0; nh < kHeadings; ++nh)
+        {
+            const int nx = ix + DX[nh], ny = iy + DY[nh];
+            if (not in_bounds(nx, ny)) continue;
+            // The move sets the heading to its direction of travel: the robot turns toward the next waypoint
+            // and then translates, which is what the trajectory controller actually does.
+            if (not cell_free(nx, ny, nh)) continue;
+            const float step = ((DX[nh] != 0 and DY[nh] != 0) ? 1.41421356f : 1.0f) * cell_;
+            // A small turning penalty keeps the path from zig-zagging between diagonal and axial moves of
+            // equal length, which the MPPI would otherwise chase.
+            const float turn = (nh == h) ? 0.f : 0.25f * cell_;
+            // Tight cells cost more to cross — see Params::clearance_weight. The EDT is already built
+            // (cell_free forced it), so this is one lookup. The penalty MULTIPLIES the step so it scales
+            // with distance travelled rather than with how many cells the resolution happens to make.
+            const float tight = (clearance_w > 0.f and not dist_.empty())
+                              ? clearance_w * std::max(0.f, (clearance_d - dist_[idx(nx, ny)]) / clearance_d)
+                              : 0.f;
+            const int ns = sid(nx, ny, nh);
+            if (const float ng = g[s] + step * (1.f + tight) + turn; ng < g[ns])
+            { g[ns] = ng; parent[ns] = s; open.push({ng + heur(nx, ny), ns}); }
+        }
+    }
+
+    if (goal_state < 0)
+    {
+        last_failure_ = std::format("no route: {} expansions over {} free cells{}",
+                                    expansions, n_cells - occupied_cells(),
+                                    start_in_collision ? " [start was NOT footprint-feasible; escape was "
+                                                         "allowed and still found nothing]" : "");
+        return std::nullopt;
+    }
+
+    std::vector<Eigen::Vector2f> path;
+    for (int s = goal_state; s != -1; s = parent[s])
+    {
+        const int cell = s / kHeadings;
+        path.push_back(cell_to_world(cell % w_, cell / w_));
+    }
+    std::reverse(path.begin(), path.end());
+    path.front() = start_world;
+    path.back() = goal_world;
+
+    // Keep only turning points. A dense cell chain gives the trajectory controller nothing but jitter for its
+    // carrot to chase; the straight runs between corners are exactly the information it needs.
+    //
+    // Douglas-Peucker on PERPENDICULAR DEVIATION, not on consecutive-segment direction. Direction comparison
+    // looks equivalent and is not: the endpoints are snapped to cell centres and then overwritten with the true
+    // start/goal, so the first and last segments can be a small fraction of a cell long, and an arbitrarily
+    // small positional offset over a very short segment is a large ANGLE. That made a dead-straight 8 m run
+    // retain four waypoints. Deviation from the chord is the quantity actually being approximated, and it does
+    // not care how the points are spaced.
+    const float tol = 0.5f * cell_;
+    std::vector<Eigen::Vector2f> simplified;
+    const auto rdp = [&](auto&& self, std::size_t lo, std::size_t hi) -> void
+    {
+        if (hi <= lo + 1) return;
+        const Eigen::Vector2f a = path[lo], b = path[hi], ab = b - a;
+        const float len2 = ab.squaredNorm();
+        std::size_t worst = lo; float worst_d = 0.f;
+        for (std::size_t i = lo + 1; i < hi; ++i)
+        {
+            const Eigen::Vector2f ap = path[i] - a;
+            const float t = len2 > 1e-12f ? std::clamp(ap.dot(ab) / len2, 0.f, 1.f) : 0.f;
+            if (const float d = (ap - t * ab).norm(); d > worst_d) { worst_d = d; worst = i; }
+        }
+        if (worst_d <= tol) return;
+        self(self, lo, worst);
+        simplified.push_back(path[worst]);
+        self(self, worst, hi);
+    };
+    simplified.push_back(path.front());
+    rdp(rdp, 0, path.size() - 1);
+    simplified.push_back(path.back());
+    return simplified;
+}
+
+bool GridPlanner::self_test()
+{
+    bool ok = true;
+    auto check = [&](bool c, const char* m) { if (!c) { ok = false; std::printf("  FAIL: %s\n", m); } };
+
+    const std::vector<Eigen::Vector2f> world = {{-5, -5}, {5, -5}, {5, 5}, {-5, 5}};
+
+    // (1) Empty room: a straight path exists and stays clear.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        p.set_world(world, {});
+        const auto path = p.plan({-4, 0}, {4, 0});
+        std::printf("  empty room: %s (%zu waypoints)\n", path ? "planned" : p.last_failure().c_str(),
+                    path ? path->size() : 0);
+        check(path.has_value(), "an empty room must be trivially plannable");
+        check(path and path->size() == 2, "a straight run must simplify to its two endpoints");
+    }
+
+    // (1b) DISTANCE FIELD vs BRUTE FORCE. The transform is exact, so it must agree with an O(n^2) scan
+    // over every occupied cell to within the interpolation error — not "closely", exactly. Checked at
+    // cell centres (where interpolation is the identity) so any discrepancy is the transform's, and on a
+    // world with obstacles in the interior AND the room border, since outside-the-room is occupied too.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f; p.params.cell_size_m = 0.10f;
+        const std::vector<std::vector<Eigen::Vector2f>> obs = {
+            {{-1.f, -1.f}, {0.f, -1.f}, {0.f, 0.f}, {-1.f, 0.f}},
+            {{2.f, 1.5f}, {3.f, 1.5f}, {3.f, 2.5f}, {2.f, 2.5f}}};
+        p.set_world(world, obs);
+
+        // Brute force: nearest occupied cell centre, in metres.
+        std::vector<Eigen::Vector2f> occupied;
+        for (int iy = 0; iy < p.height(); ++iy)
+            for (int ix = 0; ix < p.width(); ++ix)
+                if (p.occ_[p.idx(ix, iy)]) occupied.push_back(p.cell_to_world(ix, iy));
+        check(not occupied.empty(), "the test world must contain occupied cells");
+
+        float worst = 0.f;
+        int checked = 0;
+        for (int iy = 0; iy < p.height(); iy += 3)
+            for (int ix = 0; ix < p.width(); ix += 3)
+            {
+                const Eigen::Vector2f c = p.cell_to_world(ix, iy);
+                float best = std::numeric_limits<float>::max();
+                for (const auto& o : occupied) best = std::min(best, (o - c).norm());
+                worst = std::max(worst, std::abs(p.distance_at(c) - best));
+                ++checked;
+            }
+        std::printf("  distance field: %d cells vs brute force, worst error %.6f m (cell %.2f m)\n",
+                    checked, worst, 0.10f);
+        check(worst < 1e-4f, "the distance transform must be EXACT at cell centres, not approximate");
+
+        // The gradient must point AWAY from an obstacle and be a unit vector in open space (|grad d| = 1
+        // is the eikonal property of a true distance field — a chamfer violates it by up to 8%).
+        const Eigen::Vector2f probe{1.0f, -0.5f};             // right of the first box, clear of both
+        const Eigen::Vector2f g = p.distance_gradient_at(probe);
+        check(g.x() > 0.f, "the gradient must point away from the obstacle to the left");
+        check(std::abs(g.norm() - 1.f) < 0.12f, "|grad d| must be ~1 in open space (eikonal)");
+        std::printf("  gradient at (1.0,-0.5): (%.3f,%.3f), |g| = %.3f\n", g.x(), g.y(), g.norm());
+
+        // Inside an obstacle the distance is zero, and an empty world is wide open rather than blocked.
+        check(p.distance_at({-0.5f, -0.5f}) < 1e-6f, "distance inside an obstacle must be zero");
+        GridPlanner empty;
+        check(empty.distance_at({0.f, 0.f}) > 1e5f, "with no world set, distance must read wide open");
+    }
+
+    // (2) THE POINT OF ALL OF THIS. A gap wider than the robot must be usable, and a gap narrower must not.
+    // The old stacked margins demanded ~0.95 m for a robot that physically passes 0.461 m; both of these
+    // assertions would have failed under that pipeline.
+    {
+        auto wall_with_gap = [&](float gap) {
+            const float hw = gap * 0.5f;
+            return std::vector<std::vector<Eigen::Vector2f>>{
+                {{-0.3f, -5.f}, {0.3f, -5.f}, {0.3f, -hw}, {-0.3f, -hw}},
+                {{-0.3f,  hw}, {0.3f,  hw}, {0.3f,  5.f}, {-0.3f,  5.f}}};
+        };
+        GridPlanner p; p.params.safety_margin_m = 0.f; p.params.cell_size_m = 0.05f;
+        const float need = 2.f * p.footprint.inscribed_radius();
+
+        p.set_world(world, wall_with_gap(need + 0.20f));
+        const auto wide = p.plan({-3, 0}, {3, 0});
+        p.set_world(world, wall_with_gap(need - 0.15f));
+        const auto narrow = p.plan({-3, 0}, {3, 0});
+        std::printf("  robot needs %.3f m: gap %.2f -> %s | gap %.2f -> %s\n",
+                    need, need + 0.20f, wide ? "PASSES" : "blocked",
+                    need - 0.15f, narrow ? "passes" : "BLOCKED (correct)");
+        check(wide.has_value(), "a gap WIDER than the footprint must be navigable");
+        check(not narrow.has_value(), "a gap NARROWER than the footprint must NOT be navigable");
+    }
+
+    // (3) A sealed goal is reported as infeasible, not as a mysterious "no path".
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        p.set_world(world, {{{1.f, 1.f}, {3.f, 1.f}, {3.f, 3.f}, {1.f, 3.f}}});
+        const auto path = p.plan({-3, -3}, {2, 2});
+        std::printf("  goal inside an obstacle: %s\n", path ? "planned (WRONG)" : p.last_failure().c_str());
+        check(not path.has_value(), "a goal inside an obstacle must fail");
+        check(p.last_failure().find("not footprint-feasible") != std::string::npos,
+              "...and must say so, rather than reporting a generic no-route");
+    }
+
+    // (4) A start in collision must still plan OUT — the failure that bricked the robot for a whole session.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        p.set_world(world, {{{-3.4f, -0.4f}, {-2.6f, -0.4f}, {-2.6f, 0.4f}, {-3.4f, 0.4f}}});
+        const auto path = p.plan({-3.0f, 0.0f}, {3.0f, 0.0f});
+        std::printf("  start INSIDE an obstacle: %s\n", path ? "planned out (correct)" : p.last_failure().c_str());
+        check(path.has_value(), "a start in collision must still be able to plan OUT");
+    }
+
+    // (5) nearest_free must agree with the planner's own feasibility predicate — the two disagreeing is what
+    // produced targets the controller would never accept.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        p.set_world(world, {{{1.f, 1.f}, {3.f, 1.f}, {3.f, 3.f}, {1.f, 3.f}}});
+        const auto fixed = p.nearest_free({2.f, 2.f}, 0.f);
+        std::printf("  nearest_free from inside an obstacle: %s\n",
+                    fixed ? std::format("({:.2f},{:.2f})", fixed->x(), fixed->y()).c_str() : "none");
+        check(fixed.has_value(), "a blocked pose must be repairable nearby");
+        check(fixed and p.pose_free(*fixed, 0.f), "the repaired pose must satisfy the planner's OWN predicate");
+    }
+
+    // (6) THE BUG THIS EXISTS FOR: free floor that is SEALED OFF. nearest_free is happy — the footprint
+    // fits inside the pocket — but no route exists, so repair handed back the same unroutable pose every
+    // cycle and the robot held forever. nearest_reachable must refuse the pocket and return something the
+    // robot can actually drive to.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {10.f, 0.f}, {10.f, 10.f}, {0.f, 10.f}};
+        // A pocket in the top-right corner, walled off on both open sides. Its interior is clear floor.
+        p.set_world(world, {{{6.f, 5.9f}, {10.f, 5.9f}, {10.f, 6.1f}, {6.f, 6.1f}},
+                           {{5.9f, 5.9f}, {6.1f, 5.9f}, {6.1f, 10.f}, {5.9f, 10.f}}});
+        const Eigen::Vector2f start{2.f, 2.f}, inside{8.f, 8.f};
+        const bool fits = p.pose_free(inside, 0.f);
+        const bool routes = p.plan(start, inside).has_value();
+        const auto reach = p.nearest_reachable(start, inside);
+        std::printf("  sealed pocket: footprint fits=%s  routable=%s  nearest_reachable=%s\n",
+                    fits ? "yes" : "no", routes ? "yes" : "no",
+                    reach ? std::format("({:.2f},{:.2f})", reach->x(), reach->y()).c_str() : "none");
+        check(fits, "the pocket interior must be footprint-feasible — that is what fooled nearest_free");
+        check(not routes, "the pocket must be genuinely unroutable, or this test proves nothing");
+        check(reach.has_value(), "a reachable alternative must always exist when the robot can move");
+        check(reach and p.plan(start, *reach).has_value(),
+              "★the returned pose must ROUTE — that is the entire contract nearest_free could not meet");
+        check(reach and (*reach - inside).norm() < (start - inside).norm(),
+              "and it must be closer to the goal than standing still, else driving buys nothing");
+        // ★IDENTITY WHEN THE GOAL IS REACHABLE. The session holds the reachability repair for the whole
+        // life of a target (clearing it oscillates), so this must be an EXACT no-op on a normal target
+        // — half a cell of drift re-applied every cycle would be a bug introduced by the fix.
+        const Eigen::Vector2f open_goal{3.17f, 2.43f};   // deliberately not on a cell centre
+        const auto same = p.nearest_reachable(start, open_goal);
+        std::printf("  reachable goal is returned EXACTLY: (%.4f,%.4f) -> %s\n", open_goal.x(), open_goal.y(),
+                    same ? std::format("({:.4f},{:.4f})", same->x(), same->y()).c_str() : "none");
+        check(same.has_value() and (*same - open_goal).norm() < 1e-6f,
+              "a reachable goal must come back bit-identical, not snapped to a cell centre");
+    }
+
+    // (7) FEASIBLE AT BOTH ENDS, IMPOSSIBLE IN THE MIDDLE — the failure the arrival path cannot see.
+    // A standpoint is verified at ONE heading; the terminal rotation sweeps the whole arc. The Shadow
+    // hull measures 0.543 m across and 0.460 m along, so lying in a corridor it needs 0.543 m — but the
+    // span it sweeps while turning PEAKS at 0.615 m around 30 deg (measured off the hull itself, not
+    // guessed from a bounding box). A slot between the two admits the robot pointing along it and traps
+    // it part-way round.
+    // ★THE NUMBERS HERE WERE RESTATED WITH THE YAW CORRECTION, and the old ones are worth recording
+    // because they were wrong twice over: they read "0.46 x 0.65 body, diagonal 0.796 m", which is the
+    // INSCRIBED and CIRCUMSCRIBED diameters treated as though they were the body's sides. The slot they
+    // produced (0.75 m) only trapped the robot because the 0.10 m raster was inflating everything by two
+    // cells — so the test was passing on rasterisation error, against a body that was itself rotated 90
+    // degrees. Both are fixed: the true hull, and a cell fine enough that the assertion is about the
+    // body rather than about the grid.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        p.params.cell_size_m = 0.01f;   // the trapping window is 7 cm wide; the raster must not fill it
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {3.f, 0.f}, {3.f, 3.f}, {0.f, 3.f}};
+        // A 0.58 m slot running along x at y = 1.5: wider than the body lying in it (0.543), narrower
+        // than the widest span it sweeps turning round (0.615).
+        p.set_world(world, {{{0.f, 0.f}, {3.f, 0.f}, {3.f, 1.21f}, {0.f, 1.21f}},
+                           {{0.f, 1.79f}, {3.f, 1.79f}, {3.f, 3.f}, {0.f, 3.f}}});
+        const Eigen::Vector2f spot{1.5f, 1.5f};
+        const float along = 0.f, back = static_cast<float>(M_PI);
+        const auto sweep = p.rotation_sweep(spot, along, back);
+        std::printf("  narrow slot: free along=%s free reversed=%s | can it TURN? %s (tightest %.3f m at %.0f deg)\n",
+                    p.pose_free(spot, along) ? "yes" : "no", p.pose_free(spot, back) ? "yes" : "no",
+                    sweep.feasible ? "yes" : "NO", sweep.min_clearance_m,
+                    sweep.worst_heading_rad * 180.f / static_cast<float>(M_PI));
+        check(p.pose_free(spot, along) and p.pose_free(spot, back),
+              "the body must FIT at both ends, or the test says nothing about the arc between them");
+        check(not sweep.feasible,
+              "★rotation_sweep must REFUSE it — this is the case pose_free cannot express and the "
+              "terminal rotation runs straight into");
+        check(p.pose_clearance(spot, along) > 0.f,
+              "pose_clearance must be positive where the body fits, so it can grade 'barely'");
+    }
+
+    // (8) nearest_rotatable must REFUSE the slot from (7) and move OUT of it, because that is the
+    // whole point: with GoalFacingYawEnabled the robot turns in place at the standpoint.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {6.f, 0.f}, {6.f, 6.f}, {0.f, 6.f}};
+        p.set_world(world, {{{0.f, 0.f}, {4.f, 0.f}, {4.f, 2.625f}, {0.f, 2.625f}},
+                           {{0.f, 3.375f}, {4.f, 3.375f}, {4.f, 6.f}, {0.f, 6.f}}});
+        const Eigen::Vector2f slot{2.f, 3.f};        // inside the 0.75 m slot: stand yes, turn no
+        const auto out = p.nearest_rotatable(slot);
+        std::printf("  nearest_rotatable from a slot you cannot turn in: %s (moved %.2f m)\n",
+                    out ? std::format("({:.2f},{:.2f})", out->x(), out->y()).c_str() : "none",
+                    out ? (*out - slot).norm() : 0.f);
+        check(p.pose_free(slot, 0.f), "the slot must be STANDABLE, or the test proves nothing");
+        check(out.has_value(), "the open half of the room is right there — something must be found");
+        check(out and (*out - slot).norm() > 1e-6f, "it must MOVE: the slot cannot be turned in");
+        if (out) for (int h = 0; h < kHeadings; ++h)
+            check(p.pose_free(*out, h * 2.f * static_cast<float>(M_PI) / kHeadings),
+                  "★the chosen spot must admit the body at EVERY heading — that is the guarantee");
+        // And it must never move a target that was already fine.
+        const Eigen::Vector2f open_spot{5.f, 3.f};
+        const auto same = p.nearest_rotatable(open_spot);
+        check(same.has_value() and (*same - open_spot).norm() < 1e-6f,
+              "an already-rotatable standpoint must be returned untouched");
+    }
+
+    // (9) nearest_free_where: the search must honour evidence the GRID DOES NOT HAVE. This is the case
+    // the controller's final-approach re-check depends on — an empty grid, so every pose passes
+    // pose_free, and an obstacle known only to the caller (a live LiDAR return over a decayed hull).
+    // Re-asking the grid there returns the same wrong answer forever; the predicate is what changes it.
+    {
+        GridPlanner p; p.params.safety_margin_m = 0.f;
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {6.f, 0.f}, {6.f, 6.f}, {0.f, 6.f}};
+        p.set_world(world, {});                       // NOTHING is occupied: the grid has forgotten
+        const Eigen::Vector2f standpoint{3.f, 3.f};
+        check(p.pose_free(standpoint, 0.f), "the grid must call it free — that IS the failure being modelled");
+        check(p.nearest_free(standpoint, 0.f).value_or(Eigen::Vector2f{-9.f, -9.f}).isApprox(standpoint),
+              "and nearest_free must therefore leave it exactly where it is");
+        // Known only to the caller: everything within 0.5 m of the standpoint is really occupied.
+        const auto admissible = [&](const Eigen::Vector2f &w) { return (w - standpoint).norm() > 0.5f; };
+        const auto moved = p.nearest_free_where(standpoint, 0.f, admissible, 1.5f);
+        std::printf("  nearest_free_where with caller-supplied evidence: %s (moved %.2f m)\n",
+                    moved ? std::format("({:.2f},{:.2f})", moved->x(), moved->y()).c_str() : "none",
+                    moved ? (*moved - standpoint).norm() : 0.f);
+        check(moved.has_value(), "open floor is right there — the search must find somewhere");
+        check(moved and admissible(*moved), "★the returned pose must satisfy the EXTRA predicate");
+        check(moved and p.pose_free(*moved, 0.f), "...and still be footprint-feasible on the grid");
+        check(moved and (*moved - standpoint).norm() < 0.75f,
+              "it must take the NEAREST admissible pose, not wander: a viewpoint dragged far is no "
+              "longer that affordance's viewpoint");
+        // A predicate nothing can satisfy must REPORT that, never invent a pose outside the bound.
+        check(not p.nearest_free_where(standpoint, 0.f, [](const Eigen::Vector2f &) { return false; }, 1.5f)
+                    .has_value(),
+              "an unsatisfiable predicate must return nullopt, so the caller can say so out loud");
+    }
+
+    // (10) ★HEADING IS A YAW, AND THE BODY MUST FACE ALONG IT. This is the convention the whole class
+    // runs on and it was silently violated for the class's whole life: offsets_[h] was rasterised at
+    // RobotFootprint's theta while h meant a yaw, so the body sat 90 deg across its own direction of
+    // travel. Nothing threw, because the hull is nearly symmetric — the only symptom was 4.2 cm of
+    // missing width where a corridor closes. It is unprovable from behaviour, so it is pinned here.
+    {
+        GridPlanner p;
+        p.params.cell_size_m = 0.02f;      // fine, so the assertion is about the body and not the raster
+        p.params.safety_margin_m = 0.f;
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {4.f, 0.f}, {4.f, 4.f}, {0.f, 4.f}};
+        p.set_world(world, {});             // empty world: this is about the offsets, not the occupancy
+        const auto span = [](const std::vector<Eigen::Vector2i>& o)
+        {
+            int mx = 0, my = 0;
+            for (const auto& c : o) { mx = std::max(mx, std::abs(c.x())); my = std::max(my, std::abs(c.y())); }
+            return std::pair{mx, my};
+        };
+        const auto [along0, across0] = span(p.offsets_[0]);                 // yaw 0   → travelling +x
+        const auto [across90, along90] = span(p.offsets_[kHeadings / 4]);   // yaw 90  → travelling +y
+        std::printf("  heading convention: at yaw 0 the body spans %d cells along-track / %d across-track;"
+                    " at yaw 90, %d / %d\n", along0, across0, along90, across90);
+        // The Shadow hull is 0.2716 m half-width LATERALLY and 0.2300 m half-length. So whichever way it
+        // is pointing, it must measure WIDER across its track than it is long along it.
+        check(across0 > along0,
+              "★at yaw 0 (travelling +x) the body must be wider in y than it is long in x — if this is "
+              "reversed the footprint is rotated 90 deg from its direction of travel");
+        check(across90 > along90, "★and the same at yaw 90 deg, which is that statement rotated");
+        // ...and the correction must actually differ from what it replaced, or the monitor is measuring
+        // nothing. The legacy rasterisation is the transposed one, by construction.
+        const auto [l_along0, l_across0] = span(p.offsets_legacy_[0]);
+        check(l_across0 < l_along0, "the legacy offsets must be the TRANSPOSED ones — that is the bug "
+                                    "being measured against, and a monitor that reports no difference "
+                                    "is a monitor that is not wired up");
+    }
+
+    // (11) The census must SEE the difference in a world where it can matter: a corridor narrower than
+    // the body's width but wider than its length admits travel along it in exactly one of the two
+    // rasterisations, which is the whole physical content of the correction.
+    {
+        GridPlanner p;
+        p.params.cell_size_m = 0.02f;
+        p.params.safety_margin_m = 0.f;
+        const std::vector<Eigen::Vector2f> world{{0.f, 0.f}, {4.f, 0.f}, {4.f, 4.f}, {0.f, 4.f}};
+        // A horizontal corridor 0.52 m tall: wider than the body is LONG (0.460) and narrower than it is
+        // WIDE (0.543), so driving along +x through it is impossible and only the corrected orientation
+        // knows that.
+        p.set_world(world, {{{0.f, 0.f}, {4.f, 0.f}, {4.f, 1.74f}, {0.f, 1.74f}},
+                           {{0.f, 2.26f}, {4.f, 2.26f}, {4.f, 4.f}, {0.f, 4.f}}});
+        const Eigen::Vector2f mid{2.f, 2.f};
+        std::printf("  corridor 0.52 m: along +x corrected=%s legacy=%s\n",
+                    p.pose_free(mid, 0.f) ? "fits" : "BLOCKED",
+                    p.pose_free_legacy(mid, 0.f) ? "fits" : "BLOCKED");
+        check(not p.pose_free(mid, 0.f),
+              "★the body is 0.543 m wide: it does NOT fit down a 0.52 m corridor, and the corrected "
+              "rasterisation is the one that says so");
+        check(p.pose_free_legacy(mid, 0.f),
+              "...while the legacy one waved it through — this is the scrape, reproduced");
+        const auto c = p.orientation_census();
+        std::printf("  census: %ld states, free %ld -> %ld (lost %ld, gained %ld)\n",
+                    c.states, c.free_legacy, c.free_now, c.lost, c.gained);
+        check(c.states > 0 and c.lost > 0,
+              "the census must report states changing hands, or it is not measuring anything");
+        // ★AND THE TOTAL MUST NOT MOVE. A quarter turn is exactly two of eight buckets, so the corrected
+        // offsets at heading h are the legacy offsets at h-2 and the two rasterisations cover the same
+        // set of placements overall. This is what says the correction REDISTRIBUTES space rather than
+        // costing it — and it is the invariant that would break first if someone "fixed" the conversion
+        // by inflating the footprint instead of rotating it.
+        check(c.free_now == c.free_legacy and c.lost == c.gained,
+              "★the correction must conserve total free C-space: it rotates the body, it does not "
+              "grow it. Unequal totals mean something is being inflated, not turned");
+    }
+
+    std::printf("GridPlanner::self_test %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+}  // namespace rc

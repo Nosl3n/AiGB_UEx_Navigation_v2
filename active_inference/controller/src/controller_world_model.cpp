@@ -1,0 +1,367 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
+#include "controller_world_model.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace
+{
+bool finite_target_info(const ControllerTargetInfo &info)
+{
+    return std::isfinite(info.world_pos.x())
+        && std::isfinite(info.world_pos.y())
+        && std::isfinite(info.yaw_rad)
+        && std::isfinite(info.epistemic_gain);
+}
+}
+
+void ControllerWorldModel::set_params(const ControllerParams *params)
+{
+    params_ = params;
+}
+
+void ControllerWorldModel::set_affordance_manager(rc::AffordanceManager *affordance_manager)
+{
+    affordance_manager_ = affordance_manager;
+}
+
+void ControllerWorldModel::set_dependencies(std::shared_ptr<DSR::DSRGraph> graph, DSR::InnerEigenAPI *inner_eigen_api)
+{
+    graph_ = std::move(graph);
+    inner_eigen_api_ = inner_eigen_api;
+    rt_api_ = graph_ ? graph_->get_rt_api() : nullptr;   // for get_edge_RT_covariance()
+}
+
+bool ControllerWorldModel::refresh_graph_state()
+{
+    if (!graph_)
+        return false;
+
+    if (graph_state_.world_name.empty())
+    {
+        // The world frame: a `room` indoors, a `field` outdoors (openfield_concept). Same contract.
+        if (const auto frame = rc::world::frame_node(*graph_); frame.has_value())
+        {
+            graph_state_.world_id = frame->id();
+            graph_state_.world_name = frame->name();
+        }
+    }
+    else if (!graph_->get_node(graph_state_.world_id).has_value())
+    {
+        graph_state_.world_id = 0;
+        graph_state_.world_name.clear();
+    }
+
+    if (graph_state_.robot_name.empty())
+    {
+        if (const auto robot_nodes = graph_->get_nodes_by_type("robot"); !robot_nodes.empty())
+        {
+            graph_state_.robot_id = robot_nodes.front().id();
+            graph_state_.robot_name = robot_nodes.front().name();
+        }
+    }
+    else if (!graph_->get_node(graph_state_.robot_id).has_value())
+    {
+        graph_state_.robot_id = 0;
+        graph_state_.robot_name.clear();
+    }
+
+    return graph_state_.ready();
+}
+
+std::optional<std::vector<Eigen::Vector2f>> ControllerWorldModel::read_world_polygon() const
+{
+    if (!graph_ || graph_state_.world_id == 0)
+        return std::nullopt;
+
+    auto world_node = graph_->get_node(graph_state_.world_id);
+    if (!world_node.has_value())
+        return std::nullopt;
+
+    auto polygon_x = graph_->get_attrib_by_name<delimiting_polygon_x_att>(world_node.value());
+    auto polygon_y = graph_->get_attrib_by_name<delimiting_polygon_y_att>(world_node.value());
+    if (!polygon_x.has_value() || !polygon_y.has_value())
+        return std::nullopt;
+
+    const auto &xs = polygon_x.value().get();
+    const auto &ys = polygon_y.value().get();
+    const std::size_t count = std::min(xs.size(), ys.size());
+    if (count < 3)
+        return std::nullopt;
+
+    std::vector<Eigen::Vector2f> polygon;
+    polygon.reserve(count);
+    for (std::size_t index = 0; index < count; ++index)
+        polygon.emplace_back(xs[index], ys[index]);
+
+    return polygon;
+}
+
+std::optional<ControllerRobotPose> ControllerWorldModel::pose_from_rt(
+    std::initializer_list<std::uint64_t> instants) const
+{
+    if (!inner_eigen_api_ || !graph_state_.ready() || !params_)
+        return std::nullopt;
+
+    const auto time_query = params_->interpolate_rt ? DSR::RT_API::TimeQuery::Interpolated
+                                                    : DSR::RT_API::TimeQuery::Nearest;
+    for (const std::uint64_t ts : instants)
+    {
+        const auto world_T_robot = inner_eigen_api_->get_transformation_matrix(graph_state_.world_name,
+                                                                             graph_state_.robot_name,
+                                                                             ts, "RT", time_query);
+        if (!world_T_robot.has_value()) continue;
+        const auto &matrix = world_T_robot->matrix();
+        ControllerRobotPose pose;
+        pose.pos = Eigen::Vector2f(static_cast<float>(matrix(0, 3)), static_cast<float>(matrix(1, 3)));
+        pose.theta = std::atan2(static_cast<float>(matrix(1, 0)), static_cast<float>(matrix(0, 0)));
+        return pose;
+    }
+    return std::nullopt;
+}
+
+// SCAN-ALIGNED — the pose contemporaneous with the observations the obstacle set was built from.
+// Falls back to `now`, then to the untimestamped edge, exactly as before.
+std::optional<ControllerRobotPose> ControllerWorldModel::read_robot_pose_in_world(
+    std::uint64_t timestamp_ms,
+    const std::optional<std::uint64_t> &last_lidar_timestamp_ms) const
+{
+    return pose_from_rt({last_lidar_timestamp_ms.value_or(timestamp_ms), timestamp_ms, 0});
+}
+
+// FRESHEST — see the header for why the control law wants this one and nothing else does. Asking for a
+// future instant cannot invent a pose: cortex's bracketing_blocks CLAMPS past the newest block.
+std::optional<ControllerRobotPose> ControllerWorldModel::read_robot_pose_latest(
+    std::uint64_t timestamp_ms) const
+{
+    return pose_from_rt({timestamp_ms, 0});
+}
+
+std::optional<Eigen::Vector2f> ControllerWorldModel::read_node_world_xy(std::uint64_t node_id,
+                                                                      std::uint64_t timestamp_ms) const
+{
+    if (!graph_ || !inner_eigen_api_ || !graph_state_.ready() || !params_)
+        return std::nullopt;
+    const auto node = graph_->get_node(node_id);
+    if (!node.has_value())
+        return std::nullopt;
+
+    const auto time_query = params_->interpolate_rt ? DSR::RT_API::TimeQuery::Interpolated
+                                                    : DSR::RT_API::TimeQuery::Nearest;
+    auto world_T_node = inner_eigen_api_->get_transformation_matrix(graph_state_.world_name, node->name(),
+                                                                   timestamp_ms, "RT", time_query);
+    if (!world_T_node.has_value())
+        world_T_node = inner_eigen_api_->get_transformation_matrix(graph_state_.world_name, node->name(),
+                                                                  0, "RT", time_query);
+    if (!world_T_node.has_value())
+        return std::nullopt;
+
+    const auto &m = world_T_node->matrix();
+    return Eigen::Vector2f(static_cast<float>(m(0, 3)), static_cast<float>(m(1, 3)));
+}
+
+std::optional<std::uint64_t> ControllerWorldModel::pose_stamp_age_ms(std::uint64_t now_ms) const
+{
+    if (!graph_ || !graph_state_.ready())
+        return std::nullopt;
+    auto rt_edge = graph_->get_edge(graph_state_.robot_id, graph_state_.world_id, "RT");
+    if (!rt_edge.has_value())
+        rt_edge = graph_->get_edge(graph_state_.world_id, graph_state_.robot_id, "RT");
+    if (!rt_edge.has_value())
+        return std::nullopt;
+    // The edge keeps a RING BUFFER of stamps (rt_timestamps) with rt_head_index pointing at the newest,
+    // so the freshest stamp is NOT simply the last element. Fall back to the maximum when the index is
+    // missing — a wrong pick here would silently report a whole buffer's worth of extra latency.
+    const auto stamps = graph_->get_attrib_by_name<rt_timestamps_att>(rt_edge.value());
+    if (!stamps.has_value()) return std::nullopt;
+    const auto &v = stamps.value().get();
+    if (v.empty()) return std::nullopt;
+    std::uint64_t newest = 0;
+    if (const auto head = graph_->get_attrib_by_name<rt_head_index_att>(rt_edge.value());
+        head.has_value() and head.value() >= 0 and static_cast<std::size_t>(head.value()) < v.size())
+        newest = v[static_cast<std::size_t>(head.value())];
+    else
+        newest = *std::max_element(v.begin(), v.end());
+    if (newest == 0 or now_ms < newest) return std::nullopt;   // unstamped, or clocks disagree
+    return now_ms - newest;
+}
+
+std::optional<ControllerPoseUncertainty> ControllerWorldModel::read_pose_uncertainty(std::uint64_t timestamp_ms) const
+{
+    if (!graph_ || !graph_state_.ready())
+        return std::nullopt;
+
+    auto rt_edge = graph_->get_edge(graph_state_.robot_id, graph_state_.world_id, "RT");
+    if (!rt_edge.has_value())
+        rt_edge = graph_->get_edge(graph_state_.world_id, graph_state_.robot_id, "RT");
+    if (!rt_edge.has_value())
+        return std::nullopt;
+
+    // ★READ IT THROUGH cortex's OWN ACCESSOR, not by hand-indexing the flat attribute.
+    //
+    // What this replaced was wrong twice over. rt_covariance is a 6x6 ROW-MAJOR SE3 covariance
+    // [x,y,z,rx,ry,rz] (RT_COVARIANCE_BLOCK_SIZE = 36 in cortex's dsr_rt_api.cpp; the concept agents'
+    // writers spell the same order out), so:
+    //   · flat[0] and flat[7] ARE var_x and var_y — those two were right;
+    //   · flat[14] = [2*6+2] is var_Z. Yaw is [5*6+5] = [35]. The rotation throttle was therefore being
+    //     driven by the robot's HEIGHT uncertainty;
+    //   · and the guard `size() < 15` waved through a 36-element block, and a whole RING of them, without
+    //     noticing either. On edges cortex's RT api manages the attribute is a ring of blocks, so block 0
+    //     is not necessarily the newest — the flat read could also be an arbitrarily stale covariance.
+    //
+    // RT_API::get_edge_RT_covariance() already handles all of that: ring vs single block, the head index,
+    // and timestamp selection. Asking it is both correct and the only version that stays correct if the
+    // packing changes.
+    if (rt_api_ == nullptr)
+        return std::nullopt;
+    // ── THE UNCERTAINTY MUST DESCRIBE THE POSE BEING ACTED ON, NOT A DIFFERENT ONE ──────────────
+    // This used to call with the defaults -- newest block, Nearest -- while the pose these numbers
+    // throttle is read by read_robot_pose_latest(timestamp_ms), pinned to an instant and interpolated.
+    // So a pose from one moment was being paired with a confidence from another. Nothing complains:
+    // both are well-formed, and the mismatch shows up only as a speed limiter reacting to the wrong
+    // uncertainty, which looks like tuning.
+    // ★SAME INSTANT AND SAME MODE AS THE POSE READ. interpolate_rt picks Interpolated exactly as
+    // pose_from_rt does, so the two answers come from the same place in the ring.
+    // ★NOT Extrapolated, deliberately. Cortex will widen a covariance to account for a pose it walked
+    // forward, but the pose here is NOT walked -- it is interpolated inside the ring. Asking for the
+    // widened version would attach the cost of a prediction that never happened.
+    const auto time_query = (params_ != nullptr and params_->interpolate_rt)
+                            ? DSR::RT_API::TimeQuery::Interpolated
+                            : DSR::RT_API::TimeQuery::Nearest;
+    const auto cov = rt_api_->get_edge_RT_covariance(rt_edge.value(), timestamp_ms, time_query);
+    if (not cov.has_value())
+        return std::nullopt;
+
+    ControllerPoseUncertainty uncertainty;
+    uncertainty.xy_std_m = static_cast<float>(std::sqrt(std::max(0.0, std::max((*cov)(0, 0), (*cov)(1, 1)))));
+    uncertainty.theta_std_rad = static_cast<float>(std::sqrt(std::max(0.0, (*cov)(5, 5))));   // yaw, was (2,2)
+    return uncertainty;
+}
+
+std::optional<ControllerTargetInfo> ControllerWorldModel::read_target_in_world(std::uint64_t timestamp_ms) const
+{
+    if (!graph_ || !inner_eigen_api_ || !graph_state_.ready() || !params_)
+        return std::nullopt;
+
+    // ★AN EXPLICIT GOAL BEATS AN AFFORDANCE. A goal linked robot -goto_action-> node is an OPERATOR's command
+    // (a click, utils/send_goal.py, utils/run_route.py); an affordance is something the robot MAY do on its own
+    // (approach a person, look at an object). With the operator's goal read only when no affordance was on offer,
+    // any worker in view took the robot over and a commanded route was never driven. So: the explicit goal
+    // first; with none, the affordances exactly as before.
+    const auto explicit_goal = [&]() -> std::optional<ControllerTargetInfo>
+    {
+        const auto edges = graph_->get_edges_by_type(params_->target_edge_type);
+        if (edges.empty())
+            return std::nullopt;
+
+        const auto time_query = params_->interpolate_rt ? DSR::RT_API::TimeQuery::Interpolated
+                                                        : DSR::RT_API::TimeQuery::Nearest;
+        for (const auto &edge : edges)
+        {
+            std::uint64_t target_id = edge.to();
+            if (edge.to() == graph_state_.world_id || edge.to() == graph_state_.robot_id)
+                target_id = edge.from();
+            else if ((edge.from() == graph_state_.world_id || edge.from() == graph_state_.robot_id) && edge.to() != 0)
+                target_id = edge.to();
+
+            if (target_id == 0 || target_id == graph_state_.world_id || target_id == graph_state_.robot_id)
+                continue;
+
+            const auto target_name = graph_->get_name_from_id(target_id);
+            if (!target_name.has_value())
+                continue;
+
+            const auto translation = inner_eigen_api_->transform(graph_state_.world_name,
+                                                                 *target_name,
+                                                                 timestamp_ms,
+                                                                 "RT",
+                                                                 time_query);
+            if (!translation.has_value())
+                continue;
+
+            ControllerTargetInfo info;
+            info.node_id = target_id;
+            info.node_name = *target_name;
+            info.world_pos = Eigen::Vector2f(static_cast<float>(translation->x()), static_cast<float>(translation->y()));
+            info.from_affordance = false;
+            if (!finite_target_info(info))
+                continue;
+            return info;
+        }
+        return std::nullopt;
+    }();
+    if (explicit_goal.has_value())
+        return explicit_goal;
+
+    if (affordance_manager_)
+    {
+        // Robot room-frame position feeds the grounded EFE nav-cost term in select_target.
+        // Leave it unset (nullopt) until a live pose is available so the nav-cost is ignored,
+        // rather than scoring affordances by their distance from the room origin.
+        std::optional<Eigen::Vector2f> robot_pos;
+        if (const auto pose = read_robot_pose_in_world(timestamp_ms, std::nullopt); pose.has_value())
+            robot_pos = pose->pos;
+        if (const auto affordance_target = affordance_manager_->select_target(graph_, robot_pos); affordance_target.has_value())
+        {
+            ControllerTargetInfo info;
+            info.node_id = affordance_target->node_id;
+            info.node_name = affordance_target->node_name;
+            info.world_pos = affordance_target->world_pos;
+            info.yaw_rad = affordance_target->yaw_rad;
+            info.epistemic_gain = affordance_target->epistemic_gain;
+            info.epistemic_pending = affordance_target->epistemic_pending;
+            info.from_affordance = true;
+            info.epoch = affordance_target->epoch;
+            info.parent_node_id = affordance_target->parent_node_id;
+            if (!finite_target_info(info))
+                return std::nullopt;
+            return info;
+        }
+    }
+
+    return std::nullopt;
+}
+
+// ★WHAT MAKES A TARGET THE SAME TARGET — AND WHY GAIN IS NOT PART OF IT.
+// This predicate decides `target_changed`, and `target_changed` throws the plan away and replans. So
+// every field named here is a licence to replan, and a field that varies for reasons unrelated to WHERE
+// the robot must go is a licence to replan for no reason.
+// `epistemic_gain` was in this list, compared to 1e-3. It is the producer's estimate of a viewpoint's
+// VALUE, and room_concept confirmed (2026-08-19) that it rewrites the offered target every cycle, gain
+// included, for the whole Offered-but-not-yet-claimed window — `AffordanceManager::publish_target`
+// only refuses rewrites once the target is CLAIMED. So a live belief update read here as a brand-new
+// target instance, on a target whose pose had not moved a millimetre.
+// ★A GAIN IS A PRIORITY, NOT AN IDENTITY. A target is identified by WHERE IT IS. The producer's
+// opinion of how much it is worth belongs to selection — it decides which target to pursue — and must
+// not survive into "is this still the thing I am driving to". Room's own words, and they are right:
+// damping the gain upstream would degrade a real signal to satisfy an identity test.
+// ★THE SHARED LAYER ALREADY KNEW. `AffordanceManager`'s log dedup key carries the identical note —
+// "identity only (name + parent type) ... must NOT embed gain/shape/pending — those wobble every cycle"
+// (affordance_manager.cpp:27-28). The lesson was learned once, for a log line, and never reached the
+// predicate that throws away plans. Gain remains where it belongs: the EFE selection at
+// affordance_manager.cpp:490, G = lambda_cost*nav_dist - epistemic_gain, which is about WHICH target
+// to pursue, not about whether the one in hand is still the same one.
+// Everything left here is geometry or channel: which node, from which source, at what pose and facing.
+bool ControllerWorldModel::same_target_instance(const ControllerTargetInfo &lhs, const ControllerTargetInfo &rhs)
+{
+    constexpr float pos_eps_m = 0.05f;
+    constexpr float yaw_eps_rad = 0.05f;
+
+    // ★★★IDENTITY IS WHERE THE TARGET IS, NOT WHAT THE PROTOCOL IS DOING ABOUT IT.
+    // `epistemic_pending` used to be compared here, and it is a PROTOCOL STATE BIT: it flips from false
+    // to true every time the producer re-arms the node. So re-offering the SAME standpoint read as a
+    // different target instance, which set `target_is_new_`, which fed the rule "if the goal reads
+    // reached on the first cycle after adopting it, no approach happened — refuse it". The robot was
+    // standing on that standpoint because it had already driven there, so:
+    //     re-arm -> looks new -> already reached -> REFUSED: already at this standpoint on the first cycle
+    //     -> producer re-arms -> ... for ever, with the robot parked.
+    // ★It is the same defect as `epistemic_gain`, removed from this comparison in 7fb6a62 for the same
+    // reason: a value that changes for protocol reasons cannot be part of a target's identity. What
+    // identifies a standpoint is the node it belongs to, where it is, and which way it faces.
+    // ★Dropping it does not lose a replan that matters: a re-arm at an unchanged pose needs no new path,
+    // and any real move of the standpoint is still caught by the pose and yaw tests below.
+    return lhs.node_id == rhs.node_id
+        && lhs.from_affordance == rhs.from_affordance
+        && (lhs.world_pos - rhs.world_pos).cwiseAbs().maxCoeff() < pos_eps_m
+        && std::abs(lhs.yaw_rad - rhs.yaw_rad) < yaw_eps_rad;
+}

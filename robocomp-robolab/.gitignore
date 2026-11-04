@@ -1,0 +1,4 @@
+# Build artifacts of the drivers built in place (see active_inference/utils/sub_husky.toml)
+**/bin/
+**/build/
+**/generated/*.ice

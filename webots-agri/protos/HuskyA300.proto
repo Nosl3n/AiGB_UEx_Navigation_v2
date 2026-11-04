@@ -1,0 +1,283 @@
+#VRML_SIM R2025a utf8
+# license: Apache License 2.0
+# Clearpath Husky A300 for agricultural simulation, driven by Webots2Robocomp (skid-steer, 4 motors).
+#
+# ==== CONVENTIONS (identical to Shadow.proto / ShadowDiff.proto, on purpose) =====================
+#   * Robot frame: +Y forward, +X to the RIGHT, +Z up. The origin is on the FLOOR, under the centre of
+#     the four wheels, so every sensor height below is a height above ground.
+#   * Wheel hinges use axis -1 0 0, so a POSITIVE motor velocity drives FORWARD (+Y) on both sides.
+#     The bridge's differential/skid IK relies on exactly that.
+#   * Device names are the Shadow ones ("helios", "zed", "zed-ranger", "accelerometer", "gyro") so the
+#     bridge and the robolab drivers (lidar3d_dds, zed_camera, imu_dds) pick them up unchanged.
+#     New for the field: "gps", "inertial unit", "compass".
+#
+# ==== GEOMETRY ===================================================================================
+# Defaults are taken from Clearpath's husky_description (A200) URDF:
+#   wheelbase 0.512 m, track 0.5708 m, wheel radius 0.1651 m, wheel width 0.1143 m,
+#   overall 0.99 x 0.67 x 0.39 m.
+# ⚠ TODO(F1): confirm against the A300 description (clearpath_common, a300.urdf.xacro). The A300 is
+#   a similar footprint but heavier; every number that may differ is a PROTO field, not a literal.
+
+PROTO HuskyA300 [
+  field SFVec3f    translation      0 0 0
+  field SFRotation rotation         0 0 1 0
+  field SFString   name             "husky"
+  field SFString   controller       "<extern>"
+  field SFBool     synchronization  TRUE
+  field SFBool     supervisor       TRUE          # Webots2Robocomp is a Supervisor (GT pose, humans, doors).
+
+  field SFFloat    wheelRadius      0.1651        # m
+  field SFFloat    wheelWidth       0.1143        # m
+  field SFFloat    wheelbase        0.512         # m, front-rear axle distance
+  field SFFloat    track            0.5708        # m, left-right wheel-centre distance
+  field SFFloat    bodyMass         46            # kg, chassis only (wheels add 4 x wheelMass)
+  field SFFloat    wheelMass        2.64          # kg
+  field SFFloat    maxWheelVelocity 12.2          # rad/s  (~2.0 m/s with R = 0.1651, A300 top speed)
+  field SFFloat    maxWheelTorque   40            # N·m
+
+  # Sensor mounts (robot frame, metres). Mast at the rear so the LiDAR sees over the crop canopy.
+  field SFVec3f    heliosTranslation 0 -0.25 0.95
+  field SFVec3f    zedTranslation    0 0.42 0.55
+  field SFFloat    zedPitch          0.2618       # rad, camera tilted DOWN (15°) towards the rows
+  field SFVec3f    gpsTranslation    0 -0.25 1.02 # antenna on top of the LiDAR
+
+  # LiDAR: RS-Helios 32 (H32F70) emulated like on Shadow: a symmetric 110° fan (Webots ignores
+  # tiltAngle) of which the bridge keeps only the device's real -55..+15° channels
+  # (LidarChannels.helios.* in the bridge config). 50 layers over 110° = 2.245°/layer: the window
+  # keeps layers 18..49 = exactly 32 channels, +14.6 .. -55.0°.
+  field SFInt32    heliosLayers      50
+  field SFFloat    heliosVerticalFov 1.9199       # rad (110°)
+  field SFInt32    heliosHorizontalResolution 900
+  field SFFloat    heliosMaxRange    30           # m, outdoors 100 m only costs rays
+  # Range noise as a std in METRES. Webots' Lidar `noise` is RELATIVE TO maxRange ("1.0 = a gaussian of std
+  # maxRange metres"), so the Shadow-inherited `noise 0.005` was a 15 cm std at 30 m (50 cm at Shadow's 100 m):
+  # crowns smeared half a metre along the rays and robot-body hits escaping the 5 cm self-filter. RS-Helios
+  # datasheet: ±2 cm. Converted to Webots' relative units below.
+  field SFFloat    heliosNoiseM      0.02
+  # InertialUnit angle noise as a std in RADIANS. Webots' `noise` here is relative to pi/2 ("1.0 = std pi/2
+  # rad"); converted below. 0.003 rad ≈ 0.17°, a good MEMS AHRS.
+  field SFFloat    imuNoiseRad       0.003
+
+  # GPS: Webots `accuracy` is the per-axis Gaussian std (m); `noiseCorrelation` in [0,1] makes it a
+  # slowly drifting (Gauss-Markov-like) error, which is how a real receiver behaves.
+  # 0.02 m ≈ RTK fix. Use ~1.5 m / 0.9 for a plain single-band GNSS.
+  field SFFloat    gpsAccuracy          0.02
+  field SFFloat    gpsNoiseCorrelation  0.9
+  field SFFloat    gpsResolution        -1
+]
+{
+%<
+  const R  = fields.wheelRadius.value;
+  const W  = fields.wheelWidth.value;
+  const hx = fields.track.value / 2;       // lateral (X) wheel offset
+  const hy = fields.wheelbase.value / 2;   // longitudinal (Y) wheel offset
+  // Chassis between the wheels: must clear the inner wheel faces.
+  const innerW = 2 * hx - W - 0.02;
+  const zedP  = fields.zedPitch.value;
+  const wheels = [
+    { name: 'front_left',  x: -hx, y:  hy },
+    { name: 'front_right', x:  hx, y:  hy },
+    { name: 'rear_left',   x: -hx, y: -hy },
+    { name: 'rear_right',  x:  hx, y: -hy },
+  ];
+>%
+Robot {
+  translation IS translation
+  rotation IS rotation
+  name IS name
+  model "Clearpath Husky A300"
+  description "Clearpath Husky A300 (skid-steer), AiGB UEx agricultural"
+  controller IS controller
+  synchronization IS synchronization
+  supervisor IS supervisor
+  children [
+    # ---------------------------------------------------------------- body (visual only)
+    DEF CHASSIS Pose {
+      translation 0 0 %<= R + 0.06 >%
+      children [
+        Shape {
+          appearance DEF HUSKY_YELLOW PBRAppearance { baseColor 0.95 0.75 0.05 roughness 0.5 metalness 0 }
+          geometry Box { size %<= innerW >% 0.80 0.22 }
+        }
+      ]
+    }
+    DEF TOP_PLATE Pose {
+      translation 0 0 %<= 2 * R + 0.025 >%
+      children [
+        Shape {
+          appearance DEF HUSKY_BLACK PBRAppearance { baseColor 0.08 0.08 0.08 roughness 0.6 metalness 0.2 }
+          geometry Box { size %<= 2 * hx + W >% 0.86 0.03 }
+        }
+      ]
+    }
+    DEF FRONT_BUMPER Pose {
+      translation 0 %<= 0.47 >% %<= R + 0.06 >%
+      children [ Shape { appearance USE HUSKY_BLACK geometry Box { size %<= 2 * hx + W - 0.04 >% 0.05 0.06 } } ]
+    }
+    DEF REAR_BUMPER Pose {
+      translation 0 %<= -0.47 >% %<= R + 0.06 >%
+      children [ Shape { appearance USE HUSKY_BLACK geometry Box { size %<= 2 * hx + W - 0.04 >% 0.05 0.06 } } ]
+    }
+    # ---------------------------------------------------------------- sensor mast
+    %< const mast = fields.heliosTranslation.value; const mastBase = 2 * R + 0.04; >%
+    DEF MAST Pose {
+      translation %<= mast.x >% %<= mast.y >% %<= (mastBase + mast.z - 0.05) / 2 >%
+      children [
+        Shape {
+          appearance DEF ALU PBRAppearance { baseColor 0.7 0.7 0.72 roughness 0.3 metalness 0.8 }
+          geometry Box { size 0.04 0.04 %<= mast.z - 0.05 - mastBase >% }
+        }
+      ]
+    }
+
+    # ---------------------------------------------------------------- sensors
+    # Same mount rotation as Shadow's helios (x of the device -> +Y of the robot).
+    Lidar {
+      translation IS heliosTranslation
+      rotation 0 0 1 1.5708
+      name "helios"
+      children [
+        Shape {
+          appearance USE HUSKY_BLACK
+          geometry Cylinder { height 0.10 radius 0.05 }
+        }
+      ]
+      horizontalResolution IS heliosHorizontalResolution
+      fieldOfView 6.28
+      verticalFieldOfView IS heliosVerticalFov
+      numberOfLayers IS heliosLayers
+      minRange 0.2
+      maxRange IS heliosMaxRange
+      noise %<= fields.heliosNoiseM.value / fields.heliosMaxRange.value >%
+      defaultFrequency 10
+    }
+    # ZED 2: forward, tilted down. Outer Pose = Shadow's mount (device x -> robot +Y); inner = pitch.
+    Pose {
+      translation IS zedTranslation
+      rotation 0 0 1 1.5708
+      children [
+        Camera {
+          rotation 0 1 0 %<= zedP >%
+          name "zed"
+          children [
+            Shape {
+              appearance USE HUSKY_BLACK
+              geometry Box { size 0.03 0.17 0.03 }
+            }
+            RangeFinder {
+              name "zed-ranger"
+              fieldOfView 1.9198
+              width 1280
+              height 720
+              minRange 0.3
+              maxRange 20
+            }
+          ]
+          fieldOfView 1.9198
+          width 1280
+          height 720
+          projection "planar"
+        }
+      ]
+    }
+    Accelerometer {
+      translation 0 0 %<= R + 0.06 >%
+      resolution 0.001
+    }
+    Gyro {
+      translation 0 0 %<= R + 0.06 >%
+    }
+    # Absolute attitude (roll/pitch/yaw) — the heading a GPS alone cannot give.
+    InertialUnit {
+      translation 0 0 %<= R + 0.06 >%
+      name "inertial unit"
+      noise %<= fields.imuNoiseRad.value / (Math.PI / 2) >%
+    }
+    Compass {
+      translation 0 0 %<= R + 0.06 >%
+      name "compass"
+    }
+    GPS {
+      translation IS gpsTranslation
+      name "gps"
+      children [
+        Shape {
+          appearance USE HUSKY_BLACK
+          geometry Cylinder { height 0.02 radius 0.06 }
+        }
+      ]
+      accuracy IS gpsAccuracy
+      noiseCorrelation IS gpsNoiseCorrelation
+      resolution IS gpsResolution
+    }
+
+    # ---------------------------------------------------------------- running gear (skid-steer)
+    # Cylinder Z --(Pose R_x -90)--> Y --(Solid R_z +90)--> -X, the lateral axle: same two-rotation
+    # composition as ShadowDiff.proto, so the hinge axis -1 0 0 means "positive = forward".
+%< for (const w of wheels) { >%
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis -1 0 0
+        anchor %<= w.x >% %<= w.y >% %<= R >%
+      }
+      device [
+        RotationalMotor {
+          name "%<= w.name >%"
+          maxVelocity IS maxWheelVelocity
+          maxTorque IS maxWheelTorque
+        }
+        PositionSensor {
+          name "%<= w.name >%_sensor"
+        }
+      ]
+      endPoint Solid {
+        translation %<= w.x >% %<= w.y >% %<= R >%
+        rotation 0 0 1 1.5708
+        children [
+          Pose {
+            rotation 1 0 0 -1.5708
+            children [
+              Shape {
+                appearance PBRAppearance { baseColor 0.1 0.1 0.1 roughness 0.9 metalness 0 }
+                geometry Cylinder { height %<= W >% radius %<= R >% subdivision 32 }
+              }
+            ]
+          }
+        ]
+        name "wheel_%<= w.name >%"
+        contactMaterial "HuskyWheelMat"
+        boundingObject Pose {
+          rotation 1 0 0 -1.5708
+          children [ Cylinder { height %<= W >% radius %<= R >% subdivision 24 } ]
+        }
+        physics Physics {
+          density -1
+          mass IS wheelMass
+        }
+      }
+    }
+%< } >%
+  ]
+  boundingObject Group {
+    children [
+      Pose {
+        translation 0 0 %<= R + 0.06 >%
+        children [ Box { size %<= innerW >% 0.80 0.22 } ]
+      }
+      Pose {
+        translation 0 0 %<= 2 * R + 0.025 >%
+        children [ Box { size %<= 2 * hx + W >% 0.86 0.03 } ]
+      }
+      Pose {
+        translation 0 0 %<= R + 0.06 >%
+        children [ Box { size %<= 2 * hx + W - 0.04 >% 0.99 0.06 } ]
+      }
+    ]
+  }
+  physics Physics {
+    density -1
+    mass IS bodyMass
+    centerOfMass [ 0 0 %<= R + 0.04 >% ]
+  }
+}
+}

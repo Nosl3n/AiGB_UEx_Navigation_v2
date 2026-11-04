@@ -1,0 +1,27 @@
+# Root ignores for the whole repo (each sub-component keeps its own .gitignore too).
+build/
+bin/
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+.vscode/
+
+# Runtime logs the agents write on every run (the live file and its rotated copies).
+active_inference/*/etc/*.csv
+active_inference/*/etc/*.csv.*
+active_inference/openfield_concept/tmp/
+
+# Model weights: large, downloaded separately (see README).
+*.onnx
+
+# Webots per-user project state (window layout).
+webots-agri/worlds/.*.wbproj
+
+# Local notes and tool state: they live outside this public repo.
+.archify/
+CLAUDE.md
+.claude/
+
+# Runtime logs written next to each component.
+*.log

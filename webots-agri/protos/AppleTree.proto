@@ -1,0 +1,299 @@
+#VRML_SIM R2025a utf8
+# license: Apache License 2.0
+# template language: javascript
+# An apple tree trained as a TALL SPINDLE, the usual form in intensive orchards: a central leader on a short
+# trunk, scaffold branches that are longest at the bottom and shorten towards the top (a narrow cone), a
+# stake beside the trunk, leaves along the outer part of every branch and fruit hanging under them.
+#
+# Webots' own trees (Tree / SimpleTree "crab apple tree") are two crossed textured planes: fine for a camera,
+# but the LiDAR sees two flat sheets instead of a crown. This one is procedural: wood, leaves
+# and fruit are a few IndexedFaceSets, and `seed` varies the branch, leaf and fruit layout per instance
+# deterministically, so an orchard looks natural but re-loads identical. Per-tree SIZE (height, canopy
+# radius, leaf and fruit load) is set by webots-agri/tools/gen_apple_rows.py.
+#
+# COLLISION = THE TRUNK ONLY. Branches, leaves and fruit are visible to the camera and the LiDAR (Webots
+# ray-casts the graphics), but the robot may brush through them, as it would through real foliage. The
+# canopy radius bounds the corridor at robot height: gen_apple_rows.py checks it against the Husky.
+
+PROTO AppleTree [
+  field SFVec3f    translation    0 0 0
+  field SFRotation rotation       0 0 1 0
+  field SFString   name           "apple tree"
+  field SFInt32    seed           1          # per-instance branch / leaf / fruit variation (deterministic)
+  field SFFloat    height         2.7        # m, ground to the tip of the leader
+  field SFFloat    trunkHeight    0.6        # m, ground to the lowest scaffold branch
+  field SFFloat    trunkRadius    0.035      # m, at the base (tall spindle: 3-5 cm diameter)
+  field SFFloat    canopyRadius   0.55       # m, reach of the longest (lowest) scaffold branch
+  field SFInt32    branchCount    16         # scaffold branches along the leader
+  field SFInt32    leafCount      1300
+  field SFFloat    leafSize       0.09       # m, leaf length
+  field SFInt32    fruitCount     40         # 0 = no fruit (young / out of season)
+  field SFFloat    fruitRadius    0.036      # m
+  field SFFloat    ripeFraction   0.8        # share of fruit in fruitColor; the rest in fruitColor2
+  field SFFloat    droop          0.6        # 1/m, how much branches bend down under their load
+  field SFBool     stake          TRUE       # support stake beside the trunk
+  field SFColor    barkColor      0.36 0.27 0.19
+  field SFColor    leafColor      0.16 0.36 0.11
+  field SFColor    leafColor2     0.28 0.49 0.17
+  field SFColor    fruitColor     0.70 0.07 0.06
+  field SFColor    fruitColor2    0.78 0.66 0.20
+  field SFColor    stakeColor     0.55 0.50 0.42
+]
+{
+%<
+  import * as wbrandom from 'wbrandom.js';
+  wbrandom.seed(fields.seed.value);
+  const H = fields.height.value;
+  const T = Math.min(fields.trunkHeight.value, 0.6 * H);
+  const R = fields.canopyRadius.value;
+  const R0 = fields.trunkRadius.value;
+  const NB = Math.max(1, fields.branchCount.value);
+  const NL = Math.max(0, fields.leafCount.value);
+  const LS = fields.leafSize.value;
+  const NF = Math.max(0, fields.fruitCount.value);
+  const FR = fields.fruitRadius.value;
+  const DROOP = fields.droop.value;
+  const GOLDEN = 2.39996;               // golden angle: scaffolds spiral round the leader without stacking
+
+  // ── wood: the leader and the scaffolds, as tapered tubes along a polyline ──────────────────────────
+  const wood = { points: [], faces: [] };
+  function tube(path, radii, sides) {
+    const base = wood.points.length;
+    for (let i = 0; i < path.length; ++i) {
+      const p = path[i];
+      const q = path[Math.min(i + 1, path.length - 1)], o = path[Math.max(i - 1, 0)];
+      let t = [q[0] - o[0], q[1] - o[1], q[2] - o[2]];
+      const tl = Math.hypot(t[0], t[1], t[2]) || 1;
+      t = [t[0] / tl, t[1] / tl, t[2] / tl];
+      // Any vector not parallel to the tangent gives the ring's frame.
+      const a = Math.abs(t[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+      let u = [t[1] * a[2] - t[2] * a[1], t[2] * a[0] - t[0] * a[2], t[0] * a[1] - t[1] * a[0]];
+      const ul = Math.hypot(u[0], u[1], u[2]);
+      u = [u[0] / ul, u[1] / ul, u[2] / ul];
+      const v = [t[1] * u[2] - t[2] * u[1], t[2] * u[0] - t[0] * u[2], t[0] * u[1] - t[1] * u[0]];
+      for (let k = 0; k < sides; ++k) {
+        const ang = 2 * Math.PI * k / sides;
+        const c = Math.cos(ang) * radii[i], s = Math.sin(ang) * radii[i];
+        wood.points.push([p[0] + c * u[0] + s * v[0], p[1] + c * u[1] + s * v[1], p[2] + c * u[2] + s * v[2]]);
+      }
+    }
+    for (let i = 0; i + 1 < path.length; ++i)
+      for (let k = 0; k < sides; ++k) {
+        const a = base + i * sides + k, b = base + i * sides + (k + 1) % sides;
+        const c = a + sides, d = b + sides;
+        // Both windings: Webots culls back faces and IndexedFaceSet has no `solid` field.
+        wood.faces.push([a, b, d], [a, d, c], [a, d, b], [a, c, d]);
+      }
+  }
+
+  // Leader: a gentle random lean that grows with height, tapering to a twig at the top.
+  const leanX = wbrandom.real(-0.06, 0.06), leanY = wbrandom.real(-0.06, 0.06);
+  const leaderAt = (z) => { const f = (z / H) * (z / H); return [leanX * f, leanY * f, z]; };
+  const LSEG = 8;
+  const leader = [], leaderR = [];
+  for (let j = 0; j <= LSEG; ++j) {
+    const z = H * j / LSEG;
+    leader.push(leaderAt(z));
+    leaderR.push(R0 * (1 - 0.82 * j / LSEG));
+  }
+  tube(leader, leaderR, 6);
+
+  // Scaffolds: longest at the bottom, shortening up the cone; they rise, then droop under their load.
+  const BSEG = 4;
+  const branches = [];                  // { path, len, zf } for placing leaves and fruit
+  for (let i = 0; i < NB; ++i) {
+    const zf = (i + wbrandom.real(0.0, 0.8)) / NB;          // 0 = lowest scaffold, 1 = top
+    const z0 = T + zf * (0.92 * H - T);
+    const az = i * GOLDEN + wbrandom.real(-0.35, 0.35);
+    const len = R * Math.pow(Math.max(0.05, 1 - 0.85 * zf), 0.9) * wbrandom.real(0.75, 1.1);
+    const el = wbrandom.real(0.15, 0.6);
+    const k = DROOP * wbrandom.real(0.6, 1.4);
+    const o = leaderAt(z0);
+    const ca = Math.cos(az), sa = Math.sin(az);
+    const path = [], radii = [];
+    const rb = Math.max(0.007, 0.5 * R0 * (1 - 0.6 * zf));
+    for (let j = 0; j <= BSEG; ++j) {
+      const r = len * j / BSEG;
+      path.push([o[0] + r * ca, o[1] + r * sa, o[2] + r * Math.tan(el) - k * r * r]);
+      radii.push(rb * (1 - 0.75 * j / BSEG));
+    }
+    tube(path, radii, 5);
+    branches.push({ path: path, len: len, zf: zf });
+  }
+  // The leader above the lowest scaffold also carries leaves (spurs on the central axis).
+  const upper = leader.filter((p) => p[2] >= T);
+  if (upper.length >= 2)
+    branches.push({ path: upper, len: 0.5 * (H - T), zf: 0.5, leader: true });
+
+  const totalLen = branches.reduce((s, b) => s + b.len, 0);
+  function pickBranch(weight) {
+    let w = 0;
+    const ws = branches.map((b) => { w += weight(b); return w; });
+    const x = wbrandom.real(0, w);
+    for (let i = 0; i < ws.length; ++i) if (x <= ws[i]) return branches[i];
+    return branches[branches.length - 1];
+  }
+  function along(path, s) {
+    const f = s * (path.length - 1), i = Math.min(Math.floor(f), path.length - 2), t = f - i;
+    const a = path[i], b = path[i + 1];
+    return [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])];
+  }
+
+  // ── leaves: small diamonds on the outer part of the branches, two shades ───────────────────────────
+  const leaves = [{ points: [], faces: [] }, { points: [], faces: [] }];
+  for (let n = 0; n < NL && totalLen > 0; ++n) {
+    const b = pickBranch((x) => x.len);
+    const s = b.leader ? wbrandom.real(0, 1) : Math.pow(wbrandom.real(0.06, 1), 0.6);   // outer bias
+    const p = along(b.path, s);
+    const off = 0.02 + 0.16 * Math.sqrt(wbrandom.real(0, 1));   // a leafy sleeve round each branch
+    const oa = wbrandom.real(0, 2 * Math.PI), oe = wbrandom.real(-0.6, 0.9);
+    const c = [p[0] + off * Math.cos(oe) * Math.cos(oa), p[1] + off * Math.cos(oe) * Math.sin(oa), p[2] + off * Math.sin(oe)];
+    // Leaf plane: a mostly upward normal, random long axis.
+    const na = wbrandom.real(0, 2 * Math.PI), ne = wbrandom.real(0.3, 1.5);
+    const nrm = [Math.cos(ne) * Math.cos(na), Math.cos(ne) * Math.sin(na), Math.sin(ne)];
+    const ax = Math.abs(nrm[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+    let u = [nrm[1] * ax[2] - nrm[2] * ax[1], nrm[2] * ax[0] - nrm[0] * ax[2], nrm[0] * ax[1] - nrm[1] * ax[0]];
+    const ul = Math.hypot(u[0], u[1], u[2]);
+    u = [u[0] / ul, u[1] / ul, u[2] / ul];
+    const rot = wbrandom.real(0, Math.PI);
+    const v0 = [nrm[1] * u[2] - nrm[2] * u[1], nrm[2] * u[0] - nrm[0] * u[2], nrm[0] * u[1] - nrm[1] * u[0]];
+    const L = [Math.cos(rot) * u[0] + Math.sin(rot) * v0[0], Math.cos(rot) * u[1] + Math.sin(rot) * v0[1], Math.cos(rot) * u[2] + Math.sin(rot) * v0[2]];
+    const W = [nrm[1] * L[2] - nrm[2] * L[1], nrm[2] * L[0] - nrm[0] * L[2], nrm[0] * L[1] - nrm[1] * L[0]];
+    const hl = 0.5 * LS * wbrandom.real(0.8, 1.2), hw = 0.22 * LS * wbrandom.real(0.8, 1.2);
+    const set = leaves[wbrandom.real(0, 1) < 0.55 ? 0 : 1];
+    const i0 = set.points.length;
+    set.points.push([c[0] + hl * L[0], c[1] + hl * L[1], c[2] + hl * L[2]]);
+    set.points.push([c[0] + hw * W[0], c[1] + hw * W[1], c[2] + hw * W[2]]);
+    set.points.push([c[0] - hl * L[0], c[1] - hl * L[1], c[2] - hl * L[2]]);
+    set.points.push([c[0] - hw * W[0], c[1] - hw * W[1], c[2] - hw * W[2]]);
+    set.faces.push([i0, i0 + 1, i0 + 2], [i0, i0 + 2, i0 + 3], [i0, i0 + 2, i0 + 1], [i0, i0 + 3, i0 + 2]);
+  }
+
+  // ── fruit: low-poly spheres hanging under the branches, two colours (ripe / not yet) ───────────────
+  const fruit = [{ points: [], faces: [] }, { points: [], faces: [] }];
+  const NLON = 10, NLAT = 6;
+  function sphere(set, c, r) {
+    const base = set.points.length;
+    set.points.push([c[0], c[1], c[2] + r]);                                   // north pole
+    for (let i = 1; i < NLAT; ++i) {
+      const th = Math.PI * i / NLAT;
+      for (let j = 0; j < NLON; ++j) {
+        const ph = 2 * Math.PI * j / NLON;
+        set.points.push([c[0] + r * Math.sin(th) * Math.cos(ph), c[1] + r * Math.sin(th) * Math.sin(ph),
+                         c[2] + r * Math.cos(th) * 0.92]);                       // slightly flattened, like an apple
+      }
+    }
+    const south = set.points.length;
+    set.points.push([c[0], c[1], c[2] - 0.92 * r]);
+    const ring = (i, j) => base + 1 + (i - 1) * NLON + ((j % NLON) + NLON) % NLON;
+    for (let j = 0; j < NLON; ++j) set.faces.push([base, ring(1, j), ring(1, j + 1)]);
+    for (let i = 1; i + 1 < NLAT; ++i)
+      for (let j = 0; j < NLON; ++j) {
+        set.faces.push([ring(i, j), ring(i + 1, j), ring(i + 1, j + 1)]);
+        set.faces.push([ring(i, j), ring(i + 1, j + 1), ring(i, j + 1)]);
+      }
+    for (let j = 0; j < NLON; ++j) set.faces.push([south, ring(NLAT - 1, j + 1), ring(NLAT - 1, j)]);
+  }
+  for (let n = 0; n < NF; ++n) {
+    // Fruit sits on the lower and middle scaffolds more than at the top of the cone.
+    const b = pickBranch((x) => (x.leader ? 0.3 * x.len : x.len * (1.2 - 0.7 * x.zf)));
+    const p = along(b.path, wbrandom.real(0.3, 0.95));
+    const r = FR * wbrandom.real(0.85, 1.15);
+    const la = wbrandom.real(0, 2 * Math.PI), lo = wbrandom.real(0.02, 0.10);
+    const c = [p[0] + lo * Math.cos(la), p[1] + lo * Math.sin(la), p[2] - r - wbrandom.real(0.0, 0.04)];
+    sphere(fruit[wbrandom.real(0, 1) < fields.ripeFraction.value ? 0 : 1], c, r);
+  }
+
+  const stakeH = Math.min(0.85 * H, 2.4);
+  const stakeA = wbrandom.real(0, 2 * Math.PI);
+  const shapes = [
+    { set: leaves[0], color: fields.leafColor.value, crease: 0.0, rough: 0.9 },
+    { set: leaves[1], color: fields.leafColor2.value, crease: 0.0, rough: 0.9 },
+    { set: fruit[0], color: fields.fruitColor.value, crease: 1.2, rough: 0.45 },
+    { set: fruit[1], color: fields.fruitColor2.value, crease: 1.2, rough: 0.45 },
+  ].filter((s) => s.set.faces.length > 0);
+>%
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    model "apple tree"
+    recognitionColors [ %<= fields.leafColor.value.r >% %<= fields.leafColor.value.g >% %<= fields.leafColor.value.b >% ]
+    children [
+      Shape {
+        appearance PBRAppearance {
+          baseColor IS barkColor
+          roughness 1
+          metalness 0
+        }
+        geometry IndexedFaceSet {
+          coord Coordinate {
+            point [
+%< for (const p of wood.points) { >%
+              %<= p[0].toFixed(4) >% %<= p[1].toFixed(4) >% %<= p[2].toFixed(4) >%
+%< } >%
+            ]
+          }
+          coordIndex [
+%< for (const f of wood.faces) { >%
+            %<= f[0] >% %<= f[1] >% %<= f[2] >% -1
+%< } >%
+          ]
+          creaseAngle 0.8
+        }
+      }
+%< for (const sh of shapes) { >%
+      Shape {
+        appearance PBRAppearance {
+          baseColor %<= sh.color.r >% %<= sh.color.g >% %<= sh.color.b >%
+          roughness %<= sh.rough >%
+          metalness 0
+        }
+        geometry IndexedFaceSet {
+          coord Coordinate {
+            point [
+%< for (const p of sh.set.points) { >%
+              %<= p[0].toFixed(4) >% %<= p[1].toFixed(4) >% %<= p[2].toFixed(4) >%
+%< } >%
+            ]
+          }
+          coordIndex [
+%< for (const f of sh.set.faces) { >%
+            %<= f[0] >% %<= f[1] >% %<= f[2] >% -1
+%< } >%
+          ]
+          creaseAngle %<= sh.crease >%
+        }
+      }
+%< } >%
+%< if (fields.stake.value) { >%
+      Pose {
+        translation %<= (0.07 * Math.cos(stakeA)).toFixed(4) >% %<= (0.07 * Math.sin(stakeA)).toFixed(4) >% %<= (stakeH / 2 - 0.1).toFixed(4) >%
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS stakeColor
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height %<= stakeH.toFixed(4) >%
+              radius 0.018
+              subdivision 8
+            }
+          }
+        ]
+      }
+%< } >%
+    ]
+    boundingObject Pose {
+      translation 0 0 %<= T / 2 >%
+      children [
+        Cylinder {
+          height %<= T >%
+          radius %<= R0 >%
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+import "GPS.idsl";
+import "Webots2Robocomp.idsl";
+
+Component openfield_concept
+{
+    Communications
+    {
+        requires GPS, Webots2Robocomp;
+    };
+    language Cpp11;
+    options dsr;
+
+};

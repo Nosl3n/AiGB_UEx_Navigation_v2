@@ -1,0 +1,14 @@
+# Base capability + geometry of the Husky A300, read by robot_concept (Agent.base_config_file) and
+# published on the robot node. Same flat keys and units as SVD48VBase/etc/config_diferential.toml
+# (mm, mm/s, rad/s). In simulation the "base component" is Webots2Robocomp (Base.Kinematics = "skid").
+# A skid-steer has no lateral DOF, so it is declared Differential (non-holonomic).
+baseType="Differential"
+# Teleop/navigation ceiling, well under the A300's ~2 m/s.
+maxLinSpeed=1000
+maxRotSpeed=1.5
+maxAcceleration=500
+maxDeceleration=1000
+# Clearpath husky_description (HuskyA300.proto defaults). Geometric track: the skid scrub is modelled
+# by the bridge's Base.TrackScale, not here.
+wheelRadius=165.1
+axesLength=570.8

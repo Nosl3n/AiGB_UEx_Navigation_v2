@@ -1,0 +1,77 @@
+# Cognitive stack for the Husky A300 in the agricultural worlds (plan.md, F4).
+#   python3 cognitive.py cognitive_husky.toml
+# Assumes the sensorimotor layer is up (python3 subcognitive.py sub_husky.toml) and Webots has a
+# webots-agri world open. Every cwd points inside this repo.
+#
+# Order follows the DSR dependency graph:
+#   robot_concept (bootstraps the graph from husky.json) -> openfield_concept (GPS+IMU+wheels pose,
+#   the room_concept replacement, publishes the `field` node) -> residual -> controller (last).
+
+[[components]]
+name = "robot_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/robot_concept"
+cmd  = "bin/robot_concept etc/config_husky.toml"
+
+[[components]]
+name = "openfield_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/openfield_concept"
+cmd  = "bin/openfield_concept etc/config.toml"   # GPS+IMU+wheels EKF -> field node + robot->field RT
+
+# Null-hypothesis safety layer: every LiDAR/ZED return no concept explains becomes occupancy (the palms,
+# for now — there is no agricultural concept yet). Needs openfield_concept's `field` node.
+[[components]]
+name = "residual"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/residual_concept"
+cmd  = "bin/residual_concept etc/config_husky.toml"
+
+# Last: plans on the field polygon + residual's occupancy and drives the base (click a goal in its 2D view).
+[[components]]
+name = "controller"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/controller"
+cmd  = "bin/controller etc/config_husky.toml"
+
+# Plants: each plant is an INDIVIDUAL (a concept): ONE `plant` node plant_<id> per plant, its parts as ATTRIBUTES
+# (active_inference/conceptos.md). Its trunk: the ZED's ADE20K 'tree' masks in the band below the canopy, confirmed
+# by the helios -> the keep-out disc the controller plans around, permanent until the camera verifies it gone. Its
+# canopy: every vegetation mask point on a ground-plane evidence grid -> what hides things (residual counts its
+# returns as explained, human_concept knows no person stands inside it). Needs retina (masks) and openfield's field.
+# (Replaces trunk_concept + vegetation_concept, 2026-11-03.)
+[[components]]
+name = "plant_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/plant_concept"
+cmd  = "bin/plant_concept etc/config.toml"
+
+# Rows: field -> row -> plants. Trunks on a line form a row, a rectangle that grows as trunks join it; one
+# `metaconcept` node row_<id> per row with a group_member edge to each PLANT (in the graph viewer: a layer of
+# rows under the field, each row's plants in a column under it, each plant's trunk and canopy beside it). The controller marks the rows.
+# Re-enabled 2026-11-03 (it was off since 2026-10-14; without it the controller marks every trunk with its own disc).
+[[components]]
+name = "row_metaconcept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/row_metaconcept"
+cmd  = "bin/row_metaconcept etc/config.toml"
+
+# Plots (parcelas): rows planted together — parallel, side by side, at the planting spacing read from the rows —
+# form a plot_<id> metaconcept (group_member -> its rows). A wider gap (headland, another plantation) starts another.
+[[components]]
+name = "plot_metaconcept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/plot_metaconcept"
+cmd  = "bin/plot_metaconcept etc/config.toml"
+
+# The FIELD as a metaconcept: field_0 = the set of plots (group_member -> each plot), born once the plots stop
+# changing. Not the world frame (that is `world`, openfield_concept). world -> field -> plot -> row -> plant.
+[[components]]
+name = "field_metaconcept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/field_metaconcept"
+cmd  = "bin/field_metaconcept etc/config.toml"
+
+# People (part 1 of retina in the field): ZED -> YOLO-seg + YOLO-pose -> 'masks' and 'skeleton' nodes.
+[[components]]
+name = "retina"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/retina"
+cmd  = "bin/retina etc/config_husky.toml"
+
+# BODY_18 skeletons from retina -> one person_* node per tracked person, placed in the field frame.
+[[components]]
+name = "human_concept"
+cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/human_concept"
+cmd  = "bin/human_concept etc/config.toml"

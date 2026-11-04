@@ -1,0 +1,128 @@
+#VRML_SIM R2025a utf8
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Soil.proto"
+# template language: javascript
+# FieldTerrain — tilled farm ground: raised planting beds (camellones) under each crop row, flat-bottomed
+# corridors between them, headlands, a gentle large-scale undulation and fine clod roughness.
+#
+# Heights are relative to z = 0, which is the CORRIDOR / HEADLAND level the robot drives on, so the rest of the
+# stack's "ground ~ z 0" assumption still holds there (see cosas_a_tener_en_cuenta.md). Everything is
+# deterministic from `seed`: the same world reloads identical, so runs are comparable.
+#
+# Bed cross-section (across x, centred on each value of rowX):
+#
+#        |<-- bedTopWidth -->|
+#         ___________________             bedHeight
+#        /                   \            (cosine shoulders, bedShoulder wide each side)
+#  _____/                     \______     0 = corridor floor
+#
+# Along y each bed spans [bedYMin, bedYMax] and rounds off over bedShoulder at both ends.
+
+PROTO FieldTerrain [
+  field SFVec3f    translation    0 0 0
+  field SFRotation rotation       0 0 1 0
+  field SFString   name           "field terrain"
+  field SFVec2f    size           36 36          # m, x by y, centred on translation
+  field SFFloat    spacing        0.1            # m between height samples (bed shoulders need <= 0.1)
+  field MFFloat    rowX           [ -5 -2.5 0 2.5 5 ]   # bed centre lines (= palm rows)
+  field SFFloat    bedYMin        -7.6
+  field SFFloat    bedYMax        7.6
+  field SFFloat    bedHeight      0.20           # m, typical ridge 0.15-0.30
+  field SFFloat    bedTopWidth    0.70
+  field SFFloat    bedShoulder    0.25           # m, horizontal run of each sloping side
+  field SFFloat    clodAmplitude  0.012          # m, fine roughness (clods, footprints), ~0.3-1 m wavelength
+  field SFFloat    swellAmplitude 0.04           # m, large undulation, ~8-15 m wavelength (field not level)
+  field SFInt32    seed           11
+  field SFNode     appearance     Soil { type "braun" color 0.80 0.62 0.45 textureTransform TextureTransform { scale 24 24 } }   # tilled loam: browner and finer-grained than the stock texture
+]
+{
+  %<
+    import * as wbrandom from 'wbrandom.js';
+    wbrandom.seed(fields.seed.value);
+    const sx = fields.size.value.x, sy = fields.size.value.y;
+    const ds = fields.spacing.value;
+    const nx = Math.round(sx / ds) + 1, ny = Math.round(sy / ds) + 1;
+    const rows = fields.rowX.value;
+    const H = fields.bedHeight.value, topHalf = 0.5 * fields.bedTopWidth.value, sh = fields.bedShoulder.value;
+    const y0 = fields.bedYMin.value, y1 = fields.bedYMax.value;
+
+    // Smooth value noise: random lattice values, smoothstep-interpolated. One lattice per octave.
+    function lattice(cell) {
+      const gx = Math.ceil(sx / cell) + 2, gy = Math.ceil(sy / cell) + 2;
+      const v = [];
+      for (let k = 0; k < gx * gy; ++k) v.push(2 * wbrandom.real() - 1);
+      return { cell: cell, gx: gx, v: v };
+    }
+    function sample(L, x, y) {
+      const fx = (x + 0.5 * sx) / L.cell, fy = (y + 0.5 * sy) / L.cell;
+      const i = Math.floor(fx), j = Math.floor(fy);
+      let tx = fx - i, ty = fy - j;
+      tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty);
+      const a = L.v[i + j * L.gx], b = L.v[i + 1 + j * L.gx];
+      const c = L.v[i + (j + 1) * L.gx], d = L.v[i + 1 + (j + 1) * L.gx];
+      return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
+    }
+    const swell = [lattice(12.0), lattice(6.0)];
+    const clods = [lattice(1.0), lattice(0.45), lattice(0.2)];
+
+    // 1 on the flat top, cosine down to 0 over the shoulder, 0 beyond.
+    function profile(d) {
+      if (d <= topHalf) return 1;
+      if (d >= topHalf + sh) return 0;
+      return 0.5 * (1 + Math.cos(Math.PI * (d - topHalf) / sh));
+    }
+    function bed(x, y) {
+      let across = 0;
+      for (let r = 0; r < rows.length; ++r) across = Math.max(across, profile(Math.abs(x - rows[r])));
+      if (across === 0) return 0;
+      // along y: flat between the ends, rounded off over one shoulder beyond them
+      let along = 1;
+      if (y < y0) along = profile(topHalf + (y0 - y));
+      else if (y > y1) along = profile(topHalf + (y - y1));
+      return H * across * along;
+    }
+
+    const h = [];
+    for (let j = 0; j < ny; ++j) {
+      const y = -0.5 * sy + j * ds;
+      for (let i = 0; i < nx; ++i) {
+        const x = -0.5 * sx + i * ds;
+        let z = bed(x, y);
+        z += fields.swellAmplitude.value * (0.7 * sample(swell[0], x, y) + 0.3 * sample(swell[1], x, y));
+        // Clods are rougher on the loose bed soil than on the compacted corridors the wheels run in.
+        const loose = 0.6 + 0.4 * (H > 0 ? z / H : 0);
+        z += fields.clodAmplitude.value * loose *
+             (0.6 * sample(clods[0], x, y) + 0.3 * sample(clods[1], x, y) + 0.1 * sample(clods[2], x, y));
+        h.push(z.toFixed(4));
+      }
+    }
+  >%
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    children [
+      Pose {
+        translation %<= -0.5 * sx >% %<= -0.5 * sy >% 0
+        children [
+          Shape {
+            appearance IS appearance
+            geometry DEF FIELD_GRID ElevationGrid {
+              xDimension %<= nx >%
+              xSpacing %<= ds >%
+              yDimension %<= ny >%
+              ySpacing %<= ds >%
+              thickness 0.5
+              height [ %<= h.join(' ') >% ]
+            }
+            castShadows FALSE
+          }
+        ]
+      }
+    ]
+    boundingObject Pose {
+      translation %<= -0.5 * sx >% %<= -0.5 * sy >% 0
+      children [ USE FIELD_GRID ]
+    }
+    locked TRUE
+  }
+}

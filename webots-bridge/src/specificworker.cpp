@@ -1,0 +1,2811 @@
+/*
+ *    Copyright (C) 2025 by YOUR NAME HERE
+ *
+ *    This file is part of RoboComp
+ *
+ *    RoboComp is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation, either version 3 of the License, or
+ *    (at your option) any later version.
+ *
+ *    RoboComp is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with RoboComp.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include "specificworker.h"
+#include <format>
+#include <charconv>
+#include <webots/Field.hpp>   // tiltAngle read off the scene tree
+#include <set>
+
+#pragma region Robocomp Methods
+
+SpecificWorker::SpecificWorker(const ConfigLoader& configLoader, TuplePrx tprx, bool startup_check) : GenericWorker(configLoader, tprx)
+{
+this->startup_check_flag = startup_check;
+	if(this->startup_check_flag)
+	{
+		this->startup_check();
+	}
+	else
+	{
+		#ifdef HIBERNATION_ENABLED
+			hibernationChecker.start(500);
+		#endif
+
+		
+		// Example statemachine:
+		/***
+		//Your definition for the statesmachine (if you dont want use a execute function, use nullptr)
+		states["CustomState"] = std::make_unique<GRAFCETStep>("CustomState", period, 
+															std::bind(&SpecificWorker::customLoop, this),  // Cyclic function
+															std::bind(&SpecificWorker::customEnter, this), // On-enter function
+															std::bind(&SpecificWorker::customExit, this)); // On-exit function
+
+		//Add your definition of transitions (addTransition(originOfSignal, signal, dstState))
+		states["CustomState"]->addTransition(states["CustomState"].get(), SIGNAL(entered()), states["OtherState"].get());
+		states["Compute"]->addTransition(this, SIGNAL(customSignal()), states["CustomState"].get()); //Define your signal in the .h file under the "Signals" section.
+
+		//Add your custom state
+		statemachine.addState(states["CustomState"].get());
+		***/
+
+		statemachine.setChildMode(QState::ExclusiveStates);
+		statemachine.start();
+
+		auto error = statemachine.errorString();
+		if (error.length() > 0){
+			qWarning() << error;
+			throw error;
+		}
+		
+	}
+}
+
+SpecificWorker::~SpecificWorker()
+{
+	std::cout << "Destroying SpecificWorker" << std::endl;
+
+    if(robot)
+        delete robot;
+}
+
+void SpecificWorker::initialize()
+{
+    std::cout << "Initialize worker" << std::endl;
+    if(this->startup_check_flag)
+    {
+        this->startup_check();
+    }
+    else
+    {
+         try { pars.points3D = configLoader.get<bool>("Camera.ZED.points3D"); } catch(...) {}
+         try { pars.humans = configLoader.get<bool>("Humans"); } catch(...) {}
+
+        // Which doors this provider advertises over DoorControl: the hinge DEFs of the loaded world.
+        // Absent from the config it advertises none, and getCapabilities() reports canActuate=false —
+        // which is the honest answer for a world whose doors are scenery, and is what stops a caller
+        // offering an open-the-door affordance it could never carry out.
+        try { door_control_defs = configLoader.get<std::vector<std::string>>("DoorControl.Doors"); }
+        catch(...) {}
+        if (not door_control_defs.empty())
+            std::cout << "[DoorControl] advertising " << door_control_defs.size() << " door(s)\n";
+
+        // Where the published base velocity comes from, and how often it goes out. Note the string
+        // MUST be quoted in etc/config: ConfigLoader::processLine throws "type not recognized" for a
+        // bare word and the throw escapes load() before any get() runs, so an unquoted value aborts
+        // startup rather than falling back to the default here.
+        std::string velocity_source = "wheels";
+        try { velocity_source = configLoader.get<std::string>("FullPose.VelocitySource"); } catch(...) {}
+        fullpose_velocity_source_ = velocity_source == "supervisor" ? VelocitySource::Supervisor
+                                                                    : VelocitySource::Wheels;
+        try { fullpose_publish_period_ms = configLoader.get<int>("FullPose.PublishPeriod"); } catch(...) {}
+        if (fullpose_publish_period_ms < 1) fullpose_publish_period_ms = 1;
+
+        // Which running gear the loaded world's robot has. Defaults to mecanum, which is what
+        // Shadow.proto is and what every world other than piso.wbt still instantiates.
+        std::string kinematics = "mecanum";
+        try { kinematics = configLoader.get<std::string>("Base.Kinematics"); } catch(...) {}
+        if (kinematics == "differential")
+        {
+            base_kinematics_ = BaseKinematics::Differential;
+            wheel_count_  = 2;
+            wheel_radius_ = 0.100;   // SVD48VBase/etc/config_diferential: wheelRadius = 100 mm
+            half_track_   = 0.259;   //                                    axesLength  = 518 mm, /2
+        }
+        else if (kinematics == "skid")
+        {
+            // Four driven wheels, left pair and right pair commanded together (Husky A300).
+            // Defaults: Clearpath husky_description, also HuskyA300.proto's field defaults.
+            base_kinematics_ = BaseKinematics::Skid;
+            wheel_count_  = 4;
+            wheel_radius_ = 0.1651;
+            half_track_   = 0.5708 / 2.0;
+        }
+        // ...overridable, because a future world may differ from the one robot these came from.
+        try { wheel_radius_ = configLoader.get<double>("Base.WheelRadius"); } catch(...) {}
+        try { half_track_   = configLoader.get<double>("Base.HalfTrack"); } catch(...) {}
+        try { track_scale_  = configLoader.get<double>("Base.TrackScale"); } catch(...) {}
+        if (track_scale_ <= 0.0) track_scale_ = 1.0;
+        try { robot_def_ = configLoader.get<std::string>("Robot.Def"); } catch(...) {}
+        try { gps_period_ms_ = configLoader.get<int>("GPS.Period"); } catch(...) {}
+        load_gnss_config();
+        try { nominal_orient_var_ = configLoader.get<double>("IMU.NominalOrientVar"); } catch(...) {}
+
+        // ── Synthetic sensor error — see the header for why the two channels differ ──
+        try { sensor_noise_enabled_ = configLoader.get<bool>("SensorNoise.Enabled"); } catch(...) {}
+        try { wheel_sigma_v_floor_ = configLoader.get<double>("SensorNoise.WheelSigmaVFloor"); } catch(...) {}
+        try { wheel_sigma_w_floor_ = configLoader.get<double>("SensorNoise.WheelSigmaWFloor"); } catch(...) {}
+        try { wheel_sigma_v_ = configLoader.get<double>("SensorNoise.WheelSigmaV"); } catch(...) {}
+        try { wheel_sigma_w_ = configLoader.get<double>("SensorNoise.WheelSigmaW"); } catch(...) {}
+        try { wheel_scale_v_ = configLoader.get<double>("SensorNoise.WheelScaleV"); } catch(...) {}
+        try { wheel_scale_w_ = configLoader.get<double>("SensorNoise.WheelScaleW"); } catch(...) {}
+        try { gyro_sigma_    = configLoader.get<double>("SensorNoise.GyroSigma"); } catch(...) {}
+        try { gyro_bias_     = configLoader.get<double>("SensorNoise.GyroBias"); } catch(...) {}
+        if (sensor_noise_enabled_)
+            std::printf("[SensorNoise] ON — wheels: sigma_v=%.5g m/sqrt(s) sigma_w=%.5g rad/sqrt(s) "
+                        "scale_v=%+.4f scale_w=%+.4f | gyro: sigma=%.5g rad/sqrt(s) bias=%+.5g rad/s\n"
+                        "[SensorNoise] ⚠ this bridge is NO LONGER publishing ground truth; every "
+                        "consumer sees the corrupted stream, which is the point.\n",
+                        wheel_sigma_v_, wheel_sigma_w_, wheel_scale_v_, wheel_scale_w_,
+                        gyro_sigma_, gyro_bias_);
+
+        try { nominal_gyro_var_ = configLoader.get<double>("IMU.NominalGyroVar"); } catch(...) {}
+        try { nominal_acc_var_  = configLoader.get<double>("IMU.NominalAccVar"); } catch(...) {}
+        try { nominal_vel_var_  = configLoader.get<double>("FullPose.NominalVelVar"); } catch(...) {}
+        try { nominal_rot_var_  = configLoader.get<double>("FullPose.NominalRotVar"); } catch(...) {}
+
+        // Heavy sensors sample independently of the step rate; absent from the config
+        // they follow it, which is the historical behaviour.
+        const int compute_period = this->getPeriod("Compute");
+        sensor_period = compute_period;
+        imu_step_period_ms_ = compute_period;
+        try { sensor_period = configLoader.get<int>("Period.Sensors"); } catch(...) {}
+        if(sensor_period < compute_period)
+        {
+            std::cout << "Period.Sensors (" << sensor_period << ") is below Period.Compute ("
+                      << compute_period << "); clamping to Period.Compute." << std::endl;
+            sensor_period = compute_period;
+        }
+        std::cout << "Compute period: " << compute_period << " ms, sensor period: "
+                  << sensor_period << " ms" << std::endl;
+
+        // pause variable
+        last_read.store(std::chrono::high_resolution_clock::now());
+
+        robot = new webots::Supervisor();
+        robotNode = robot->getFromDef(robot_def_);
+        if (robotNode == nullptr)
+            std::cout << "No robot node with DEF '" << robot_def_ << "' in this world -- set Robot.Def. "
+                      << "Ground-truth pose, FullPose and IMU orientation will be missing." << std::endl;
+        // Resolved once: getField() is a name lookup against the simulator.
+        if(robotNode)
+        {
+            robotRotationField = robotNode->getField("rotation");
+            robotTranslationField = robotNode->getField("translation");
+        }
+
+        // Initialise the motors and the position sensors.
+        // Mecanum order is {wheel2, wheel1, wheel4, wheel3} -- it is what the IK below is written
+        // against, not alphabetical, so do not "tidy" it. Differential is {left, right}, matching
+        // ShadowDiff.proto and the sign convention in the forward kinematics.
+        const char *mecanumMotorNames[4] = {"wheel2", "wheel1", "wheel4", "wheel3"};
+        const char *diffMotorNames[2]    = {"wheel_left", "wheel_right"};
+        // Skid is {left pair, right pair}: indices 0,1 get the left speed and 2,3 the right one.
+        const char *skidMotorNames[4]    = {"front_left", "rear_left", "front_right", "rear_right"};
+        const char **motorNames = base_kinematics_ == BaseKinematics::Differential ? diffMotorNames
+                                : base_kinematics_ == BaseKinematics::Skid         ? skidMotorNames
+                                                                                   : mecanumMotorNames;
+        //const char *sensorNames[4] = {"wheel1sensor", "wheel2sensor", "wheel3sensor", "wheel4sensor"};
+
+        // Initialise the supported sensors.
+        lidar_helios = robot->getLidar("helios");
+        lidar_pearl = robot->getLidar("bpearl");
+        camera = robot->getCamera("camera");
+        range_finder = robot->getRangeFinder("range-finder");
+        camera360_1 = robot->getCamera("camera_360_1");
+        camera360_2 = robot->getCamera("camera_360_2");
+        accelerometer = robot->getAccelerometer("accelerometer");
+        gyroscope = robot->getGyro("gyro");
+        zedRangeFinder = robot->getRangeFinder("zed-ranger");
+        zed = robot->getCamera("zed");
+        // Field sensors (HuskyA300.proto). getDevice() on a missing name returns nullptr and warns;
+        // Shadow worlds have none of these, which is fine.
+        gps_           = dynamic_cast<webots::GPS*>(robot->getDevice("gps"));
+        inertial_unit_ = dynamic_cast<webots::InertialUnit*>(robot->getDevice("inertial unit"));
+        compass_       = dynamic_cast<webots::Compass*>(robot->getDevice("compass"));
+
+        // Enable the components found in the simulation.
+        // Heavy sensors run at sensor_period; the IMU and wheel encoders are cheap and
+        // feed the control loop, so they stay at the step rate.
+        if(lidar_helios) lidar_helios->enable(sensor_period);
+        if(lidar_pearl) lidar_pearl->enable(sensor_period);
+        if(camera) camera->enable(sensor_period);
+        if(range_finder) range_finder->enable(sensor_period);
+        if(camera360_1 && camera360_2){
+            camera360_1->enable(sensor_period);
+            camera360_2->enable(sensor_period);
+        }
+        for (int i = 0; i < 4; i++) { motors[i] = nullptr; ps[i] = nullptr; }
+        for (int i = 0; i < wheel_count_; i++)
+        {
+            motors[i] = robot->getMotor(motorNames[i]);
+            if (motors[i] == nullptr)
+            {
+                std::cout << "No motor named '" << motorNames[i] << "' in this world -- is "
+                          << "Base.Kinematics right for the robot it loads?" << std::endl;
+                continue;
+            }
+            ps[i] = motors[i]->getPositionSensor();
+            if (ps[i]) ps[i]->enable(compute_period);
+            motors[i]->setPosition(INFINITY); // Velocity mode.
+            motors[i]->setVelocity(0);
+        }
+        if(accelerometer) accelerometer->enable(compute_period);
+        if(gyroscope) gyroscope->enable(compute_period);
+        if(inertial_unit_) inertial_unit_->enable(compute_period);
+        if(compass_) compass_->enable(compute_period);
+        if(gps_)
+        {
+            gps_->enable(std::max(gps_period_ms_, compute_period));
+            init_gps_reference();
+            init_gnss_canopy();
+        }
+        if (zedRangeFinder) zedRangeFinder->enable(sensor_period);
+        if (zed) zed->enable(sensor_period);
+
+        // Wheel odometry needs every encoder. Fall back LOUDLY rather than silently, because a quiet
+        // revert to the supervisor is indistinguishable from the wheel path not working.
+        if (fullpose_velocity_source_ == VelocitySource::Wheels)
+            for (int i = 0; i < wheel_count_; i++)
+                if (ps[i] == nullptr)
+                {
+                    std::cout << "No position sensor on motor " << motorNames[i]
+                              << "; falling back to FullPose.VelocitySource = supervisor." << std::endl;
+                    fullpose_velocity_source_ = VelocitySource::Supervisor;
+                    velocity_source = "supervisor";
+                    break;
+                }
+        std::cout << "Base: " << kinematics << " (" << wheel_count_ << " driven wheels, R="
+                  << wheel_radius_ << " m, half-track=" << half_track_ << " m, track scale="
+                  << track_scale_ << ")" << std::endl;
+        std::cout << "FullPose: " << velocity_source << "-derived velocity @ "
+                  << (1000.0 / fullpose_publish_period_ms) << " Hz; IMU @ step rate ("
+                  << (1000.0 / compute_period) << " Hz nominal)" << std::endl;
+
+        // Doors are resolved lazily, by DEF, on the first setDoorAngle that names them (see
+        // setDoorAperture) — there is no single "the" controllable door any more.
+
+        scan_world_extents();
+    }
+}
+
+void SpecificWorker::compute()
+{
+    // Getting simulation timestamp
+    //double now = robot->getTime() * 1000;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    // Webots only refreshes a device's data once per its sampling period, so when the
+    // step rate is faster than sensor_period the extra passes would reprocess the same
+    // point clouds and images. Skip them.
+    const double sim_now_ms = robot != nullptr ? robot->getTime() * 1000.0 : 0.0;
+    const bool new_sensor_sample = sim_now_ms >= next_sensor_sample_ms;
+    if(new_sensor_sample)
+        next_sensor_sample_ms = sim_now_ms + sensor_period;
+
+    // Getting the data from simulation. The robot pose/speed feeds the control loop,
+    // so it is refreshed every step regardless of the sensor rate.
+    if(robot) receiving_robotSpeed(robot, now);
+    if(new_sensor_sample)
+    {
+        if(lidar_helios) receiving_lidarData("helios", lidar_helios, double_buffer_helios,  helios_delay_queue, now);
+        if(lidar_pearl) receiving_lidarData("bpearl", lidar_pearl, double_buffer_pearl, pearl_delay_queue, now);
+        //if(camera) receiving_cameraRGBData(camera, now);
+        //if(range_finder) receiving_depthImageData(range_finder, now);
+        if(camera360_1 and camera360_2) receiving_camera360Data(camera360_1, camera360_2, now);
+        if(zedRangeFinder && zed) receiving_cameraRGBD(zed, zedRangeFinder, zedImage, now);
+    }
+
+    // Refresh the snapshots served by the RPC servants, then drain any work they
+    // queued. Everything that talks to Webots happens on this thread.
+    update_imu_data(now);
+    update_gps_data();
+    update_object_poses();
+    update_door_control();
+    run_webots_tasks();
+
+    // Push any speed command received over RPC since the last step.
+    apply_pending_speed_command();
+
+    robot->step(getPeriod("Compute"));
+
+//    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;
+
+    if(pars.humans)
+    {
+        parseHumanObjects();
+        update_visual_objects();
+    }
+
+    //humansMovement();
+    fps.print("FPS:");
+}
+
+void SpecificWorker::emergency()
+{
+    std::cout << "Emergency worker" << std::endl;
+	//computeCODE
+	//
+	//if (SUCCESSFUL)
+    //  emmit goToRestore()
+}
+
+//Execute one when exiting to emergencyState
+void SpecificWorker::restore()
+{
+    std::cout << "Restore worker" << std::endl;
+	//computeCODE
+	//Restore emergency component
+
+}
+
+int SpecificWorker::startup_check()
+{
+	std::cout << "Startup check" << std::endl;
+	QTimer::singleShot(200, QCoreApplication::instance(), SLOT(quit()));
+	return 0;
+}
+
+#pragma endregion Robocomp Methods
+
+#pragma region Data-Catching Methods
+
+void SpecificWorker::receiving_cameraRGBD(webots::Camera* _camera,
+                                          webots::RangeFinder* _rangeFinder,
+                                          RoboCompCameraRGBDSimple::TRGBD& _image,
+                                          long timestamp)
+{
+
+    RoboCompCameraRGBDSimple::TRGBD new_zed_image;
+
+    // ------------------ Common -----------------------------
+    // Acquisition instant, not loop time: the frame was rendered at the last multiple of the camera's
+    // sampling period, so it can be up to a full sensor_period old. And `period` is the DEVICE's
+    // sampling period -- it used to report fps.get_period(), which is the loop period and left a
+    // consumer no way to infer the frame's age. (CameraRGBDSimple carries no simTimestamp field; only
+    // Lidar3D, IMU and FullPoseEstimation gained one.)
+    const double zed_sim_now_ms = robot != nullptr ? robot->getTime() * 1000.0 : 0.0;
+    const long zed_acq_ms = acquisition_wall_ms(timestamp, zed_sim_now_ms, sensor_period);
+    new_zed_image.image.alivetime = new_zed_image.depth.alivetime = new_zed_image.points.alivetime = zed_acq_ms;
+    new_zed_image.image.period = new_zed_image.depth.period = new_zed_image.points.period =
+        static_cast<float>(sensor_period);
+
+    int width = _camera->getWidth();
+    int height = _camera->getHeight();
+    double cfov = _camera->getFov(); // radianes
+    double cfx = width / (2.0 * tan(cfov / 2.0));
+    double cfy = cfx; // square pixel assumption //height / (2.0 * tan(cfov / 2.0));
+    new_zed_image.image.focalx = cfx;    //TODO: change the type in the IDSL
+    new_zed_image.image.focaly = cfy;
+    new_zed_image.image.width = new_zed_image.depth.width = width;
+    new_zed_image.image.height = new_zed_image.depth.height = height;
+    new_zed_image.image.depth = 3; // RGB
+    new_zed_image.image.compressed = new_zed_image.depth.compressed = new_zed_image.points.compressed = false;
+
+    // -------------------- Imagen RGB --------------------
+    const unsigned char *webotsImageData = _camera->getImage();
+    if (webotsImageData == nullptr) return;   // no sample yet (first cycle, before any step)
+    cv::Mat imageMatBGRA(height, width, CV_8UC4, (void*)webotsImageData);
+
+    cv::Mat imageMatRGB;
+    cv::cvtColor(imageMatBGRA, imageMatRGB, cv::COLOR_BGRA2RGB);
+
+    new_zed_image.image.image.resize(imageMatRGB.total() * imageMatRGB.channels());
+    new_zed_image.image.depth = imageMatRGB.channels();
+
+    std::memcpy(new_zed_image.image.image.data(), imageMatRGB.data, new_zed_image.image.image.size());
+    // TODO: check if this can be done with move_iterator
+
+    // -------------------- Depth image --------------------
+    double fov = _rangeFinder->getFov(); // radianes
+    double fx = width / (2.0 * tan(fov / 2.0));
+    double fy = fx;
+    new_zed_image.depth.focalx = fx;    //TODO: change the type in the IDSL
+    new_zed_image.depth.focaly = fy;
+    new_zed_image.depth.width = _rangeFinder->getWidth();
+    new_zed_image.depth.height = _rangeFinder->getHeight();
+    new_zed_image.depth.depthFactor = 1; // meters
+
+    const float* depthImage = _rangeFinder->getRangeImage();
+    cv::Mat depthMat(height, width, CV_32FC1, (void*)depthImage);
+    new_zed_image.depth.depth.resize(width * height * sizeof(float));
+    // check conditions to avoid problems
+    if (depthMat.data == nullptr)
+    {
+        qWarning() << "Error: Depth data is null.";
+        return;
+    }
+    std::memcpy(new_zed_image.depth.depth.data(), depthMat.data, new_zed_image.depth.depth.size());
+
+    // -------------------- Point Cloud --------------------
+    if(pars.points3D)
+    {
+        RoboCompCameraRGBDSimple::TPoints& points = new_zed_image.points;
+        points.alivetime = zed_acq_ms;                          // acquisition, not loop time
+        points.period = static_cast<float>(sensor_period);      // device period, not loop period
+        points.compressed = false;
+        int offset = 2;
+        points.points.reserve((width / offset) * (height / offset));
+        for (int v = 0; v < height; v=v+offset)
+            for (int u = 0; u < width; u=u+offset)
+            {
+                float Z = depthMat.at<float>(v, u);
+                // if Z is nan or zero, skip the point
+                if (std::isnan(Z) || Z <= 0.0f || Z > 10000.0f) continue;
+                float cx = width / 2.0f;
+                float cy = height / 2.0f;
+                float X = (u - cx) * Z / fx;
+                float Y = (v - cy) * Z / fy;
+                points.points.emplace_back(X, Y, Z);
+            }
+    }
+    double_buffer_zed.put(std::move(new_zed_image));
+}
+
+
+void SpecificWorker::receiving_camera360Data(webots::Camera* _camera1, webots::Camera* _camera2, long timestamp)
+{
+    RoboCompCamera360RGB::TImage newImage360;
+
+    // Both cameras must have the same resolution; otherwise the difference has to be handled.
+    if (_camera1->getWidth() != _camera2->getWidth() || _camera1->getHeight() != _camera2->getHeight())
+    {
+        std::cerr << "Error: Cameras with different resolutions." << std::endl;
+        return;
+    }
+
+    // Acquisition instant, not loop time: both cameras were rendered at the last multiple of their
+    // sampling period, so the frame can be up to a full sensor_period old.
+    const double cam360_sim_now_ms = robot != nullptr ? robot->getTime() * 1000.0 : 0.0;
+    newImage360.timestamp = acquisition_wall_ms(timestamp, cam360_sim_now_ms, sensor_period);
+
+    // The new image is twice as wide, since it joins the two images.
+    newImage360.width = 2 * _camera1->getWidth();
+    newImage360.height = _camera1->getHeight();
+    newImage360.depth = 3; // assuming color images
+
+    // The DEVICE's sampling period, which is what tells a consumer how old this frame may be. It used
+    // to report fps.get_period() -- the loop period, unrelated to when the cameras were rendered.
+    newImage360.period = static_cast<float>(sensor_period);
+
+    const unsigned char* webotsImageData1 = _camera1->getImage();
+    const unsigned char* webotsImageData2 = _camera2->getImage();
+    if (webotsImageData1 == nullptr or webotsImageData2 == nullptr) return;
+    cv::Mat img_1 = cv::Mat(cv::Size(_camera1->getWidth(), _camera1->getHeight()), CV_8UC4);
+    cv::Mat img_2 = cv::Mat(cv::Size(_camera2->getWidth(), _camera2->getHeight()), CV_8UC4);
+    img_1.data = (uchar *)webotsImageData1;
+    cv::cvtColor(img_1, img_1, cv::COLOR_RGBA2RGB);
+    img_2.data = (uchar *)webotsImageData2;
+    cv::cvtColor(img_2, img_2, cv::COLOR_RGBA2RGB);
+    // Plain [cam1 | cam2] concat puts the SEAM between the two 180° captures at the panorama centre —
+    // i.e. cam1's own centre (its optical axis) sits a quarter-width off-centre, not in the middle of
+    // the final image. Slide the whole composite right by half a camera's width (a circular roll) so
+    // cam1 ends up centred and cam2 — which was already spanning the panorama's wrap seam at column 0 —
+    // gets split across both edges instead: new[0:w/2]=cam2's tail, new[w/2:w/2+w]=cam1 (centred),
+    // new[w/2+w:2w]=cam2's head.
+    const int w = _camera1->getWidth();
+    const int shift = w / 2;
+    cv::Mat img_final = cv::Mat(cv::Size(w * 2, _camera1->getHeight()), CV_8UC3);
+    img_2(cv::Rect(w - shift, 0, shift, _camera2->getHeight())).copyTo(img_final(cv::Rect(0, 0, shift, _camera1->getHeight())));
+    img_1.copyTo(img_final(cv::Rect(shift, 0, w, _camera1->getHeight())));
+    img_2(cv::Rect(0, 0, w - shift, _camera2->getHeight())).copyTo(img_final(cv::Rect(shift + w, 0, w - shift, _camera1->getHeight())));
+
+    // Assign the 360 RGB image to RoboComp's TImage type
+    newImage360.image.resize(img_final.total()*img_final.elemSize());
+    memcpy(&newImage360.image[0], img_final.data, img_final.total()*img_final.elemSize());
+
+    //newImage360.image = rgbImage360;
+    newImage360.compressed = false;
+
+    if(pars.delay)
+        camera_queue.push(newImage360);
+
+    // Store the final result in the class attribute (if there is one).
+    double_buffer_360.put(std::move(newImage360));
+
+    //std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;
+}
+
+// Webots refreshes a device's data on steps that are multiples of its sampling period, so the sample
+// currently in hand was taken at the last such multiple -- which is up to a full sensor period before
+// the loop time every payload used to be stamped with. Anything that anchors on "when was this scan
+// taken" (a localizer propagating odometry forward from an optimized pose, say) needs the real instant:
+// at 1.5 rad/s a 32 ms error is 2.7 degrees of heading.
+double SpecificWorker::acquisition_sim_ms(double sim_now_ms, int device_period_ms)
+{
+    if (device_period_ms <= 0) return sim_now_ms;
+    return std::floor(sim_now_ms / device_period_ms) * device_period_ms;
+}
+
+// The same instant on the wall clock. The sample is (sim_now - t_acq) of SIMULATION time old, and the
+// simulation runs slower than the wall by sim_wall_rate_, so it is that much /sim_wall_rate_ of WALL
+// time old. Reuses the estimator commit 5968a65 already put in place.
+long SpecificWorker::acquisition_wall_ms(long loop_wall_ms, double sim_now_ms, int device_period_ms) const
+{
+    const double age_sim_ms = sim_now_ms - acquisition_sim_ms(sim_now_ms, device_period_ms);
+    const double rate = sim_wall_rate_ > 0.05 ? sim_wall_rate_ : 1.0;
+    return loop_wall_ms - static_cast<long>(age_sim_ms / rate);
+}
+
+// Runs in the compute() thread only, from receiving_robotSpeed, so this needs no lock -- same as
+// clock_pairs_. Differences the four wheel encoders over SIMULATION time and inverts the mecanum IK of
+// apply_pending_speed_command(). Returns false when there is no usable sample, in which case the
+// previous velocity is held -- which is what a real odometry driver does on a dropped frame.
+//
+// `publishing` says whether this cycle will emit a FullPose. The published twist is differenced from
+// the PUBLISH anchor, not the step anchor, so it is the exact mean over the interval the consumer will
+// integrate it across (see WheelOdometry in the header for why that matters).
+bool SpecificWorker::update_wheel_odometry(double sim_seconds, bool publishing)
+{
+    double angle[4] = {0, 0, 0, 0};
+    for (int i = 0; i < wheel_count_; ++i)
+    {
+        if (ps[i] == nullptr) { wheel_odo_.valid = false; return false; }
+        angle[i] = ps[i]->getValue();
+        // NaN until the first robot->step(). compute() calls us BEFORE the step, so cycle 1 always
+        // lands here: publish zeros for one cycle rather than a garbage difference.
+        if (not std::isfinite(angle[i])) { wheel_odo_.seeded = false; wheel_odo_.valid = false; return false; }
+    }
+
+    // Closed-form inverse of the IK in apply_pending_speed_command(). See the header for the
+    // derivation and for why the gyro is not fused in here.
+    const auto twist_from = [this](const double *anchor_angle, const double *angle_now, double dt)
+    {
+        double w[4] = {0, 0, 0, 0};
+        for (int i = 0; i < wheel_count_; ++i)
+            w[i] = (angle_now[i] - anchor_angle[i]) / dt;
+
+        const double R = wheel_radius_, c = half_track_;
+        double advz_fk, advx, rot;
+        if (base_kinematics_ == BaseKinematics::Skid)
+        {
+            // w[0],w[1] = left pair, w[2],w[3] = right pair; each side is the mean of its two
+            // encoders. Same model as the differential below, with the effective track.
+            const double wl = 0.5 * (w[0] + w[1]);
+            const double wr = 0.5 * (w[2] + w[3]);
+            advz_fk = R * 0.5 * (wr + wl);
+            advx    = 0.0;
+            rot     = R / (2.0 * c * track_scale_) * (wr - wl);
+        }
+        else if (base_kinematics_ == BaseKinematics::Differential)
+        {
+            // w[0] = left, w[1] = right. A differential base cannot translate sideways, so advx is
+            // structurally zero here -- not measured-as-zero, but absent from the model.
+            advz_fk = R * 0.5       * (w[1] + w[0]);
+            advx    = 0.0;
+            rot     = R / (2.0 * c * track_scale_) * (w[1] - w[0]);
+        }
+        else
+        {
+            advz_fk = R * 0.25      * ( w[0] + w[1] + w[2] + w[3]);
+            advx    = R * 0.25      * (-w[0] + w[1] + w[2] - w[3]);
+            rot     = R / (4.0 * c) * ( w[0] - w[1] + w[2] - w[3]);
+        }
+
+        // apply_pending_speed_command ADDS WHEEL_CENTROID_OFFSET*rot to advz, so a true inverse must
+        // subtract it. A no-op at 0.0, wired in now so the two cannot silently stop being inverses on
+        // the day the one-pivot trial in the header enables the offset.
+        const double advz = advz_fk - WHEEL_CENTROID_OFFSET * rot;
+
+        // (0) = -side, (1) = forward: the shadow_velocity_local convention that pose_data.adv/side and
+        // update_base_state's advVz/advVx already assume, so nothing downstream changes.
+        return std::tuple{Eigen::Vector2f{static_cast<float>(-advx), static_cast<float>(advz)}, rot,
+                          std::array{w[0], w[1], w[2], w[3]}};
+    };
+
+    // First usable sample: anchor BOTH sets together and produce nothing. Seeding only the step anchor
+    // here would leave pub_angle at zero until the first publishing cycle, and by then `seeded` is
+    // already true -- so that publish would difference the ABSOLUTE encoder angle against zero and
+    // report the robot's whole history as one interval's motion. Invisible at world start, where the
+    // angles are ~0, and badly wrong whenever this component restarts against a world already running.
+    if (not wheel_odo_.seeded)
+    {
+        std::copy(std::begin(angle), std::end(angle), std::begin(wheel_odo_.step_angle));
+        std::copy(std::begin(angle), std::end(angle), std::begin(wheel_odo_.pub_angle));
+        wheel_odo_.step_sim_t = sim_seconds;
+        wheel_odo_.pub_sim_t  = sim_seconds;
+        wheel_odo_.seeded = true;
+        wheel_odo_.valid  = false;
+        return false;
+    }
+
+    // dt is NOT constant: hibernation drops the period to 500 ms, and Period.Compute (8) sits below
+    // basicTimeStep so Webots rounds every step anyway. Hence sim time, never a configured period.
+    // Reject dt == 0 (paused simulator: wb_robot_step returns without advancing) and, on the per-step
+    // anchor, anything over a second (resumed pause, blocked step).
+    if (const double step_dt = sim_seconds - wheel_odo_.step_sim_t;
+        step_dt > 1e-4 and step_dt < 1.0)
+    {
+        auto [v, rot, w] = twist_from(wheel_odo_.step_angle, angle, step_dt);
+        wheel_odo_.step_v_local = v;
+        wheel_odo_.step_rot     = rot;
+        std::copy(w.begin(), w.end(), std::begin(wheel_odo_.step_w));
+    }
+    std::copy(std::begin(angle), std::end(angle), std::begin(wheel_odo_.step_angle));
+    wheel_odo_.step_sim_t = sim_seconds;
+
+    if (publishing)
+    {
+        // The publish interval is legitimately long under hibernation (500 ms steps), so CLAMP rather
+        // than reject at the top end here -- unlike the per-step anchor above, a long interval is the
+        // normal case, not a fault. The mean over it is still exact.
+        const double pub_dt = sim_seconds - wheel_odo_.pub_sim_t;
+        if (pub_dt > 1e-4)
+        {
+            auto [v, rot, w] = twist_from(wheel_odo_.pub_angle, angle, pub_dt);
+            if constexpr (BRIDGE_WHEEL_ODOM_EMA_ALPHA < 1.0)
+                v = static_cast<float>(BRIDGE_WHEEL_ODOM_EMA_ALPHA) * v
+                  + static_cast<float>(1.0 - BRIDGE_WHEEL_ODOM_EMA_ALPHA) * wheel_odo_.v_local;
+            wheel_odo_.v_local = v;
+            wheel_odo_.rot     = rot;
+            wheel_odo_.pub_dt  = pub_dt;
+            wheel_odo_.valid   = true;
+        }
+        // Re-anchor even when the sample was rejected, or the next publish differences across the gap.
+        std::copy(std::begin(angle), std::end(angle), std::begin(wheel_odo_.pub_angle));
+        wheel_odo_.pub_sim_t = sim_seconds;
+    }
+
+    return wheel_odo_.valid;
+}
+
+#if BRIDGE_WHEEL_ODOM_DIAG
+// The encoder-derived twist and the supervisor's, in the SAME cycle and both per-SIM-second, so no
+// k_wall can confound the comparison and the difference between them IS the mecanum slip.
+//
+// What each group settles:
+//   wh_*   vs sup_*   -- signs and scale of the forward kinematics, then the slip magnitude
+//   pub_*  vs wh_*    -- that the publish-interval mean is a mean and not an aliased snapshot
+//   gyro_z vs sup_wz  -- the gyro axis, for whoever integrates the IMU downstream
+//   gyro_x/y          -- catches a tilt that would invalidate the upright assumption
+//   yaw_raw           -- UNSHIFTED atan2(R01,R00); unwrap offline. Note it is -theta while
+//                        rotationMatrixToEulerZYX (used by the IMU servants) gives +theta, so
+//                        d(yaw_raw)/dt anti-correlates with wz. That is pre-existing, not a
+//                        regression, and it is why the old yawrate_diag.csv looked inverted.
+void SpecificWorker::log_wheel_odom_diag(double sim_now_ms, long wall_ms, bool publishing,
+                                         const Eigen::Vector2f &sup_v_local_sim, double sup_wz,
+                                         const double *orientation_matrix)
+{
+    static std::ofstream diag("wheel_odom_diag.csv");
+    static bool hdr = false;
+    if (not hdr)
+    {
+        diag.imbue(std::locale::classic());   // never emit a comma decimal separator
+        diag << "sim_t,wall_ms,pub_dt,valid,publishing,w0,w1,w2,w3,"
+                "wh_advx,wh_advz,wh_rot,pub_advx,pub_advz,pub_rot,"
+                "gyro_x,gyro_y,gyro_z,sup_advx,sup_advz,sup_wz,yaw_raw,"
+                "cmd_advx,cmd_advz,cmd_rot,sim_wall_rate\n";
+        hdr = true;
+    }
+    const double *g = gyroscope != nullptr ? gyroscope->getValues() : nullptr;
+    diag << sim_now_ms / 1000.0
+         << ',' << wall_ms
+         << ',' << wheel_odo_.pub_dt
+         << ',' << (wheel_odo_.valid ? 1 : 0)
+         << ',' << (publishing ? 1 : 0);
+    for (const double w : wheel_odo_.step_w) diag << ',' << w;
+    diag << ',' << -wheel_odo_.step_v_local(0)   // back to (advx, advz) for readability
+         << ',' <<  wheel_odo_.step_v_local(1)
+         << ',' <<  wheel_odo_.step_rot
+         << ',' << -wheel_odo_.v_local(0)
+         << ',' <<  wheel_odo_.v_local(1)
+         << ',' <<  wheel_odo_.rot
+         << ',' << (g != nullptr ? g[0] : 0.0)
+         << ',' << (g != nullptr ? g[1] : 0.0)
+         << ',' << (g != nullptr ? g[2] : 0.0)
+         << ',' << -sup_v_local_sim(0)
+         << ',' <<  sup_v_local_sim(1)
+         << ',' <<  sup_wz
+         << ',' << atan2(orientation_matrix[1], orientation_matrix[0])
+         << ',' << last_applied_cmd_.advx
+         << ',' << last_applied_cmd_.advz
+         << ',' << last_applied_cmd_.rot
+         << ',' << sim_wall_rate_ << '\n';
+}
+#endif
+
+void SpecificWorker::receiving_robotSpeed(webots::Supervisor* _robot, long timestamp)
+{
+    const double* shadow_position = robotNode->getPosition();
+    const double* shadow_orientation = robotNode->getOrientation();
+    const double* shadow_velocity = robotNode->getVelocity();
+    const float orientation = atan2(shadow_orientation[1], shadow_orientation[0]) - M_PI_2;
+
+    // Webots reports velocities per SIMULATION second, and that is now what we publish: `simTimestamp`
+    // carries the clock they are measured in, so a consumer integrates the true rate over the matching
+    // clock and needs no correction. sim_wall_rate_ is still estimated -- acquisition_wall_ms() needs
+    // it to turn a sensor's age in sim-ms into an age in wall-ms -- but it no longer scales any
+    // published velocity. See the BRIDGE_WALL_TIME_VELOCITIES note in the header for why the scaling
+    // went away and what turning it back on would mean.
+    update_sim_wall_rate(_robot->getTime(), timestamp);
+#if BRIDGE_WALL_TIME_VELOCITIES
+    const double k_wall = sim_wall_rate_;
+#else
+    const double k_wall = 1.0;
+#endif
+
+#if BRIDGE_YAWRATE_DIAG
+    // DIAGNOSTIC (2026-08-09): is the angular velocity we publish consistent with this node's OWN
+    // rotation? Measured downstream, robot_current_angular_speed integrates to 7.2% more rotation
+    // than actually happened: over a pivot that swept four full turns and closed on its starting
+    // heading (so the true rotation is exactly 1440 deg), odometry read 1543.4 deg while the command
+    // read 1444.0. That was measured against room_concept's map-anchored posterior, which cannot be
+    // 7% wrong on ANGLE because a closed rotation pins it. This log removes the localizer from the
+    // question entirely: both columns below are supervisor reads from the same cycle, so
+    //     d(yaw)/d(sim_time)   vs   wz
+    // is a self-contained check of getVelocity()[5]. Logging sim AND wall time also separates a
+    // pacing problem (sim slower than wall) from a wrong value, and TIME_STEP is 33 ms against this
+    // world's default basicTimeStep of 32, which is worth ruling in or out.
+    // Suspicions, in order: aliasing of a ~0.5-1 s oscillation seen in the published rate (3.5-9% of
+    // the mean, long same-sign runs) against the consumer's ~50 ms window; a phase error between the
+    // sampled velocity and the timestamp; the value simply being wrong.
+    {
+        static std::ofstream diag("yawrate_diag.csv");
+        static bool hdr = false;
+        if (not hdr)
+        {
+            diag.imbue(std::locale::classic());   // never emit a comma decimal separator
+            diag << "sim_t,wall_ms,yaw_raw,wz,vx_world,vy_world,sim_wall_rate\n";
+            hdr = true;
+        }
+        diag << _robot->getTime()
+             << ',' << timestamp
+             << ',' << atan2(shadow_orientation[1], shadow_orientation[0])  // UNSHIFTED: unwrap offline
+             << ',' << shadow_velocity[5]
+             << ',' << shadow_velocity[0]
+             << ',' << shadow_velocity[1]
+             << ',' << sim_wall_rate_ << '\n';
+    }
+#endif
+
+    Eigen::Matrix2f rt_rotation_matrix;
+    rt_rotation_matrix << cos(orientation), -sin(orientation),
+                          sin(orientation), cos(orientation);
+
+    // Multiply the velocity std::vector by the inverse of the rotation matrix to get the velocity in the robot reference system
+    const Eigen::Vector2f shadow_velocity_world(shadow_velocity[1], shadow_velocity[0]);
+    // ... and scale to per-WALL-second, because that is the clock our timestamps use. Both linear and
+    // angular: the unit mismatch applies identically to translation, it was simply only measured on
+    // rotation (which room_concept arbitrates against the room geometry, so it was visible there).
+    const Eigen::Vector2f shadow_velocity_local_sim = rt_rotation_matrix.inverse() * shadow_velocity_world;
+    const Eigen::Vector2f shadow_velocity_local = static_cast<float>(k_wall) * shadow_velocity_local_sim;
+    const double shadow_rot_wall = k_wall * shadow_velocity[5];
+
+    // OmniRobot keeps the supervisor's values and the step rate: it is the ground-truth reference the
+    // new wheel channel is measured against, and getBaseState() callers expect a fresh snapshot every
+    // cycle regardless of how often FullPose goes out. So refresh it BEFORE the publish gate below.
+    update_base_state(shadow_position, shadow_velocity_local, shadow_rot_wall);
+
+    // FullPose is the WHEEL channel and goes out at its own, slower rate -- the IMU keeps the step
+    // rate, and that gap is what a consumer's high-rate injection propagates across. Sample the
+    // encoders every step regardless, so the per-step diagnostic columns stay populated.
+    const double sim_now_ms = _robot->getTime() * 1000.0;
+    const bool publishing = sim_now_ms >= next_fullpose_publish_ms;
+    update_wheel_odometry(_robot->getTime(), publishing);
+
+#if BRIDGE_WHEEL_ODOM_DIAG
+    log_wheel_odom_diag(sim_now_ms, timestamp, publishing,
+                        shadow_velocity_local_sim, shadow_velocity[5], shadow_orientation);
+#endif
+
+    if (not publishing) return;
+    next_fullpose_publish_ms = sim_now_ms + fullpose_publish_period_ms;
+
+    // Both channels are per SIM second, exactly like getVelocity(), so they take the SAME single
+    // k_wall. That holds only because update_wheel_odometry divides by robot->getTime() deltas --
+    // differencing over `timestamp` (wall ms) would already be per-wall-second and k_wall would be
+    // counted twice (~13% at the measured 1.068 sim/wall ratio).
+    Eigen::Vector2f velocity_local = shadow_velocity_local;
+    double          rot_velocity   = shadow_rot_wall;
+    if (fullpose_velocity_source_ == VelocitySource::Wheels)
+    {
+        // No fallback to the supervisor when the wheel sample is not yet valid: the held value is 0,
+        // which is the truth at t=0, and a silent per-cycle source switch would be worse than one
+        // cycle of zeros.
+        velocity_local = static_cast<float>(k_wall) * wheel_odo_.v_local;
+        rot_velocity   = k_wall * wheel_odo_.rot;
+    }
+
+    // ── SYNTHETIC WHEEL ERROR ────────────────────────────────────────────────────────────────────
+    // Applied HERE, on the values actually published, so every consumer sees one consistent corrupted
+    // stream — which is the whole difference between this and a per-consumer test hook. The scale is
+    // constant for the run (a wheel radius does not change per sample); the noise is a density, so the
+    // rate perturbation is sigma/sqrt(dt) and the accumulated increment has variance sigma^2*dt.
+    // dt is the PUBLISH period, because that is the interval a consumer integrates this sample across.
+    if (sensor_noise_enabled_)
+    {
+        const double dt_pub = std::max(1e-3, fullpose_publish_period_ms * 1e-3);
+        const double inv_sqrt_dt = 1.0 / std::sqrt(dt_pub);
+        // ★ SPEED-DEPENDENT, ported from p3bot-bridge 2026-08-29 where it was measured.
+        // A flat density says a PARKED robot's wheels are as noisy as a moving one's. They are not:
+        // an encoder at rest emits no counts, so it reports zero speed with near-certainty — that is
+        // the absence of counts, not a noisy reading of zero. On P3Bot the flat model injected
+        // 0.118 m/s into a demonstrably stationary robot and the localiser, having no way to know
+        // better, random-walked 210 mm over 3963 cycles with ground truth motionless. Fixing it took
+        // the parked drift from 3.49 to 0.122 mm/cycle.
+        // What actually scales with speed is slip and timing: a timing error dt_e becomes a velocity
+        // error v*dt_e/dt, and slip is a fraction of distance travelled — both proportional to v.
+        // Quantisation leaves a small floor.
+        //     sigma(v) = sqrt(sigma_floor^2 + (k_slip * |v|)^2)
+        const auto sigma_at = [](double floor_, double k_slip, double v)
+        { return std::hypot(floor_, k_slip * v); };
+        wheel_sigma_v_eff_ = sigma_at(wheel_sigma_v_floor_, wheel_sigma_v_,
+                                      std::hypot(velocity_local.x(), velocity_local.y()));
+        wheel_sigma_w_eff_ = sigma_at(wheel_sigma_w_floor_, wheel_sigma_w_, std::abs(rot_velocity));
+        velocity_local.x() = static_cast<float>(velocity_local.x() * (1.0 + wheel_scale_v_)
+                                                + generate_noise(wheel_sigma_v_eff_ * inv_sqrt_dt));
+        velocity_local.y() = static_cast<float>(velocity_local.y() * (1.0 + wheel_scale_v_)
+                                                + generate_noise(wheel_sigma_v_eff_ * inv_sqrt_dt));
+        rot_velocity = rot_velocity * (1.0 + wheel_scale_w_)
+                     + generate_noise(wheel_sigma_w_eff_ * inv_sqrt_dt);
+    }
+
+    RoboCompFullPoseEstimation::FullPoseEuler pose_data;
+
+    // Position
+    pose_data.x = static_cast<float>(shadow_position[0]);  // metros → mm
+    pose_data.y = static_cast<float>(shadow_position[1]);
+    pose_data.z = static_cast<float>(shadow_position[2]);
+
+    // Orientation (Euler, radians) 2D
+    pose_data.rx = 0.0;
+    pose_data.ry = 0.0;
+    pose_data.rz = orientation;  // Z angle, already computed
+
+    // Velocities in the world frame
+    pose_data.vx = -velocity_local(0);
+    pose_data.vy = -velocity_local(1);
+    pose_data.vz = 0;
+    pose_data.vrx = 0;
+    pose_data.vry = 0;
+    pose_data.vrz = static_cast<float>(rot_velocity);
+
+    // Velocities in the robot frame
+    pose_data.adv = velocity_local(1);  //y
+    pose_data.side = -velocity_local(0);
+    pose_data.rot = static_cast<float>(rot_velocity); // per WALL second, see sim_wall_rate_
+
+    // Provenance and both clocks. `timestamp` stays wall-clock so latency and staleness still work;
+    // `simTimestamp` is the instant this refers to on the sim clock, which is the one to integrate
+    // over -- the velocities above are per SIM second. Velocity is sampled at the publish instant, so
+    // there is no acquisition lag to subtract here (unlike the lidars).
+    pose_data.source       = "webots-bridge";
+    pose_data.timestamp    = timestamp;
+    pose_data.simTimestamp = static_cast<long>(sim_now_ms);
+    pose_data.simulated    = true;
+
+    // ★ THE VARIANCE ADVERTISED IS THE ONE ACTUALLY USED for this sample, so velCov varies with speed
+    // exactly as the injected noise does. It used to be a bare nominal constant, which made
+    // room_concept's OdomVarianceInjection channel live and INERT — it converts a stated variance to
+    // a density, and a constant has nothing to say. A consumer recovering sigma(v) as sqrt(var*dt)
+    // now gets ~0 at rest (nothing to integrate) and the slip term at speed (the prior loosens where
+    // it should). Ported from p3bot-bridge 2026-08-29.
+    // dt is the PUBLISH period: the interval a consumer integrates one sample across.
+    const double dt_cov = std::max(1e-3, fullpose_publish_period_ms * 1e-3);
+    const double vel_extra = sensor_noise_enabled_
+                           ? wheel_sigma_v_eff_ * wheel_sigma_v_eff_ / dt_cov : 0.0;
+    const double rot_extra = sensor_noise_enabled_
+                           ? wheel_sigma_w_eff_ * wheel_sigma_w_eff_ / dt_cov : 0.0;
+    // A published variance is NEVER 0: zero reads downstream as infinite confidence and hands that
+    // channel unlimited authority, silently. Strictly positive, or exactly -1 for "producer does not
+    // know" — the same contract the pose and acceleration blocks below use.
+    const auto safe_var_v = [](double v) -> double
+    { return (v < 0.0) ? -1.0 : std::max(v, 1e-12); };
+    pose_data.velCov.m00 = static_cast<float>(safe_var_v(nominal_vel_var_ + vel_extra));   // vx
+    pose_data.velCov.m11 = static_cast<float>(safe_var_v(nominal_vel_var_ + vel_extra));   // vy
+    pose_data.velCov.m55 = static_cast<float>(safe_var_v(nominal_rot_var_ + rot_extra));   // vrz
+    pose_data.poseCov.m00 = -1.f;
+    pose_data.accCov.m00  = -1.f;
+
+    this->fullposeestimationpub_pubproxy->newFullPose(pose_data);
+}
+
+// Runs in the compute() thread only (from receiving_robotSpeed), so clock_pairs_ needs no lock.
+void SpecificWorker::update_sim_wall_rate(double sim_seconds, long wall_ms)
+{
+    // Trailing 10 s window, plus a light EMA. The 2 s window this started with was far too
+    // responsive: it ranged 0.88-1.00 frame to frame, which swapped a constant 6.5% bias for a
+    // +-6% time-varying one. Measured cost, matched in-place frames: at |omega| 0.8-1.6 rad/s the
+    // localizer's prediction early-exit fell 99.6% -> 93.3% and frames over its gate went 0% -> 6.7%,
+    // while the margin median did not move -- the signature of variance, not bias. What is being
+    // estimated here is how far behind real time the simulation is running, which is a property of
+    // machine load and changes over seconds to minutes, so estimating it over 10 s and smoothing is
+    // both cheaper and more faithful than tracking every frame.
+    clock_pairs_.emplace_back(sim_seconds, wall_ms);
+    while (clock_pairs_.size() > 2 and (wall_ms - clock_pairs_.front().second) > 10000)
+        clock_pairs_.pop_front();
+
+    const double dwall = (wall_ms - clock_pairs_.front().second) / 1000.0;
+    const double dsim  = sim_seconds - clock_pairs_.front().first;
+
+    // Until there is a real span to divide, leave the rate at its last value (1.0 at startup), which
+    // is the historical per-sim-second behaviour. A paused simulation lands here too: dsim is 0, so
+    // the last good rate is held rather than collapsing the published velocities to zero -- they are
+    // zero anyway while paused.
+    if (dwall < 0.5 or dsim <= 0.0)
+        return;
+
+    const double r = dsim / dwall;
+    // Sane band. Outside it something has gone wrong -- a clock jump, a step that blocked for
+    // seconds, a resumed pause -- and a bogus scale is worse than none, so hold the last good value.
+    if (r > 0.05 and r < 2.0)
+    {
+        // EMA on top of the window, so the published scale cannot step frame to frame. alpha 0.05 at
+        // the ~30 Hz step rate is a time constant of about half a second on top of the 10 s window.
+        constexpr double alpha = 0.05;
+        sim_wall_rate_ = (1.0 - alpha) * sim_wall_rate_ + alpha * r;
+    }
+}
+
+void SpecificWorker::update_base_state(const double *position, const Eigen::Vector2f &velocity_local, double rot_velocity)
+{
+    RoboCompGenericBase::TBaseState state{};
+
+    state.x = static_cast<float>(position[0]);
+    state.z = static_cast<float>(position[1]);
+    state.alpha = robotRotationField != nullptr ? static_cast<float>(robotRotationField->getSFRotation()[3]) : 0.f;
+    state.correctedX = state.x;
+    state.correctedZ = state.z;
+    state.correctedAlpha = state.alpha;
+    state.advVz = velocity_local(1);
+    state.advVx = -velocity_local(0);
+    state.rotV = static_cast<float>(rot_velocity);
+    state.isMoving = std::hypot(state.advVx, state.advVz) > 0.001f or std::fabs(state.rotV) > 0.001f;
+
+    const std::lock_guard<std::mutex> lock(base_state_mutex);
+    base_state = state;
+}
+
+// Called from servant threads: queue a closure to be run in the Webots thread.
+void SpecificWorker::post_webots_task(std::function<void()> task)
+{
+    const std::lock_guard<std::mutex> lock(webots_tasks_mutex);
+    webots_tasks.push_back(std::move(task));
+}
+
+// Called from compute(): drain the queue outside the lock, so a task that takes a
+// while cannot block servants trying to post new ones.
+void SpecificWorker::run_webots_tasks()
+{
+    std::vector<std::function<void()>> tasks;
+    {
+        const std::lock_guard<std::mutex> lock(webots_tasks_mutex);
+        if (webots_tasks.empty()) return;
+        tasks.swap(webots_tasks);
+    }
+    for (auto &task : tasks)
+        task();
+}
+
+double SpecificWorker::generate_noise(double stddev)
+{
+    // Reuse generator to avoid reseeding cost per call.
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::normal_distribution<> d(0.0, stddev);
+    return d(gen);
+}
+
+// Beam geometry that the controller API does NOT expose: `tiltAngle` has no getter on
+// webots::Lidar, so it is read straight off the scene tree. The Lidar lives INSIDE a PROTO
+// (ShadowDiff/Shadow), where getField() returns null — getBaseNodeField() is the accessor that
+// reaches a base node's own field through the PROTO wrapper. Cached per device: a Supervisor
+// getter blocks until the simulator answers, and this value cannot change while the world runs.
+//
+// WHY THIS EXISTS AT ALL. Until 2026-08-29 this function did not read the device's geometry, it
+// INVENTED it: `verticalFov` was overwritten with a hardcoded 2.8 rad for the helios, the layers
+// were spread over that fake span centred on the horizon, and a theta window then carved out an
+// H32F70-shaped fan in software. That worked only as long as nobody changed the proto. When the
+// helios became a real 32-layer / 70 deg / tilt -0.34 device, the same code stretched those 32
+// layers over 160 deg (5.01 deg per layer instead of 2.19), re-centred them on the horizon, and
+// kept the 13 layers that fell inside the window — 900 x 13 = 11700 points of scrambled geometry.
+// The rule this restores: the SIMULATOR's device is the generative model; this bridge reports it,
+// it does not redefine it.
+// The CHANNEL WINDOW: which of the layers Webots generates the real device actually has.
+//
+// Webots spreads numberOfLayers symmetrically about the device horizon and ignores tiltAngle
+// (measured — see receiving_lidarData). An RS-Helios H32F70 is NOT symmetric: its 32 channels
+// span -55..+15 deg. The only way to make those elevations EXIST in the simulator is to generate
+// a symmetric fan wide enough to contain them (110 deg = 2 x 55) and drop the layers the real
+// unit does not have. That is what this window is: a statement about the DEVICE's channel count,
+// applied to elevations that were reconstructed correctly — not the old software carve, which
+// cut a fabricated fan and so moved every point it kept.
+//
+// Absent config => no window => every layer is published. A sensor whose sim fan already matches
+// its channels (bpearl) needs no entry.
+struct ChannelWindow { double lo_deg = -1e9, hi_deg = 1e9; bool set = false; };
+
+static ChannelWindow lidar_channel_window(const ConfigLoader& cl, const std::string& name)
+{
+    static std::map<std::string, ChannelWindow> cache;
+    if (const auto it = cache.find(name); it != cache.end())
+        return it->second;
+    ChannelWindow w;
+    try { w.lo_deg = cl.get<double>("LidarChannels." + name + ".ElevMinDeg"); w.set = true; } catch(...) {}
+    try { w.hi_deg = cl.get<double>("LidarChannels." + name + ".ElevMaxDeg"); w.set = true; } catch(...) {}
+    if (w.set)
+        std::cout << "[Lidar] " << name << ": channel window [" << w.lo_deg << ", " << w.hi_deg
+                  << "] deg — layers outside it are channels the real device does not have"
+                  << std::endl;
+    cache[name] = w;
+    return w;
+}
+
+static double lidar_tilt_angle(webots::Supervisor* sup, webots::Lidar* dev, const std::string& name)
+{
+    static std::map<std::string, double> cache;
+    if (const auto it = cache.find(name); it != cache.end())
+        return it->second;
+
+    double tilt = 0.0;
+    const char* how = "absent -> 0";
+    if (sup != nullptr and dev != nullptr)
+        if (webots::Node* node = sup->getFromDevice(dev); node != nullptr)
+        {
+            webots::Field* f = node->getField("tiltAngle");
+            if (f != nullptr) how = "getField";
+            else { f = node->getBaseNodeField("tiltAngle"); if (f != nullptr) how = "getBaseNodeField"; }
+            if (f != nullptr) tilt = f->getSFFloat();
+        }
+    // The MOUNT as well, because "is the cloud upside down?" cannot be answered from the beam
+    // geometry alone, and reading it here beats inferring it from a proto file that may not be
+    // the one the running world loaded.
+    double rot[4] = {0, 0, 0, 0};
+    if (sup != nullptr and dev != nullptr)
+        if (webots::Node* node = sup->getFromDevice(dev); node != nullptr)
+        {
+            webots::Field* rf = node->getField("rotation");
+            if (rf == nullptr) rf = node->getBaseNodeField("rotation");
+            if (rf != nullptr)
+                if (const double* v = rf->getSFRotation(); v != nullptr)
+                    for (int k = 0; k < 4; ++k) rot[k] = v[k];
+        }
+    std::cout << "[Lidar] " << name << ": tiltAngle = " << tilt << " rad ("
+              << tilt * 180.0 / M_PI << " deg, " << how << ")"
+              << "  node rotation = [" << rot[0] << " " << rot[1] << " " << rot[2]
+              << "] " << rot[3] << " rad" << std::endl;
+    cache[name] = tilt;
+    return tilt;
+}
+
+void SpecificWorker::receiving_lidarData(std::string name, webots::Lidar* _lidar, DoubleBuffer<RoboCompLidar3D::TData, RoboCompLidar3D::TData> &_lidar3dData, FixedSizeDeque<RoboCompLidar3D::TData>& delay_queue, long timestamp)
+{
+    if (!_lidar) { std::cout << "No lidar available." << std::endl; return; }
+
+    const float *rangeImage = _lidar->getRangeImage();
+    if (rangeImage == nullptr) return;   // no sample yet (first cycle, before any step)
+    int horizontalResolution = _lidar->getHorizontalResolution();
+    int verticalResolution = _lidar->getNumberOfLayers();
+    double minRange = _lidar->getMinRange();
+    double maxRange = _lidar->getMaxRange();
+    double fov = _lidar->getFov();
+    double verticalFov = _lidar->getVerticalFov();
+
+    // Timestamp calculation
+//    auto now = std::chrono::system_clock::now();
+//    auto duration = now.time_since_epoch();
+//    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+
+    // Configuration settings
+    RoboCompLaser::TLaserData newLaserData;
+    RoboCompLaser::LaserConfData newLaserConfData;
+    RoboCompLidar3D::TData newLidar3dData;
+
+    // General Lidar values.
+    //
+    // The scan was rendered at the last multiple of the lidar's sampling period, which can be a full
+    // sensor_period before now -- so stamping it with the loop time (as this did) overstates its
+    // freshness by up to that much. A consumer anchoring an optimized pose on this instant and
+    // propagating odometry forward from it eats that error directly: at 1.5 rad/s, 32 ms is 2.7 deg.
+    // `period` likewise reported fps.get_period(), the LOOP period, which left no way to even infer
+    // the staleness; it is the device's sampling period.
+    const double lidar_sim_now_ms = robot != nullptr ? robot->getTime() * 1000.0 : 0.0;
+    newLidar3dData.timestamp    = acquisition_wall_ms(timestamp, lidar_sim_now_ms, sensor_period);
+    newLidar3dData.simTimestamp = static_cast<long>(acquisition_sim_ms(lidar_sim_now_ms, sensor_period));
+    newLidar3dData.simulated    = true;
+    newLidar3dData.period = static_cast<float>(sensor_period);
+    newLaserConfData.maxDegrees = fov;
+    newLaserConfData.maxRange = maxRange;
+    newLaserConfData.minRange = minRange;
+    newLaserConfData.angleRes = fov / horizontalResolution;
+
+    if(!rangeImage) { std::cout << "Lidar data empty." << std::endl; return; }
+
+    // ── Beam geometry comes from the DEVICE. Nothing is hardcoded here. ──────────────────
+    // Was: `if(name == "helios") verticalFov = 2.8;` — see lidar_tilt_angle() above for what
+    // that override cost. verticalFov is already _lidar->getVerticalFov().
+    [[maybe_unused]] const double tiltAngle = lidar_tilt_angle(robot, _lidar, name);
+
+    newLidar3dData.points.reserve(static_cast<size_t>(horizontalResolution) * static_cast<size_t>(verticalResolution));
+    newLaserData.reserve(static_cast<size_t>(horizontalResolution) * static_cast<size_t>(verticalResolution));
+    
+
+    // Precompute angles to avoid sin/cos per point.
+    std::vector<float> h_angle(horizontalResolution);
+    std::vector<float> h_cos(horizontalResolution);
+    std::vector<float> h_sin(horizontalResolution);
+    for (int i = 0; i < horizontalResolution; ++i)
+    {
+        float horizontalAngle = static_cast<float>(M_PI - i * newLaserConfData.angleRes - fov / 2.0);
+        h_angle[i] = horizontalAngle;
+        h_cos[i] = std::cos(horizontalAngle);
+        h_sin[i] = std::sin(horizontalAngle);
+    }
+
+    // Vertical angles, straight from the device's own geometry. Two Webots conventions decide
+    // this, and both are quoted from the Lidar reference rather than assumed:
+    //   * "the verticalFieldOfView field defines the vertical repartition of the layers (angle
+    //     between FIRST and LAST layer)" => the layers span N-1 gaps, not N. For the helios that
+    //     is 70/31 = 2.258 deg, which is exactly residual_concept's HeliosBeamSpacingRad 0.0394.
+    //     (Was verticalFov/N: a 1.6% elevation-scale error on the bpearl's 64 layers, and it is
+    //     the same class of error as the one this commit removes, so it goes too.)
+    //   * "the depth values are ordered from left to right and from the TOP to the BOTTOM layer"
+    //     => j = 0 is the TOP beam.
+    // theta convention in this function: M_PI is the horizon and LARGER than M_PI is DOWN.
+    //
+    // ★★★WEBOTS DOES NOT TILT THE BEAMS. `tiltAngle` is read and logged (below) but deliberately
+    // NOT applied: the fan is symmetric about the device's own horizon, +vfov/2 .. -vfov/2.
+    // MEASURED, not assumed — one recorded helios frame (26220 points, apartment world), each
+    // candidate reconstruction scored against the room the robot is standing in:
+    //
+    //   reconstruction              inside the 0..3 m room   densest plane       wall CV
+    //   no tilt (symmetric)                 100.0%           z=-0.02 m, 4474     0.062
+    //   pitch, tilt -0.34                    72.8%           z=+1.08 m, 1092     0.210
+    //   roll about x, +-0.34                 76-78%          z=+1.08 m           0.113-0.129
+    //   roll about y, +-0.34                 74-78%          z=+1.08 m           0.142-0.157
+    //
+    // Only the untilted fan puts EVERY point inside the room, finds the floor exactly at z = 0
+    // (4474 points), and leaves the walls vertical. The proto says `tiltAngle -0.34`; the data
+    // says the beams do not know about it.
+    // ⚠CONSEQUENCE FOR THE MODEL, not just for this function: the simulated helios is a SYMMETRIC
+    // +-35 deg fan, so the H32F70's real -55..+15 asymmetry is NOT simulated. Inverting the mount
+    // therefore buys 35 deg of up-look, not 54.5. If the asymmetry is wanted it must be baked into
+    // the Lidar NODE's rotation, which Webots does honour (the 180 deg flip is visible in the
+    // data), not into a field it ignores.
+    //
+    // ★ROW 0 IS THE TOP LAYER, as the Lidar reference states. This was briefly reversed on the
+    // strength of an offline re-mapping of one helios frame (it moved more points inside the
+    // room's 0..3 m slab and made a plane appear at the ceiling height). The BPEARL refuted it
+    // outright: reversing dropped its cloud from 18463 to 2384 points, because the theta < M_PI
+    // half-space cut then keeps the physically UP-pointing half of its dome, which mostly returns
+    // nothing. A symmetric fan is not invariant to the reversal after all — the two halves are
+    // mirror images geometrically but NOT in what they hit. The bpearl is the better instrument
+    // here: its floor sits at device z = +0.70 m against a 0.67 m mount, which pins the ordering
+    // directly. Reverted; the remaining helios discrepancy is being chased elsewhere.
+    std::vector<float> v_angle(verticalResolution);
+    std::vector<float> v_cos(verticalResolution);
+    std::vector<float> v_sin(verticalResolution);
+    const double v_step = (verticalResolution > 1) ? verticalFov / (verticalResolution - 1) : 0.0;
+    for (int j = 0; j < verticalResolution; ++j)
+    {
+        const double elev_down = -verticalFov / 2.0 + j * v_step;   // NO tilt term — measured, above
+        float verticalAngle = static_cast<float>(M_PI + elev_down);
+        v_angle[j] = verticalAngle;
+        v_cos[j] = std::cos(verticalAngle);
+        v_sin[j] = std::sin(verticalAngle);
+    }
+    // Which layers the real device actually carries (see lidar_channel_window).
+    const ChannelWindow win = lidar_channel_window(this->configLoader, name);
+    std::vector<char> layer_kept(verticalResolution, 1);
+    int kept_layers = 0;
+    for (int j = 0; j < verticalResolution; ++j)
+    {
+        const double elev_deg = -(v_angle[j] - M_PI) * 180.0 / M_PI;   // + is UP, device frame
+        // The 1e-6 slack is not cosmetic: with the window edge set to exactly the extreme channel
+        // (-55) the last layer lands on -55.0000001 and was silently dropped — 31 kept, not 32.
+        layer_kept[j] = (elev_deg >= win.lo_deg - 1e-6 and elev_deg <= win.hi_deg + 1e-6) ? 1 : 0;
+        kept_layers += layer_kept[j];
+    }
+
+    // One line per device, once, so the reconstructed fan can be checked against the proto
+    // without instrumenting anything. + is UP, and this is the DEVICE frame: an inverted sensor
+    // still reports its own -54.5..+15.5, and the body<-lidar RT edge is what turns it over.
+    static std::set<std::string> announced;
+    if (announced.insert(name).second)
+        std::cout << "[Lidar] " << name << ": layers=" << verticalResolution
+                  << " vfov=" << verticalFov * 180.0 / M_PI << " deg"
+                  << " step=" << v_step * 180.0 / M_PI << " deg"
+                  << " tilt=" << tiltAngle * 180.0 / M_PI << " deg (declared, NOT applied)"
+                  << " -> device-frame elevation span [" << (-(v_angle[verticalResolution-1] - M_PI)) * 180.0 / M_PI
+                  << " .. " << (-(v_angle[0] - M_PI)) * 180.0 / M_PI << "] deg (+ = up)"
+                  << "  channels kept " << kept_layers << "/" << verticalResolution << std::endl;
+
+    // Iterate with horizontal angle outer loop to keep phi-sorted order.
+    for (int i = 0; i < horizontalResolution; ++i)
+    {
+        for (int j = 0; j < verticalResolution; ++j)
+        {
+            int index = j * horizontalResolution + i;
+            static RoboCompLidar3D::TPoint point;
+
+
+            //distance meters to millimeters
+            const float distance = rangeImage[index]; //Meters
+
+            point.phi = h_angle[i];// horizontal angle // -x to get [PI, -PI] instead of [-PI, PI]
+            point.theta = v_angle[j];// vertical angle
+
+            //Calculate Cartesian co-ordinates and rectify axis positions
+            Eigen::Vector3f lidar_point(
+                    distance * h_cos[i] * v_cos[j],
+                    distance * h_sin[i] * v_cos[j],
+                    distance * v_sin[j]);
+
+
+            if (not (std::isinf(lidar_point.x()) or std::isinf(lidar_point.y()) or std::isinf(lidar_point.z())))
+            {
+                point.r = lidar_point.norm();  // distancia radial
+                if (point.r > 0.2)
+                {
+                    // The helios window is GONE. It carved an H32F70-shaped fan (15 deg up,
+                    // 55 deg down about the horizon) out of a sensor the proto declared as 180
+                    // deg — a hardware span emulated in software. The proto now declares the
+                    // real thing (32 layers, 70 deg, tiltAngle -0.34, mounted inverted), so
+                    // carving again would cut a second window out of the first. Every layer the
+                    // device produces is published; what the sensor can see is the sensor's
+                    // business, and it is stated in ONE place now.
+                    // bpearl keeps its half-space cut: theta < M_PI is the up half of its own
+                    // (inverted) device frame, i.e. the downward dome in the world.
+                    if (layer_kept[j] and (name != "bpearl" or point.theta < M_PI))
+                    {
+                        point.x = lidar_point.x();
+                        point.y = lidar_point.y();
+                        point.z = lidar_point.z();
+
+                        point.distance2d = std::hypot(lidar_point.x(),lidar_point.y());  // distance in the xy plane
+
+                        newLidar3dData.points.push_back(point);
+                        newLaserData.push_back(RoboCompLaser::TData{.angle=point.phi, .dist = point.distance2d});
+                    }
+                }
+        
+            }
+        }
+    }
+
+    laserData = newLaserData;
+    laserDataConf = newLaserConfData;
+
+    //Is it necessary to use two lidar queues? One for each lidaR?
+    if(pars.delay)
+        delay_queue.push(newLidar3dData);
+
+    _lidar3dData.put(std::move(newLidar3dData));
+}
+void SpecificWorker::receiving_cameraRGBData(webots::Camera* _camera, long timestamp)
+{
+    RoboCompCameraRGBDSimple::TImage newImage{};
+
+    // Set the image refresh period in milliseconds.
+//    newImage.period = getPeriod("Compute");
+    newImage.period = fps.get_period();
+
+    // Timestamp calculation
+//    auto now = std::chrono::system_clock::now();
+//    auto duration = now.time_since_epoch();
+//    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    newImage.alivetime = timestamp;
+
+    // Get the image resolution.
+    newImage.width = _camera->getWidth();
+    newImage.height = _camera->getHeight();
+    newImage.depth = 3;  // assuming color images
+
+    const unsigned char* webotsImageData = _camera->getImage();
+    cv::Mat imageMatBGRA(newImage.height, newImage.width, CV_8UC4, (void*)webotsImageData);
+    cv::Mat imageMatBGR;
+    cv::cvtColor(imageMatBGRA, imageMatBGR, cv::COLOR_BGRA2BGR);
+
+    newImage.image.resize(imageMatBGR.total() * imageMatBGR.channels());
+    std::memcpy(newImage.image.data(), imageMatBGR.data, newImage.image.size());
+    newImage.compressed = false;
+
+    // Store the final result in the class attribute
+    this->cameraImage = newImage;
+}
+// void SpecificWorker::receiving_depthImageData(webots::RangeFinder* _rangeFinder, long timestamp)
+// {
+//     RoboCompCameraRGBDSimple::TDepth newDepthImage{};
+//
+//     // Set the image refresh period in milliseconds.
+//     newDepthImage.period = fps.get_period();
+//
+//     // Get the depth image resolution.
+//     newDepthImage.width = _rangeFinder->getWidth();
+//     newDepthImage.height = _rangeFinder->getHeight();
+//     newDepthImage.depthFactor = 1;
+//     newDepthImage.compressed = false;
+//
+//     // Get the depth image
+//     const float* webotsDepthData = _rangeFinder->getRangeImage();
+//
+//     // Apply a scale factor to each depth value.
+//     const int imageElementCount = newDepthImage.width * newDepthImage.height;
+//     newDepthImage.depth.resize(static_cast<size_t>(imageElementCount) * sizeof(float));
+//
+//     unsigned char* out = newDepthImage.depth.data();
+//     for (int i = 0; i < imageElementCount; i++)
+//     {
+//         // The scale factor to apply.
+//         float scaledValue = webotsDepthData[i] * 10;
+//         std::memcpy(out + static_cast<size_t>(i) * sizeof(float), &scaledValue, sizeof(float));
+//     }
+//
+//     // Store the final result in the class attribute
+//     this->depthImage = newDepthImage;
+// }
+
+#pragma endregion Data-Catching Methods
+
+#pragma region Camera360
+
+RoboCompCamera360RGB::TImage SpecificWorker::Camera360RGB_getROI(int cx, int cy, int sx, int sy, int roiwidth, int roiheight)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    if(pars.delay)
+    {
+        if(camera_queue.full())
+            return camera_queue.back();
+    }
+
+    return double_buffer_360.get_idemp();
+}
+
+#pragma endregion Camera360
+
+#pragma region CameraRGBDSimple
+
+RoboCompCameraRGBDSimple::TRGBD SpecificWorker::CameraRGBDSimple_getAll(std::string camera)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return double_buffer_zed.get_idemp();
+}
+
+// The partial getters project out the one member they return: copying the whole
+// TRGBD (image + depth + points) to hand back a third of it costs several MB per call.
+RoboCompCameraRGBDSimple::TDepth SpecificWorker::CameraRGBDSimple_getDepth(std::string camera)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return double_buffer_zed.get_idemp_with([](const auto &rgbd) { return rgbd.depth; });
+}
+
+RoboCompCameraRGBDSimple::TImage SpecificWorker::CameraRGBDSimple_getImage(std::string camera)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return double_buffer_zed.get_idemp_with([](const auto &rgbd) { return rgbd.image; });
+}
+
+RoboCompCameraRGBDSimple::TPoints SpecificWorker::CameraRGBDSimple_getPoints(std::string camera)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return double_buffer_zed.get_idemp_with([](const auto &rgbd) { return rgbd.points; });
+}
+
+#pragma endregion CamerRGBDSimple
+
+#pragma region Lidar
+
+RoboCompLaser::TLaserData SpecificWorker::Laser_getLaserAndBStateData(RoboCompGenericBase::TBaseState &bState)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return laserData;
+}
+
+RoboCompLaser::LaserConfData SpecificWorker::Laser_getLaserConfData()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return laserDataConf;
+}
+
+RoboCompLaser::TLaserData SpecificWorker::Laser_getLaserData()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    return laserData;
+}
+RoboCompLidar3D::TColorCloudData SpecificWorker::Lidar3D_getColorCloudData()
+{
+	RoboCompLidar3D::TColorCloudData ret{};
+    printNotImplementedWarningMessage(__FUNCTION__);
+	return ret;
+}
+
+RoboCompLidar3D::TData SpecificWorker::Lidar3D_getLidarData(std::string name, float start, float len, int decimationDegreeFactor)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    if(name == "helios") {
+        if(pars.delay && helios_delay_queue.full())
+            return helios_delay_queue.back();
+        else
+            return double_buffer_helios.get_idemp();
+    }
+    else if(name == "bpearl")
+    {
+        if(pars.delay && pearl_delay_queue.full())
+            return pearl_delay_queue.back();
+        else
+            return double_buffer_pearl.get_idemp();
+    }
+    else
+    {
+        std::cout << "Getting data from a not implemented lidar (" << name << "). Try 'helios' or 'pearl' instead." << std::endl;
+        return RoboCompLidar3D::TData();
+    }
+}
+
+RoboCompLidar3D::TData SpecificWorker::Lidar3D_getLidarDataWithThreshold2d(std::string name, float distance, int decimationDegreeFactor)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("Lidar3D_getLidarDataWithThreshold2d");
+    return RoboCompLidar3D::TData();
+}
+
+RoboCompLidar3D::TDataCategory SpecificWorker::Lidar3D_getLidarDataByCategory(RoboCompLidar3D::TCategories categories, Ice::Long timestamp)
+{
+	RoboCompLidar3D::TDataCategory ret{};
+    printNotImplementedWarningMessage(__FUNCTION__);
+	return ret;
+}
+
+RoboCompLidar3D::TDataImage SpecificWorker::Lidar3D_getLidarDataArrayProyectedInImage(std::string name)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("Lidar3D_getLidarDataArrayProyectedInImage");
+    return RoboCompLidar3D::TDataImage();
+}
+
+RoboCompLidar3D::TData SpecificWorker::Lidar3D_getLidarDataProyectedInImage(std::string name)
+{
+	#ifdef HIBERNATION_ENABLED
+		hibernation = true;
+	#endif
+	RoboCompLidar3D::TData ret{};
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("Lidar3D_getLidarDataProyectedInImage");
+    return ret;
+}
+
+
+#pragma endregion Lidar
+
+#pragma region OmniRobot
+
+void SpecificWorker::OmniRobot_correctOdometer(int x, int z, float alpha)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("OmniRobot_correctOdometer");
+}
+
+void SpecificWorker::OmniRobot_getBasePose(int &x, int &z, float &alpha)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("OmniRobot_getBasePose");
+}
+
+void SpecificWorker::OmniRobot_getBaseState(RoboCompGenericBase::TBaseState &state)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    // Served from the snapshot refreshed by compute(); no Webots call here.
+    const std::lock_guard<std::mutex> lock(base_state_mutex);
+    state = base_state;
+}
+
+void SpecificWorker::OmniRobot_resetOdometer()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("OmniRobot_resetOdometer");
+}
+
+void SpecificWorker::OmniRobot_setOdometer(RoboCompGenericBase::TBaseState state)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("OmniRobot_setOdometer");
+}
+
+void SpecificWorker::OmniRobot_setOdometerPose(int x, int z, float alpha)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    printNotImplementedWarningMessage("OmniRobot_setOdometerPose");
+}
+
+void SpecificWorker::OmniRobot_setSpeedBase(float advx, float advz, float rot)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    // Only queue the command. Webots buffers actuator requests until the next
+    // wb_robot_step() anyway, so applying it in compute() costs no extra actuation
+    // latency and keeps this call at memory-copy speed.
+    // The other end of the same question: a command was accepted here, so if the robot still does
+    // not move the fault is downstream — the motors, or a robot whose Webots controller is not
+    // <extern> and therefore ignores actuator writes entirely.
+    {
+        static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        static bool first = true;
+        const auto now = std::chrono::steady_clock::now();
+        if ((first or now - last > std::chrono::seconds(1))
+            and (advx != 0.f or advz != 0.f or rot != 0.f))
+        {
+            first = false; last = now;
+            std::cout << "[ setSpeedBase ] queued advx=" << advx << " advz=" << advz
+                      << " rot=" << rot << std::endl;
+        }
+    }
+    const std::lock_guard<std::mutex> lock(speed_command_mutex);
+    speed_command = {advx, advz, rot};
+    speed_command_pending = true;
+}
+
+void SpecificWorker::OmniRobot_stopBase()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    const std::lock_guard<std::mutex> lock(speed_command_mutex);
+    speed_command = {0.f, 0.f, 0.f};
+    speed_command_pending = true;
+}
+
+// Runs in the compute() thread, just before robot->step().
+void SpecificWorker::apply_pending_speed_command()
+{
+    SpeedCommand cmd;
+    {
+        const std::lock_guard<std::mutex> lock(speed_command_mutex);
+        if (not speed_command_pending) return;
+        cmd = speed_command;
+        speed_command_pending = false;
+    }
+
+    const double advx     = cmd.advx * 0.001;   // mm/s -> m/s
+    const double advz_cmd = cmd.advz * 0.001;
+
+    // Asymmetric-wheelbase compensation. The formula below is the symmetric mecanum form, so it
+    // rotates the robot about the WHEEL CENTROID rather than about the frame origin the caller means.
+    // MEASURED 08-09 by fitting p_k + R(theta_k)*d = c over a clean pivot (139 deg swept, 4.8 cm of
+    // travel, 4.6 mm mean / 8.2 mm max residual): |d| = 2.72 cm, matching the 3.0 cm the proto's wheel
+    // layout predicts, and lying along ONE axis (the other component was 0.14 cm).
+    //
+    // The offset came out along the robot frame's LATERAL axis, so the origin's induced velocity
+    // during a pivot is LONGITUDINAL -- which is why this term is on advz and not advx as first
+    // written. Still disabled: WHEEL_CENTROID_OFFSET is 0.0 because the SIGN depends on conventions
+    // I could not pin by reading (adv/side to robot x/y differs between the two integrators in
+    // room_concept.cpp:3967 and :4013, and cmd.rot's sign against local z is asserted only by a
+    // stale-looking "CW positive" comment above). Getting it backwards doubles the error to 5.4 cm.
+    // See specificworker.h for the one-pivot trial that settles it.
+    const double advz = advz_cmd + WHEEL_CENTROID_OFFSET * cmd.rot;
+
+#if BRIDGE_WHEEL_ODOM_DIAG
+    last_applied_cmd_ = {advx, advz_cmd, cmd.rot};   // what the wheels were actually told
+#endif
+
+    double speeds[4] = {0, 0, 0, 0};
+    if (base_kinematics_ == BaseKinematics::Differential or base_kinematics_ == BaseKinematics::Skid)
+    {
+        // A differential base has no lateral degree of freedom, so advx is dropped rather than
+        // silently folded into something else. Say so once: a caller commanding side motion is
+        // working from a wrong model of the robot and should hear about it, but not 125 times a
+        // second.
+        if (std::fabs(advx) > 1e-4 and not warned_advx_ignored_)
+        {
+            std::cout << "setSpeedBase: advx=" << advx << " m/s ignored -- this base is differential/skid "
+                      << "and cannot translate sideways." << std::endl;
+            warned_advx_ignored_ = true;
+        }
+        const double c_eff = half_track_ * track_scale_;
+        const double left  = (advz - c_eff * cmd.rot) / wheel_radius_;
+        const double right = (advz + c_eff * cmd.rot) / wheel_radius_;
+        if (base_kinematics_ == BaseKinematics::Skid)
+        {
+            speeds[0] = speeds[1] = left;    // front_left, rear_left
+            speeds[2] = speeds[3] = right;   // front_right, rear_right
+        }
+        else
+        {
+            speeds[0] = left;                // wheel_left
+            speeds[1] = right;               // wheel_right
+        }
+    }
+    else
+    {
+        const double c = half_track_;
+        speeds[0] = (advz - advx + c * cmd.rot) / wheel_radius_;
+        speeds[1] = (advz + advx - c * cmd.rot) / wheel_radius_;
+        speeds[2] = (advz + advx + c * cmd.rot) / wheel_radius_;
+        speeds[3] = (advz - advx - c * cmd.rot) / wheel_radius_;
+    }
+
+    for (int i = 0; i < wheel_count_; i++)
+        if (motors[i] != nullptr)
+            motors[i]->setVelocity(speeds[i]);
+}
+
+#pragma endregion OmniRobot
+
+#pragma region VisualElements
+
+// Runs in the compute() thread, right after parseHumanObjects() has refreshed the map.
+void SpecificWorker::update_visual_objects()
+{
+    RoboCompVisualElements::TObjects objectsList;
+
+    for (const auto &entry : humanObjects)
+    {
+        webots::Node *node = entry.second.node;
+        if (node == nullptr) continue;
+
+        const double *position = node->getPosition();
+
+        RoboCompVisualElements::TObject object;
+        object.id = entry.first;
+        object.x = position[0];
+        object.y = position[1];
+
+        objectsList.objects.push_back(object);
+    }
+
+    const std::lock_guard<std::mutex> lock(visual_objects_mutex);
+    visual_objects = std::move(objectsList);
+}
+
+RoboCompVisualElements::TObjects SpecificWorker::VisualElements_getVisualObjects(RoboCompVisualElements::TObjects objects)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(visual_objects_mutex);
+    return visual_objects;
+}
+void SpecificWorker::VisualElements_setVisualObjects(RoboCompVisualElements::TObjects objects)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    // Implement CODE
+}
+
+#pragma endregion VisualElements
+
+#pragma region Webots2Robocomp Methods
+
+void SpecificWorker::humansMovement()
+{
+    if(!humanObjects.empty())
+        for (auto& human : humanObjects)
+        {
+            qInfo() << "ID" << human.first;
+
+            qInfo() << "Moving human " << human.first << human.second.path.size();
+            moveHumanToNextTarget(human.first);
+
+        }
+}
+
+void SpecificWorker::moveHumanToNextTarget(int humanId)
+{
+    webots::Node *humanNode = humanObjects[humanId].node;
+
+    if(humanNode == nullptr)
+    {
+        qInfo() << "Human not found";
+        return;
+    }
+    humanObjects[humanId].node->getPosition() ;
+    double velocity[3];
+
+    if(humanObjects[humanId].path.empty())
+    {
+        qInfo() <<"Set velocity to 0, path empty";
+        velocity[0] = 0.f;
+        velocity[1] = 0.f;
+        velocity[2] = 0.f;
+    }
+    else
+    {
+        const double *position = humanNode->getPosition();
+
+        Eigen::Vector3d currentTarget {humanObjects[humanId].path.front().x - position[0], humanObjects[humanId].path.front().y - position[1] , 0};
+
+        //Erase path if .norm < d = 300mm
+        if(currentTarget.norm() < 0.3)
+            humanObjects[humanId].path.erase(humanObjects[humanId].path.begin());
+
+        //Print currentTarget std::vector values
+        qInfo() << "TARGET:" << currentTarget.x() << currentTarget.y() << currentTarget.z();
+
+        currentTarget.normalize();
+
+        velocity[0] = currentTarget.x();
+        velocity[1] = currentTarget.y();
+        velocity[2] = 0.f;
+        //Print velocity std::vector values
+        qInfo() << "SPEED:" << velocity[0] << velocity[1] << velocity[2];
+
+    }
+
+    humanNode->setVelocity(velocity);
+}
+
+void SpecificWorker::Webots2Robocomp_setPathToHuman(int humanId, RoboCompGridder::TPath path)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    // Deferred: this both reads the supervisor and mutates humanObjects, which
+    // compute() rewrites. Running it there makes the call return immediately and
+    // removes the race on the map.
+    post_webots_task([this, humanId, path = std::move(path)]
+                     { set_path_to_human(humanId, path); });
+}
+
+void SpecificWorker::set_path_to_human(int humanId, const RoboCompGridder::TPath &path)
+{
+    //static bool overwrite_path = false;
+
+    if(humanObjects[humanId].node == nullptr)
+    {
+        qInfo() << "Human not found";
+        return;
+    }
+
+    if(humanObjects[humanId].path.empty() and path.size() > 3)
+    {
+        RoboCompGridder::TPath transformed_path;
+
+        if(robotTranslationField == nullptr or robotRotationField == nullptr) return;
+        auto x = robotTranslationField->getSFVec3f()[0] * 1000;
+        auto y = robotTranslationField->getSFVec3f()[1] * 1000;
+        auto rot = robotRotationField->getSFRotation();
+
+        Eigen::Vector3d axis(rot[0], rot[1], rot[2]);
+        Eigen::AngleAxisd angleAxis(rot[3], axis.normalized());
+        Eigen::Quaterniond quaternion(angleAxis);
+
+        Eigen::Vector3d eulerAngles = quaternion.toRotationMatrix().eulerAngles(0, 1, 2);
+
+//    //Get transform matrix
+
+        auto tf = create_affine_matrix(eulerAngles.x(), eulerAngles.y(), eulerAngles.z(), Eigen::Vector3d {x, y, 0});
+
+        //    //Print tf matrix values
+//    qInfo() << "Transform matrix" << tf(0,0) << tf(0,1) << tf(0,2) << tf(0,3) << tf(1,0) << tf(1,1) << tf(1,2) << tf(1,3) << tf(2,0) << tf(2,1) << tf(2,2) << tf(2,3) << tf(3,0) << tf(3,1) << tf(3,2) << tf(3,3);
+
+        for(auto &p : path)
+        {
+            Eigen::Vector2f tf_point = (tf.matrix() * Eigen::Vector4d(p.y , -p.x, 0.0, 1.0)).head(2).cast<float>();
+            transformed_path.emplace_back(RoboCompGridder::TPoint(tf_point.x() / 1000, tf_point.y() / 1000 , 100.0));
+            qInfo() << __FUNCTION__ << "point?" << tf_point.x() << tf_point.y();
+        }
+
+        humanObjects[humanId].path = transformed_path;
+    }
+
+}
+
+void SpecificWorker::Webots2Robocomp_resetWebots()
+{
+//implementCODE
+    
+}
+
+void SpecificWorker::Webots2Robocomp_setDoorAngle(std::string DEF, float angle)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    // The DEF is copied into the task: the caller's string is gone by the time the supervisor thread
+    // runs this, and the lookup itself must happen there (Webots node access is not thread-safe).
+    post_webots_task([this, DEF = std::move(DEF), angle] { setDoorAperture(DEF, angle); });
+}
+
+RoboCompWebots2Robocomp::Quaternion axisAngleToQuaternion(const webots::Field &rotation) {
+    RoboCompWebots2Robocomp::Quaternion q;
+
+    double rx = rotation.getSFRotation()[0];
+    double ry = rotation.getSFRotation()[1];
+    double rz = rotation.getSFRotation()[2];
+    const double angle = rotation.getSFRotation()[3];
+
+    // Make sure the axis is normalised (for safety)
+    // Webots usually gives it normalised already, but this avoids errors.
+    if (const double norm = std::sqrt(rx*rx + ry*ry + rz*rz); norm > 0) {
+        rx /= norm;
+        ry /= norm;
+        rz /= norm;
+    }
+
+    // Half-angle formulas
+    const double halfAngle = angle * 0.5;
+    const double sinHalf = std::sin(halfAngle);
+
+    q.w = std::cos(halfAngle);
+    q.x = rx * sinHalf;
+    q.y = ry * sinHalf;
+    q.z = rz * sinHalf;
+
+    return q;
+}
+
+// Runs in the compute() thread: resolve any newly requested DEF, then refresh every
+// tracked pose. The Webots calls happen with no lock held, so servants reading the
+// cache are never blocked by them.
+void SpecificWorker::update_object_poses()
+{
+    std::vector<std::string> defs;
+    {
+        const std::lock_guard<std::mutex> lock(object_poses_mutex);
+        if (object_poses.empty()) return;
+        defs.reserve(object_poses.size());
+        for (const auto &[def, _] : object_poses)
+            defs.push_back(def);
+    }
+
+    std::vector<TrackedObject> refreshed(defs.size());
+    for (size_t i = 0; i < defs.size(); ++i)
+    {
+        const std::string &def = defs[i];
+        refreshed[i].resolved = true;   // resolved means "compute() has tried", not "found"
+
+        auto handles = object_handles.find(def);
+        if (handles == object_handles.end())
+        {
+            TrackedObjectHandles h;
+            if (webots::Node *node = robot->getFromDef(def); node != nullptr)
+            {
+                h.translation = node->getField("translation");
+                h.rotation = node->getField("rotation");
+                if (h.translation == nullptr or h.rotation == nullptr)
+                    std::cout << "Object node dont have postion or rotation" << std::endl;
+            }
+            else
+                std::cout << "Object with DEF:" << def << "not found" << std::endl;
+
+            handles = object_handles.emplace(def, h).first;
+        }
+
+        if (handles->second.translation == nullptr or handles->second.rotation == nullptr)
+            continue;   // leaves a zeroed pose, as the original code returned
+
+        const double *position = handles->second.translation->getSFVec3f();
+        refreshed[i].pose.position = RoboCompWebots2Robocomp::Vector3{
+            static_cast<float>(position[0] * 1000),
+            static_cast<float>(position[1] * 1000),
+            static_cast<float>(position[2] * 1000),
+        };
+        refreshed[i].pose.orientation = axisAngleToQuaternion(*handles->second.rotation);
+    }
+
+    {
+        const std::lock_guard<std::mutex> lock(object_poses_mutex);
+        for (size_t i = 0; i < defs.size(); ++i)
+            object_poses[defs[i]] = refreshed[i];
+    }
+    object_poses_cv.notify_all();
+}
+
+RoboCompWebots2Robocomp::ObjectPose SpecificWorker::Webots2Robocomp_getObjectPose(std::string DEF)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    std::unique_lock<std::mutex> lock(object_poses_mutex);
+    TrackedObject &tracked = object_poses[DEF];   // registers the DEF on first use
+    if (tracked.resolved)
+        return tracked.pose;
+
+    // First ever request for this DEF: nothing cached yet, so wait for one compute()
+    // cycle to resolve it. Bounded, and only ever paid once per DEF.
+    hibernation = true;   // make sure the loop is at full rate while we wait
+    object_poses_cv.wait_for(lock, std::chrono::seconds(1), [&tracked] { return tracked.resolved; });
+    if (not tracked.resolved)
+        std::cout << "Timed out resolving object with DEF:" << DEF << std::endl;
+    return tracked.pose;
+}
+
+// Snapshot taken in initialize() (scan_world_extents); no Webots call here.
+RoboCompWebots2Robocomp::WorldExtents SpecificWorker::Webots2Robocomp_getWorldExtents()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(world_extents_mutex_);
+    return world_extents_;
+}
+
+#pragma endregion Webots2Robocomp Methods
+
+#pragma region JoystickAdapter
+
+//SUBSCRIPTION to sendData method from JoystickAdapter interface
+void SpecificWorker::JoystickAdapter_sendData(RoboCompJoystickAdapter::TData data)
+{
+    // Declaration of the structure to be filled
+    float side=0, adv=0, rot=0;
+    /*
+    // Iterate through the std::list of buttons in the data structure
+    for (RoboCompJoystickAdapter::ButtonParams button : data.buttons) {
+        // Currently does nothing with the buttons
+    }
+    */
+
+    // Iterate through the std::list of axes in the data structure
+    for (RoboCompJoystickAdapter::AxisParams axis : data.axes)
+    {
+        // Process the axis according to its name
+        if(axis.name == "rotate")
+            rot = axis.value;
+        else if (axis.name == "advance")
+            adv = axis.value;
+        else if (axis.name == "side")
+            side = axis.value;
+        else
+            std::cout << "[ JoystickAdapter ] Warning: Using a non-defined axes (" << axis.name << ")." << std::endl;
+    }
+    // ★ SAY WHETHER COMMANDS ARRIVE. "The robot does not move" has at least four causes that look
+    //   identical from outside — the publisher never publishes, the axis NAMES do not match (the
+    //   loop above silently leaves all three at zero for an unknown name), do_joystick is off, or
+    //   the command arrives and the actuation does not follow. Nothing distinguished them, so this
+    //   says what was received. Throttled to 1 Hz, and always reports the FIRST one.
+    {
+        static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        static bool first = true;
+        const auto now = std::chrono::steady_clock::now();
+        if (first or now - last > std::chrono::seconds(1))
+        {
+            first = false; last = now;
+            std::cout << "[ JoystickAdapter ] " << data.axes.size() << " axes -> side=" << side
+                      << " adv=" << adv << " rot=" << rot
+                      << (pars.do_joystick ? "" : "   <- do_joystick is FALSE, command DISCARDED")
+                      << ((side == 0.f and adv == 0.f and rot == 0.f)
+                              ? "   <- all zero: either the stick is centred, or no axis matched the"
+                                " names 'advance'/'side'/'rotate'"
+                              : "")
+                      << std::endl;
+        }
+    }
+    if(pars.do_joystick)
+        OmniRobot_setSpeedBase(side, adv, rot);
+}
+
+#pragma endregion JoystickAdapter
+
+#pragma region IMU
+
+// Runs in the compute() thread. The accelerometer and gyro are sampled at the
+// compute period, so a per-cycle snapshot loses no information.
+void SpecificWorker::update_imu_data(long timestamp)
+{
+    RoboCompIMU::DataImu data{};
+
+    // The IMU is sampled every step, so its acquisition instant IS the current step -- no lag to
+    // subtract, unlike the lidars. simTimestamp is the clock to integrate over: the gyro reports rad
+    // per SIMULATION second, so a consumer integrating it against wall-clock dt over-counts by exactly
+    // the sim/wall ratio (the same defect commit 5968a65 fixed for the published velocities).
+    const long sim_ts = robot != nullptr ? static_cast<long>(robot->getTime() * 1000.0) : 0;
+
+    // Diagonal, isotropic, nominal. See the header for why measuring the simulator's own noise would
+    // be worse than useless here. Off-diagonals stay zero: uncorrelated is the honest claim.
+    const auto diag_cov = [](double var)
+    {
+        RoboCompIMU::Cov3 c{};
+        c.m00 = c.m11 = c.m22 = static_cast<float>(var);
+        return c;
+    };
+    const RoboCompIMU::Cov3 unknown_cov = []{ RoboCompIMU::Cov3 c{}; c.m00 = -1.f; return c; }();
+
+    if (accelerometer != nullptr)
+        if (const double *values = accelerometer->getValues(); values != nullptr)
+            data.acc = {(float)values[0], (float)values[1], (float)values[2],
+                        diag_cov(nominal_acc_var_), timestamp, sim_ts, true};
+
+    if (gyroscope != nullptr)
+        if (const double *values = gyroscope->getValues(); values != nullptr)
+        {
+            // ── SYNTHETIC GYRO ERROR, DELIBERATELY UNLIKE THE WHEELS ─────────────────────────────
+            // A gyro does not scrub, so it gets NO scale — only its own noise and a slow bias, which
+            // is the error a rate gyro actually has. Keeping these independent is what lets a consumer
+            // that prefers the gyro for heading show a real advantage, exactly as on hardware; sharing
+            // one error model between the channels would erase that and misrepresent the sensor.
+            // dt here is the STEP period (the IMU samples every step), not the wheel publish period —
+            // the same sigma therefore means the same accumulated drift on both channels.
+            double gz = values[2];
+            if (sensor_noise_enabled_)
+            {
+                const double dt_step = std::max(1e-3, static_cast<double>(imu_step_period_ms_) * 1e-3);
+                gz += gyro_bias_ + generate_noise(gyro_sigma_ / std::sqrt(dt_step));
+            }
+            // The published variance must describe the data actually sent: a consumer weighting this
+            // by the nominal figure while the samples carry injected noise would be given a covariance
+            // that lies, and every downstream precision would be wrong in the same direction.
+            const double gyro_var = nominal_gyro_var_
+                                  + (sensor_noise_enabled_ ? gyro_sigma_ * gyro_sigma_
+                                                             / std::max(1e-3, static_cast<double>(imu_step_period_ms_) * 1e-3)
+                                                           : 0.0);
+            data.gyro = {(float)values[0], (float)values[1], (float)gz,
+                         diag_cov(gyro_var), timestamp, sim_ts, true};
+        }
+
+    if (inertial_unit_ != nullptr)
+    {
+        // A real attitude sensor (HuskyA300.proto), with its own noise: preferred over the supervisor.
+        // Yaw is about +Z from world +X (ENU east) when WorldInfo.northDirection is 0 1 0 -- the same
+        // angle rotationMatrixToEulerZYX returns below, so consumers see one convention either way.
+        if (const double *rpy = inertial_unit_->getRollPitchYaw(); rpy != nullptr and std::isfinite(rpy[0]))
+            data.rot = {(float)rpy[0], (float)rpy[1], (float)rpy[2], diag_cov(nominal_orient_var_),
+                        timestamp, sim_ts, true};
+    }
+    else if (robotNode != nullptr)
+    {
+        // Still the supervisor's orientation, standing in for the internal fusion a real IMU runs.
+        // It is exact, hence "unknown" rather than a nominal variance -- claiming a number here would
+        // be inventing one, and a zero would read as infinite confidence.
+        const auto [roll, pitch, yaw] = rotationMatrixToEulerZYX(robotNode->getOrientation());
+        data.rot = {roll, pitch, yaw, unknown_cov, timestamp, sim_ts, true};
+    }
+
+    if (compass_ != nullptr)
+        if (const double *m = compass_->getValues(); m != nullptr and std::isfinite(m[0]))
+        {
+            // Webots' compass returns the unit NORTH vector in the device frame, not Tesla.
+            data.mag.XMag = (float)m[0]; data.mag.YMag = (float)m[1]; data.mag.ZMag = (float)m[2];
+        }
+    // Covariance unknown either way (the compass is exact); say so rather than a confident zero.
+    data.mag.cov = unknown_cov;
+    data.mag.timestamp = timestamp;
+    data.mag.simTimestamp = sim_ts;
+    data.mag.simulated = true;
+
+    data.temperature = 0.f;
+
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    imu_data = data;
+}
+
+RoboCompIMU::Acceleration SpecificWorker::IMU_getAcceleration()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data.acc;
+}
+
+RoboCompIMU::Gyroscope SpecificWorker::IMU_getAngularVel()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data.gyro;
+}
+
+RoboCompIMU::DataImu SpecificWorker::IMU_getDataImu()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data;
+}
+
+RoboCompIMU::Magnetic SpecificWorker::IMU_getMagneticFields()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data.mag;
+}
+
+RoboCompIMU::Orientation SpecificWorker::IMU_getOrientation()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(imu_mutex);
+    return imu_data.rot;
+}
+
+std::tuple<float, float, float> SpecificWorker::rotationMatrixToEulerZYX(const double* R)
+{
+    float roll, pitch, yaw;
+
+    if (R[6] < 1.0) {
+        if (R[6] > -1.0) {
+            pitch = std::asin(-R[6]);
+            roll  = std::atan2(R[7], R[8]);
+            yaw   = std::atan2(R[3], R[0]);
+        } else {
+            // R[6] == -1
+            pitch = M_PI / 2.0;
+            roll  = -std::atan2(-R[1], R[4]);
+            yaw   = 0.0;
+        }
+    } else {
+        // R[6] == +1
+        pitch = -M_PI / 2.0;
+        roll  = std::atan2(-R[1], R[4]);
+        yaw   = 0.0;
+    }
+
+    return {roll, pitch, yaw};
+}
+
+void SpecificWorker::IMU_resetImu()
+{
+    printNotImplementedWarningMessage(__FUNCTION__);
+}
+
+#pragma endregion IMU
+
+#pragma region GPS
+
+// WGS84 -> UTM (Snyder, "Map Projections: A Working Manual", eqs. 8-9 .. 8-10). Sub-millimetre
+// over a field. force_zone > 0 keeps a position in the reference's zone even across a boundary, so
+// the local frame never jumps by a zone width.
+void SpecificWorker::wgs84_to_utm(double lat_deg, double lon_deg, int force_zone,
+                                  int &zone, char &band, double &east, double &north)
+{
+    constexpr double a = 6378137.0, f = 1.0 / 298.257223563, k0 = 0.9996;
+    constexpr double e2 = f * (2.0 - f), ep2 = e2 / (1.0 - e2);
+    zone = force_zone > 0 ? force_zone : static_cast<int>(std::floor((lon_deg + 180.0) / 6.0)) + 1;
+    static const char *bands = "CDEFGHJKLMNPQRSTUVWXX";
+    band = (lat_deg >= -80.0 and lat_deg <= 84.0) ? bands[static_cast<int>((lat_deg + 80.0) / 8.0)] : 'Z';
+
+    const double lon0 = ((zone - 1) * 6 - 180 + 3) * M_PI / 180.0;
+    const double phi = lat_deg * M_PI / 180.0, lam = lon_deg * M_PI / 180.0;
+    const double s = std::sin(phi), c = std::cos(phi), t = std::tan(phi);
+    const double N = a / std::sqrt(1.0 - e2 * s * s);
+    const double T = t * t, C = ep2 * c * c, A = c * (lam - lon0);
+    const double M = a * ((1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 * e2 * e2 / 256) * phi
+                        - (3 * e2 / 8 + 3 * e2 * e2 / 32 + 45 * e2 * e2 * e2 / 1024) * std::sin(2 * phi)
+                        + (15 * e2 * e2 / 256 + 45 * e2 * e2 * e2 / 1024) * std::sin(4 * phi)
+                        - (35 * e2 * e2 * e2 / 3072) * std::sin(6 * phi));
+    east  = k0 * N * (A + (1 - T + C) * std::pow(A, 3) / 6
+                      + (5 - 18 * T + T * T + 72 * C - 58 * ep2) * std::pow(A, 5) / 120) + 500000.0;
+    north = k0 * (M + N * t * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * std::pow(A, 4) / 24
+                               + (61 - 58 * T + T * T + 600 * C - 330 * ep2) * std::pow(A, 6) / 720));
+    if (lat_deg < 0) north += 10000000.0;
+}
+
+// The local origin is WorldInfo.gpsReference, so GPS_getPos() is the Webots world frame (x east,
+// y north with northDirection 0 1 0) and a GPS fix can be compared directly against the supervisor.
+void SpecificWorker::init_gps_reference()
+{
+    gps_wgs84_ = gps_ != nullptr and gps_->getCoordinateSystem() == webots::GPS::WGS84;
+    if (not gps_wgs84_)
+    {
+        std::cout << "[GPS] coordinate system is LOCAL: getPos() = Webots x,y,z, getData()/getUTMData() "
+                  << "report no fix. Set WorldInfo.gpsCoordinateSystem \"WGS84\" for lat/lon." << std::endl;
+        return;
+    }
+    double ref[3] = {0, 0, 0};
+    if (webots::Node *root = robot->getRoot(); root != nullptr)
+        if (webots::Field *children = root->getField("children"); children != nullptr)
+            for (int i = 0; i < children->getCount(); ++i)
+                if (webots::Node *n = children->getMFNode(i); n != nullptr and n->getTypeName() == "WorldInfo")
+                {
+                    if (webots::Field *r = n->getField("gpsReference"); r != nullptr)
+                        if (const double *v = r->getSFVec3f(); v != nullptr)
+                            std::copy(v, v + 3, ref);
+                    break;
+                }
+    char band;
+    wgs84_to_utm(ref[0], ref[1], 0, gps_origin_zone_, band, gps_origin_east_, gps_origin_north_);
+    gps_origin_alt_ = ref[2];
+    gps_origin_set_ = true;
+    std::printf("[GPS] WGS84, reference %.7f %.7f %.2f m -> UTM %d%c E %.3f N %.3f (local origin)\n",
+                ref[0], ref[1], ref[2], gps_origin_zone_, band, gps_origin_east_, gps_origin_north_);
+}
+
+// Runs in the compute() thread. Webots refreshes the GPS once per its sampling period; between
+// samples getValues() repeats the last one, which is exactly what a real receiver's driver does.
+void SpecificWorker::update_gps_data()
+{
+    if (gps_ == nullptr) return;
+    const double *v = gps_->getValues();
+    if (v == nullptr or not std::isfinite(v[0])) return;
+
+    GpsState st;
+    if (gps_wgs84_)
+    {
+        st.lat = v[0]; st.lon = v[1]; st.alt = v[2];
+        wgs84_to_utm(st.lat, st.lon, gps_origin_zone_, st.zone, st.band, st.east, st.north);
+        if (gps_reset_requested_.exchange(false))
+        {
+            gps_origin_east_ = st.east; gps_origin_north_ = st.north; gps_origin_alt_ = st.alt;
+            std::printf("[GPS] resetPos: local origin moved to E %.3f N %.3f\n", st.east, st.north);
+        }
+        st.x = st.east - gps_origin_east_;
+        st.y = st.north - gps_origin_north_;
+        st.z = st.alt - gps_origin_alt_;
+    }
+    else
+    {
+        st.x = v[0]; st.y = v[1]; st.z = v[2];
+        if (gps_reset_requested_.exchange(false))
+        {
+            gps_origin_east_ = st.x; gps_origin_north_ = st.y; gps_origin_alt_ = st.z;
+            gps_origin_set_ = true;
+        }
+        if (gps_origin_set_) { st.x -= gps_origin_east_; st.y -= gps_origin_north_; st.z -= gps_origin_alt_; }
+    }
+    st.valid = true;
+
+    // ── GNSS degradation / receiver status: once per receiver epoch (GPS.Period of simulation time) ──────────
+    if (gnss_enabled_ or not gnss_status_path_.empty())
+    {
+        const auto sim_ms = static_cast<std::int64_t>(std::llround(robot->getTime() * 1000.0));
+        if (gnss_last_epoch_ms_ >= 0 and sim_ms - gnss_last_epoch_ms_ < gps_period_ms_)
+        {
+            if (gnss_enabled_) return;            // between epochs: keep serving the last delivered fix
+        }
+        else
+        {
+            gnss_last_epoch_ms_ = sim_ms;
+            gnss::Fix f;
+            if (gnss_enabled_)
+            {
+                f = gnss_.epoch(st.x, st.y, st.z, sim_ms);
+                ++gnss_epochs_;
+                ++gnss_epochs_by_type_[std::clamp(f.fix_type, 0, 5)];
+                if (f.meas_ms > 0)
+                {
+                    st.valid = f.valid;
+                    st.x = f.x; st.y = f.y; st.z = f.z;
+                }
+                else
+                    st.valid = false;                 // nothing delivered yet (latency at start-up)
+                if (gnss_epochs_ % 600 == 0)
+                    std::printf("[GnssDegradation] %llu epochs: fixed %.0f%%, float %.0f%%, single %.0f%%, none %.0f%% "
+                                "(now %d sats, type %d, sigma %.3f m, err %.3f m, multipath %.3f m)\n",
+                                static_cast<unsigned long long>(gnss_epochs_),
+                                100.0 * gnss_epochs_by_type_[4] / gnss_epochs_, 100.0 * gnss_epochs_by_type_[5] / gnss_epochs_,
+                                100.0 * gnss_epochs_by_type_[1] / gnss_epochs_, 100.0 * gnss_epochs_by_type_[0] / gnss_epochs_,
+                                f.n_vis, f.fix_type, f.sigma, f.err, f.mp);
+            }
+            else
+            {
+                f.valid = true; f.x = st.x; f.y = st.y; f.z = st.z; f.sigma = gnss_clean_sigma_; f.fix_type = 4;
+                f.meas_ms = sim_ms;
+            }
+            write_gnss_status(f, sim_ms);
+        }
+    }
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    gps_state_ = st;
+}
+
+void SpecificWorker::load_gnss_config()
+{
+    gnss::Params p;
+    const auto opt = [this](const char *key, auto &out)
+    {
+        try { out = configLoader.get<std::remove_reference_t<decltype(out)>>(key); } catch (...) {}
+    };
+    opt("GnssDegradation.Enabled", gnss_enabled_);
+    opt("GnssDegradation.StatusFile", gnss_status_path_);
+    opt("GnssDegradation.CleanSigmaM", gnss_clean_sigma_);
+    int seed = 1;
+    opt("GnssDegradation.Seed", seed);
+    p.seed = static_cast<std::uint32_t>(seed);
+    p.enabled = gnss_enabled_;
+    opt("GnssDegradation.Satellites", p.n_sats);
+    opt("GnssDegradation.MaskElevationDeg", p.mask_elev_deg);
+    opt("GnssDegradation.BlockChordM", p.block_chord_m);
+    opt("GnssDegradation.FixMinSats", p.fix_min_sats);
+    opt("GnssDegradation.FloatMinSats", p.float_min_sats);
+    opt("GnssDegradation.SingleMinSats", p.single_min_sats);
+    opt("GnssDegradation.ReacquireFixS", p.reacq_fix_s);
+    opt("GnssDegradation.ReacquireFloatS", p.reacq_float_s);
+    opt("GnssDegradation.SigmaFixM", p.sigma_fix_m);
+    opt("GnssDegradation.SigmaFloatM", p.sigma_float_m);
+    opt("GnssDegradation.SigmaSingleM", p.sigma_single_m);
+    opt("GnssDegradation.TauFixS", p.tau_fix_s);
+    opt("GnssDegradation.TauFloatS", p.tau_float_s);
+    opt("GnssDegradation.TauSingleS", p.tau_single_s);
+    opt("GnssDegradation.MultipathRateHz", p.mp_rate_hz);
+    opt("GnssDegradation.MultipathSigmaM", p.mp_sigma_m);
+    opt("GnssDegradation.MultipathTauS", p.mp_tau_s);
+    opt("GnssDegradation.LatencyMs", p.latency_ms);
+    opt("GnssDegradation.OutageRatePerMin", p.outage_rate_per_min);
+    opt("GnssDegradation.OutageMeanS", p.outage_mean_s);
+    for (const auto &[key, denied] : {std::pair{"GnssDegradation.DeniedZones", true}, std::pair{"GnssDegradation.DegradedZones", false}})
+    {
+        // etc/config_husky is read by ConfigLoader's TEXT parser, which has no arrays: the zones are a quoted
+        // string "x0 y0 x1 y1 [x0 y0 x1 y1 ...]" (local metres), parsed locale-free.
+        std::string text;
+        opt(key, text);
+        std::vector<double> v;
+        for (const char *p = text.data(), *end = text.data() + text.size(); p < end;)
+        {
+            while (p < end and (*p == ' ' or *p == ',')) ++p;
+            if (p >= end) break;
+            double d = 0.0;
+            const auto r = std::from_chars(p, end, d);
+            if (r.ec != std::errc()) break;
+            v.push_back(d);
+            p = r.ptr;
+        }
+        for (std::size_t i = 0; i + 3 < v.size(); i += 4)
+            p.zones.push_back({v[i], v[i + 1], v[i + 2], v[i + 3], denied});
+    }
+    gnss_.set_params(p);
+    if (gnss_enabled_)
+    {
+        std::string report;
+        const bool ok = gnss::Degrader::self_test(&report);
+        std::printf("[GnssDegradation] ON (seed %u, %d satellites, mask %.0f deg, latency %.0f ms, %zu zones) — the GPS "
+                    "fix is NO LONGER the plain Webots one\n%s\n", p.seed, p.n_sats, p.mask_elev_deg, p.latency_ms,
+                    p.zones.size(), report.c_str());
+        (void)ok;
+    }
+    if (not gnss_status_path_.empty())
+        std::printf("[GnssDegradation] receiver status -> %s\n", gnss_status_path_.c_str());
+}
+
+// The canopies of the loaded world, read from the scene tree (supervisor): every AppleTree / YoungPalm.
+void SpecificWorker::init_gnss_canopy()
+{
+    if (not gnss_enabled_) return;
+    std::vector<gnss::Canopy> canopy;
+    webots::Node *root = robot->getRoot();
+    webots::Field *children = root ? root->getField("children") : nullptr;
+    const auto f = [](webots::Node *n, const char *name, double def)
+    {
+        webots::Field *fl = n->getField(name);
+        return fl ? fl->getSFFloat() : def;
+    };
+    for (int i = 0; children and i < children->getCount(); ++i)
+    {
+        webots::Node *n = children->getMFNode(i);
+        if (n == nullptr) continue;
+        const std::string type = n->getTypeName();
+        const double *t = n->getField("translation") ? n->getField("translation")->getSFVec3f() : nullptr;
+        if (t == nullptr) continue;
+        if (type == "AppleTree")
+            canopy.push_back({t[0], t[1], t[2] + f(n, "trunkHeight", 0.6), t[2] + f(n, "height", 2.7), f(n, "canopyRadius", 0.55)});
+        else if (type == "YoungPalm")
+            canopy.push_back({t[0], t[1], t[2] + f(n, "trunkHeight", 0.7), t[2] + f(n, "trunkHeight", 0.7) + 0.3,
+                              0.8 * f(n, "frondLength", 0.6)});
+    }
+    // Into the GPS LOCAL frame (the one getPos() serves): world minus the local origin. With a WGS84 world the
+    // local frame IS the world frame (origin = gpsReference = world origin), so this is the identity there.
+    if (not gps_wgs84_ and gps_origin_set_)
+        for (auto &c : canopy) { c.x -= gps_origin_east_; c.y -= gps_origin_north_; }
+    gnss_.set_canopy(std::move(canopy));
+    std::printf("[GnssDegradation] sky model: %zu canopies from the world\n", gnss_.canopy_count());
+}
+
+void SpecificWorker::write_gnss_status(const gnss::Fix &f, std::int64_t deliver_ms)
+{
+    if (gnss_status_path_.empty()) return;
+    // One line, replaced atomically (write + rename): a reader never sees half a fix.
+    const std::string tmp = gnss_status_path_ + ".tmp";
+    if (FILE *fp = std::fopen(tmp.c_str(), "w"); fp != nullptr)
+    {
+        // std::format, not fprintf: the C locale may be es_ES here (decimal COMMA), std::format never is.
+        const std::string line = std::format("{} {} {} {} {:.4f} {:.4f} {:.4f} {:.4f} {} {} {} {} {:.4f} {:.4f}\n",
+                                             ++gnss_seq_, f.meas_ms, deliver_ms, f.valid ? 1 : 0, f.x, f.y, f.z, f.sigma,
+                                             f.fix_type, f.n_vis, f.n_partial, f.n_above, f.mp, f.err);
+        std::fputs(line.c_str(), fp);
+        std::fclose(fp);
+        std::rename(tmp.c_str(), gnss_status_path_.c_str());
+    }
+}
+
+bool SpecificWorker::GPS_getData(float &latitude, float &longitude, float &altitude)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    latitude  = static_cast<float>(gps_state_.lat);
+    longitude = static_cast<float>(gps_state_.lon);
+    altitude  = static_cast<float>(gps_state_.alt);
+    return gps_state_.valid and gps_wgs84_;
+}
+
+bool SpecificWorker::GPS_getPos(float &x, float &y, float &z)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    x = static_cast<float>(gps_state_.x);
+    y = static_cast<float>(gps_state_.y);
+    z = static_cast<float>(gps_state_.z);
+    return gps_state_.valid;
+}
+
+bool SpecificWorker::GPS_getUTMData(int &xzone, std::string &yzone, double &eastering, double &northing)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    const std::lock_guard<std::mutex> lock(gps_mutex_);
+    xzone = gps_state_.zone;
+    yzone = std::string(1, gps_state_.band);
+    eastering = gps_state_.east;
+    northing  = gps_state_.north;
+    return gps_state_.valid and gps_wgs84_;
+}
+
+void SpecificWorker::GPS_resetPos()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+    gps_reset_requested_ = true;   // applied by the compute thread on the next GPS update
+}
+
+#pragma endregion GPS
+
+void SpecificWorker::printNotImplementedWarningMessage(std::string functionName)
+{
+    std::cout << "Function not implemented used: " << "[" << functionName << "]" << std::endl;
+}
+
+Matrix4d SpecificWorker::create_affine_matrix(double a, double b, double c, Vector3d trans)
+{
+
+    Transform<double, 3, Eigen::Affine> t;
+    t = Translation<double, 3>(trans);
+    t.rotate(AngleAxis<double>(a, Vector3d::UnitX()));
+    t.rotate(AngleAxis<double>(b, Vector3d::UnitY()));
+    t.rotate(AngleAxis<double>(c, Vector3d::UnitZ()));
+    return t.matrix();
+}
+
+void SpecificWorker::parseHumanObjects() {
+    webots::Node* crowdNode = robot->getFromDef("CROWD");
+    if(!crowdNode){
+
+        static bool ErrorFlag = false;
+        if(!ErrorFlag){
+            qInfo() << "CROWD Node not found.";
+            ErrorFlag = true;
+        }
+
+        return;
+    }
+
+    webots::Field* childrenField = crowdNode->getFieldByIndex(0);
+    for (int i = 0; i < childrenField->getCount(); ++i)
+    {
+        std::string nodeDEF = childrenField->getMFNode(i)->getDef();
+        if(nodeDEF.find("HUMAN_") != std::string::npos)
+            humanObjects[i].node = childrenField->getMFNode(i);
+    }
+}
+
+// Open/close the hinged door named by its Webots DEF. Runs on the supervisor thread (posted by
+// Webots2Robocomp_setDoorAngle), which is the only thread allowed to touch webots::Node.
+//
+// The DEF is a PARAMETER now, not the single hard-wired CONTROLLABLE_DOOR: a scene has more than one
+// door, and only the caller knows which one it means. An unknown DEF, or a node with no `position`
+// field, is reported and ignored — a request to move a door that is not there must fail loudly and
+// change nothing, never silently move a different one.
+void SpecificWorker::setDoorAperture(const std::string &DEF, float _aperture) {
+
+    if (DEF.empty()) {
+        std::cerr << "[Error] setDoorAngle called with an empty DEF.\n";
+        return;
+    }
+
+    // Resolved once per DEF and cached: getFromDef walks the scene tree, and this can be called every
+    // control cycle while an affordance servos the door open. A null result is cached too — it means
+    // "this scene has no such node", which does not change while the world is loaded.
+    auto it = doorNodes.find(DEF);
+    if (it == doorNodes.end())
+        it = doorNodes.emplace(DEF, robot->getFromDef(DEF)).first;
+    webots::Node *door = it->second;
+    if (!door) {
+        std::cerr << "[Error] no node with DEF '" << DEF << "' in this world — door not moved.\n";
+        return;
+    }
+
+    // Clamp the input value to the range [-pi, 0]
+    float minAperture = -static_cast<float>(M_PI);
+    float maxAperture = 0.0f;
+
+    if (_aperture < minAperture || _aperture > maxAperture) {
+        std::cout << "[Warning] The aperture value " << _aperture
+                  << " is out of the allowed range ["
+                  << minAperture << ", " << maxAperture
+                  << "]. It will be clamped automatically.\n";
+    }
+
+    float aperture = std::clamp(_aperture, minAperture, maxAperture);
+
+    // Get the "position" field of the door node. Present on a HingeJoint's jointParameters — a DEF that
+    // names, say, the door's Solid instead of its joint resolves fine above and fails here, so the
+    // message names the DEF: that is the difference between "wrong door" and "wrong node in the door".
+    webots::Field *positionField = door->getField("position");
+    if (!positionField) {
+        std::cerr << "[Error] node '" << DEF << "' has no 'position' field — it is not a hinge joint "
+                     "(is this the door's Solid rather than its HingeJoint?).\n";
+        return;
+    }
+
+    // Set the door position
+    positionField->setSFFloat(aperture);
+    std::cout << "[Info] Door '" << DEF << "' aperture set to " << aperture << " rad.\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DoorControl — the simulator as one provider among several
+//
+// Nothing below reports whether a door IS open: it reports what this provider did about a
+// REQUEST. The caller confirms the door moved by looking at it. That is not a limitation of the
+// simulator — it is the contract that lets the same caller talk to a relay in a real apartment,
+// or to a component that asks a person, without changing a line.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+// Runs in the compute() (Webots) thread. Refreshes the advertised door list: for each hinge DEF
+// named in config, where is it. The caller associates these poses with its own fitted apertures,
+// so the ids here stay opaque — they happen to be Webots DEFs, and nothing outside may assume it.
+void SpecificWorker::update_door_control()
+{
+    if (door_control_defs.empty() or robot == nullptr) return;
+
+    RoboCompDoorControl::DoorRefList doors;
+    doors.reserve(door_control_defs.size());
+    for (const auto &def : door_control_defs)
+    {
+        auto it = doorNodes.find(def);
+        if (it == doorNodes.end())
+            it = doorNodes.emplace(def, robot->getFromDef(def)).first;
+        if (it->second == nullptr) continue;    // named in config but not in this world
+
+        // A hinge's jointParameters carries `anchor`, not `translation`: the pose that matters to a
+        // caller is the door's PLACE, so walk up to the parent Solid, which is the node that has one.
+        webots::Node *placed = it->second;
+        webots::Field *t = placed->getField("translation");
+        for (int hop = 0; t == nullptr and hop < 3; ++hop)
+        {
+            placed = placed->getParentNode();
+            if (placed == nullptr) break;
+            t = placed->getField("translation");
+        }
+        if (t == nullptr) continue;
+
+        const double *p = t->getSFVec3f();
+        RoboCompDoorControl::DoorRef ref;
+        ref.id = def;
+        ref.pose.x = static_cast<float>(p[0] * 1000.0);      // mm, to match getObjectPose
+        ref.pose.y = static_cast<float>(p[1] * 1000.0);
+        ref.pose.angle = 0.f;
+        if (webots::Field *r = placed->getField("rotation"); r != nullptr)
+        {
+            const double *rot = r->getSFRotation();
+            ref.pose.angle = static_cast<float>(rot[2] >= 0 ? rot[3] : -rot[3]);   // z-axis only
+        }
+        ref.width = 1000.f;
+        doors.push_back(ref);
+    }
+
+    const std::lock_guard<std::mutex> lock(door_control_mutex);
+    door_control_doors = std::move(doors);
+}
+
+RoboCompDoorControl::Capabilities SpecificWorker::DoorControl_getCapabilities()
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    RoboCompDoorControl::Capabilities caps;
+    const std::lock_guard<std::mutex> lock(door_control_mutex);
+    caps.doors = door_control_doors;
+    caps.canActuate = not caps.doors.empty();
+    caps.continuousAngle = true;          // a supervisor teleport can hold any angle
+    caps.requiresHuman = false;           // nobody is being asked a favour here
+    caps.typicalLatencySec = 0.1f;        // one compute() period: the task runs before the next step
+    return caps;
+}
+
+RoboCompDoorControl::RequestAck SpecificWorker::DoorControl_requestDoor(RoboCompDoorControl::DoorRequest req)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    RoboCompDoorControl::RequestAck ack;
+    ack.requestId = 0;
+    ack.accepted = false;
+    ack.refusal = RoboCompDoorControl::RefusalReason::UnknownDoor;
+    ack.expectedLatencySec = 0.1f;
+
+    // Resolve the door. The caller normally quotes an id we advertised; if it quotes none (or one we
+    // do not know) fall back to matching by PLACE, which is the resolution rule that survives when
+    // the provider is swapped for one that never heard of Webots DEFs.
+    std::string def;
+    {
+        const std::lock_guard<std::mutex> lock(door_control_mutex);
+        for (const auto &d : door_control_doors)
+            if (d.id == req.doorId) { def = d.id; break; }
+
+        if (def.empty())
+        {
+            float best = 400.f;   // mm; beyond this it is a different door, not a noisy estimate
+            for (const auto &d : door_control_doors)
+            {
+                const float dx = d.pose.x - req.door.pose.x, dy = d.pose.y - req.door.pose.y;
+                if (const float dist = std::sqrt(dx * dx + dy * dy); dist < best)
+                    { best = dist; def = d.id; }
+            }
+        }
+    }
+    if (def.empty())
+    {
+        std::cerr << "[DoorControl] no door matches id '" << req.doorId << "' or place ("
+                  << req.door.pose.x << ", " << req.door.pose.y << ") — refusing.\n";
+        return ack;   // UnknownDoor: telling the caller to stop asking is more useful than silence
+    }
+
+    // setDoorAperture clamps to [-pi, 0]; 0 is flush. "Open" without a usable hint means 90 degrees.
+    float target = 0.f;
+    if (req.action == RoboCompDoorControl::DoorAction::OpenDoor)
+        target = (req.apertureHint < -1e-3f) ? req.apertureHint
+                                             : -static_cast<float>(M_PI) / 2.f;
+
+    int id = 0;
+    {
+        const std::lock_guard<std::mutex> lock(door_control_mutex);
+        id = door_control_next_id++;
+        door_control_requests[id] = RoboCompDoorControl::RequestStatus{
+            id, RoboCompDoorControl::RequestState::Queued, RoboCompDoorControl::RefusalReason::NoRefusal};
+    }
+
+    post_webots_task([this, id, def, target]
+    {
+        setDoorAperture(def, target);
+        const std::lock_guard<std::mutex> lock(door_control_mutex);
+        if (auto it = door_control_requests.find(id); it != door_control_requests.end()
+            and it->second.state != RoboCompDoorControl::RequestState::Aborted)
+            it->second.state = RoboCompDoorControl::RequestState::Delivered;
+    });
+
+    ack.requestId = id;
+    ack.accepted = true;
+    ack.refusal = RoboCompDoorControl::RefusalReason::NoRefusal;
+    return ack;
+}
+
+RoboCompDoorControl::RequestStatus SpecificWorker::DoorControl_getRequestStatus(int requestId)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    const std::lock_guard<std::mutex> lock(door_control_mutex);
+    if (auto it = door_control_requests.find(requestId); it != door_control_requests.end())
+        return it->second;
+
+    // An id we never issued. Aborted rather than a throw: a caller polling across a provider
+    // restart should be told to give up on this request, not handed an exception to special-case.
+    return RoboCompDoorControl::RequestStatus{requestId, RoboCompDoorControl::RequestState::Aborted,
+                                             RoboCompDoorControl::RefusalReason::NoRefusal};
+}
+
+void SpecificWorker::DoorControl_cancelRequest(int requestId)
+{
+    last_read.store(std::chrono::high_resolution_clock::now());
+
+    const std::lock_guard<std::mutex> lock(door_control_mutex);
+    if (auto it = door_control_requests.find(requestId); it != door_control_requests.end()
+        and it->second.state == RoboCompDoorControl::RequestState::Queued)
+        it->second.state = RoboCompDoorControl::RequestState::Aborted;
+    // Already delivered: the teleport happened, and pretending otherwise would be a lie.
+}
+
+
+/**************************************/
+// From the RoboCompFullPoseEstimationPub you can publish calling this methods:
+// RoboCompFullPoseEstimationPub::void this->fullposeestimationpub_pubproxy->newFullPose(RoboCompFullPoseEstimation::FullPoseEuler pose)
+
+/**************************************/
+// From the RoboCompCamera360RGB you can use this types:
+// RoboCompCamera360RGB::TRoi
+// RoboCompCamera360RGB::TImage
+
+/**************************************/
+// From the RoboCompCameraRGBDSimple you can use this types:
+// RoboCompCameraRGBDSimple::Point3D
+// RoboCompCameraRGBDSimple::TPoints
+// RoboCompCameraRGBDSimple::TImage
+// RoboCompCameraRGBDSimple::TDepth
+// RoboCompCameraRGBDSimple::TRGBD
+
+/**************************************/
+// From the RoboCompIMU you can use this types:
+// RoboCompIMU::Acceleration
+// RoboCompIMU::Gyroscope
+// RoboCompIMU::Magnetic
+// RoboCompIMU::Orientation
+// RoboCompIMU::DataImu
+
+/**************************************/
+// From the RoboCompLaser you can use this types:
+// RoboCompLaser::LaserConfData
+// RoboCompLaser::TData
+
+/**************************************/
+// From the RoboCompLidar3D you can use this types:
+// RoboCompLidar3D::TPoint
+// RoboCompLidar3D::TDataImage
+// RoboCompLidar3D::TData
+// RoboCompLidar3D::TDataCategory
+// RoboCompLidar3D::TColorCloudData
+
+/**************************************/
+// From the RoboCompOmniRobot you can use this types:
+// RoboCompOmniRobot::TMechParams
+
+/**************************************/
+// From the RoboCompVisualElements you can use this types:
+// RoboCompVisualElements::TRoi
+// RoboCompVisualElements::TObject
+// RoboCompVisualElements::TObjects
+
+/**************************************/
+// From the RoboCompWebots2Robocomp you can use this types:
+// RoboCompWebots2Robocomp::Vector3
+// RoboCompWebots2Robocomp::Quaternion
+// RoboCompWebots2Robocomp::ObjectPose
+
+/**************************************/
+// From the RoboCompJoystickAdapter you can use this types:
+// RoboCompJoystickAdapter::AxisParams
+// RoboCompJoystickAdapter::ButtonParams
+// RoboCompJoystickAdapter::TData
+
+
+// ── World extents: footprint of each top-level node type ─────────────────────────────────────────
+// Webots thread only (called from initialize()). Fields are found by walking the node's field list,
+// not getField(name), so a node without `size` does not make Webots print a warning per lookup.
+// A node with an SFVec2f `size`/`floorSize` (FieldTerrain, RectangleArena) contributes its rectangle,
+// rotated by its z rotation; every other node with a `translation` contributes that point.
+void SpecificWorker::scan_world_extents()
+{
+    RoboCompWebots2Robocomp::WorldExtents out;
+    out.world = robot ? robot->getWorldPath() : std::string{};
+    webots::Node *root = robot ? robot->getRoot() : nullptr;
+    webots::Field *children = root ? root->getField("children") : nullptr;
+    if (children == nullptr)
+    {
+        std::cout << "[WorldExtents] no scene tree (not a supervisor?): getWorldExtents() will be empty" << std::endl;
+        return;
+    }
+    std::map<std::string, RoboCompWebots2Robocomp::TypeExtent> by_type;
+    const auto grow = [&by_type](const std::string &type, double x, double y)
+    {
+        auto [it, fresh] = by_type.try_emplace(type);
+        auto &e = it->second;
+        if (fresh)
+        {
+            e.type = type; e.count = 0;
+            e.xmin = e.xmax = static_cast<float>(x);
+            e.ymin = e.ymax = static_cast<float>(y);
+            return;
+        }
+        e.xmin = std::min(e.xmin, static_cast<float>(x)); e.xmax = std::max(e.xmax, static_cast<float>(x));
+        e.ymin = std::min(e.ymin, static_cast<float>(y)); e.ymax = std::max(e.ymax, static_cast<float>(y));
+    };
+    for (int i = 0; i < children->getCount(); ++i)
+    {
+        webots::Node *n = children->getMFNode(i);
+        if (n == nullptr) continue;
+        const double *t = nullptr, *r = nullptr, *sz = nullptr;
+        for (int k = 0; k < n->getNumberOfFields(); ++k)
+        {
+            webots::Field *f = n->getFieldByIndex(k);
+            if (f == nullptr) continue;
+            const std::string name = f->getName();
+            if (name == "translation" and f->getType() == webots::Field::SF_VEC3F) t = f->getSFVec3f();
+            else if (name == "rotation" and f->getType() == webots::Field::SF_ROTATION) r = f->getSFRotation();
+            else if ((name == "size" or name == "floorSize") and f->getType() == webots::Field::SF_VEC2F) sz = f->getSFVec2f();
+        }
+        if (t == nullptr) continue;
+        const std::string type = n->getTypeName();
+        if (sz != nullptr)
+        {
+            // Rotation about z only (an axis-angle whose axis is ~ +/-Z); anything else is taken unrotated.
+            double yaw = 0.0;
+            if (r != nullptr and std::abs(r[2]) > 0.999) yaw = r[2] > 0 ? r[3] : -r[3];
+            const double c = std::cos(yaw), s = std::sin(yaw), hx = sz[0] / 2.0, hy = sz[1] / 2.0;
+            for (const auto &[sx, sy] : {std::pair{-1., -1.}, {1., -1.}, {1., 1.}, {-1., 1.}})
+                grow(type, t[0] + c * sx * hx - s * sy * hy, t[1] + s * sx * hx + c * sy * hy);
+        }
+        else
+            grow(type, t[0], t[1]);
+        by_type[type].count++;
+    }
+    std::cout << "[WorldExtents] " << out.world << std::endl;
+    for (auto &[type, e] : by_type)
+    {
+        std::cout << std::format("    {:<24} x{:>4}  x [{:.2f}, {:.2f}]  y [{:.2f}, {:.2f}]",
+                                 type, e.count, e.xmin, e.xmax, e.ymin, e.ymax) << std::endl;
+        out.types.push_back(e);
+    }
+    const std::lock_guard<std::mutex> lock(world_extents_mutex_);
+    world_extents_ = std::move(out);
+}

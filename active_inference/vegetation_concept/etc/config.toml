@@ -1,0 +1,67 @@
+# vegetation_concept — the plants of the field as `plant` nodes (ADE20K vegetation masks from retina).
+# See src/specificworker.h for the contract and src/vegetation_map.h for the model.
+
+[Proxies]
+# No required Ice interfaces (DSR is the comms plane).
+
+[Agent]
+id = 26   # MUST be unique across the shared graph: robot=6 controller=8 retina=9 human=13 residual=14 openfield=25.
+          # A collision = CRDT actor-id clash -> SIGSEGV.
+name = "vegetation_concept"
+configFile = ""
+domain = 0
+tree = false
+graph = false
+"2d" = false
+"3d" = false
+
+[Period]
+Compute = 50        # 20 Hz: drains retina's masks node (vegetation arrives at the semantic rate, ~12 Hz)
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+[Presence]
+# retina produces the masks; robot_concept the camera mount. The world frame (openfield_concept's `field`)
+# is waited for inside the agent: until it exists nothing can be placed.
+required_agent_names = ["robot_concept", "retina"]
+optional_agent_names = ["openfield_concept", "human_concept", "residual_concept", "controller"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 5000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+# Owned graph nodes torn down on shutdown / peer-loss. "canopy_*" matches every canopy this agent created
+# (type `canopy`: a PART of a plant; plant_concept owns the plant_* individuals).
+nodes = ["vegetation_concept 26", "canopy_*"]
+
+[Vegetation]
+# Canopy radius seen from above. A tall-spindle apple tree in an intensive open-field orchard is ~1 m across
+# (typical value, to confirm against the orchard's own data), so 0.5 m. Every plant gets this radius: the
+# disc is "the space this plant occupies", the same role the person disc plays.
+PlantRadiusM = 0.5
+# ADE20K-150 classes that are plants (retina [Semantic].accepted_labels publishes exactly these). Not grass or
+# field: low ground cover is drivable.
+Labels = ["tree", "plant", "palm", "flower"]
+CellM = 0.10          # evidence grid resolution
+ZMinM = 0.30          # drop vegetation points below this (mask bleed onto the soil and the 0.20 m beds)
+ZMaxM = 6.0
+# Evidence a disc must hold for a plant to be born, in cell-frames (one unit per cell per frame it was seen).
+# A disc is ~78 cells; one view lights 20-50 of them, so 150 asks for several views (~1-2 s of looking).
+# ★In REFERENCE looks: each frame weighs min(1, time since the previous one / LookPeriodMs), so the evidence per
+# second does not depend on retina's semantic rate (decimation, model size, TensorRT). 530 ms = the ~1.9 looks/s
+# BirthMass was tuned at.
+BirthMass = 150.0
+LookPeriodMs = 530
+UpdatePeriodMs = 500  # plant extraction + graph publication
+MasksStallTimeoutMs = 5000

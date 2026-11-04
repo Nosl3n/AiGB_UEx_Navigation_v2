@@ -1,0 +1,96 @@
+# Editor / tooling
+.aider*
+.vscode/
+.qt/
+
+# Build trees (cmake/make) — every variant: build/ build-asan/ build-tsan/ build-gcc15/
+# build_test_migration/ build_lateral_probe/ build-make-copilot/ cmake-build*/ …
+# NOTE: generated/ is intentionally NOT ignored — the robocompdsl Ice stubs are committed; only the
+# build output UNDER it (*_autogen/) and the in-source cmake droppings are ignored.
+build*/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*_autogen/
+.trt_cache/
+
+# Compiled / binary output
+bin/
+*.o
+*.so
+*.a
+a.out
+__pycache__/
+*.pyc
+
+# Large ML model weights (too big for git; regenerate/export locally)
+*.onnx
+*.pt
+*.engine
+
+# Run artifacts + scratch edits/backups
+# Per-component run logs (chair's ai2_log.csv, ring_metaconcept's ring_fit.csv, …).
+# NOTE: a bare `etc/*.csv` contains a slash, so git anchors it to THIS directory and it
+# never matched <component>/etc/ — `git add <component>/` then silently staged run logs.
+# (.gitignore has no trailing comments: a `#` after the pattern becomes part of it.)
+**/etc/*.csv
+# Rotated previous runs, kept beside the live file by rc::diag::open_rotating
+# (common/diag_log/rotating_csv.h): "<name>.csv.<YYYYmmdd_HHMMSS>". The rule above does NOT
+# cover these — the timestamp comes AFTER the extension, so the name does not end in .csv.
+**/etc/*.csv.*
+# ...and the same one level down: `**/etc/*.csv` does NOT match `etc/archive/foo.csv`,
+# which is how a 6.7 MB archived run log stayed tracked under a rule meant to cover it.
+**/etc/**/*.csv
+*.log
+*.bak
+*.back
+*.new
+*.poisoned*
+
+# Scratch / throwaway experiments
+caca/
+
+# Large non-source blobs. GitHub HARD-REJECTS any file over 100 MB, so one of these in a
+# commit blocks the whole push — retina/models.tar.gz is 1.3 GB. These are build/runtime
+# assets fetched or produced locally, not repository content.
+**/models.tar.gz
+# Captured frame dumps (retina/etc/depth_frames held 1108 jpgs).
+**/etc/depth_frames/
+
+# ── Diagnostics written to the AGENT'S CWD, which is the COMPONENT ROOT, not etc/ ──────────────
+# An agent launched as `bin/controller etc/config.toml` has its component directory as CWD, so a
+# relative path like "tracker_diag.csv" lands in controller/, NOT controller/etc/. The `**/etc/*.csv`
+# rules above therefore never matched them, and 39 run logs in controller/ plus 8 in room_concept/
+# sat untracked in every `git status` — 130 lines of noise that a real untracked source file would
+# have hidden in.
+# ★ANCHORED WITH A LEADING SLASH AND EXACTLY ONE LEVEL: `/*/` matches <component>/ and nothing
+# deeper, so it cannot swallow common/**, etc/**, or anything a subdirectory legitimately tracks.
+/*/*.csv
+/*/*.csv.*
+/*/*.jsonl
+
+# Self-calibration output and last-known state. These are RUNTIME ESTIMATES the agents rewrite as
+# they run, not configuration: committing one is committing an arbitrary instant of a continuously
+# moving value, and it is dirty again the moment the robot does. Named individually rather than as
+# `**/etc/*.txt`, which would also catch real config (retina/etc/tsan_suppressions.txt) and the
+# world snapshots the offline benches replay (route_world.txt).
+/room_concept/etc/camera_calib_*.txt
+/room_concept/etc/image_edge_replay_*.txt
+/room_concept/etc/last_robot_pose.txt
+
+# In-source cmake droppings. The build* / CMakeFiles rules above miss the top-level Makefile that an
+# in-source `cmake .` leaves in the component root and in generated/.
+/*/Makefile
+/*/generated/Makefile
+
+# Dated/labelled backups. `*.bak` above does not match `p3bot.json.bak.pre-body` or
+# `shadow.json.before.lidar.change` — the suffix continues past the extension.
+*.bak.*
+*.before.*
+*.before-*
+*.orig
+
+# Per-run archives created by ControllerMission::archive_on_stop (a timestamped copy of each
+# diagnostic beside the run). The live files are ignored above; these are their history.
+**/etc/runs/

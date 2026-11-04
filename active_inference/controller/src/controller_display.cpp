@@ -1,0 +1,623 @@
+#include "controller_display.h"
+
+#include <chrono>
+#include <print>
+
+#include <QByteArray>
+#include <limits>
+#include <QComboBox>
+#include <QInputDialog>
+#include <QPushButton>
+#include <QSettings>
+#include <QSignalBlocker>
+#include <QSpinBox>
+
+namespace
+{
+constexpr auto kWinSettingsOrg = "RoboComp";
+constexpr auto kWinSettingsApp = "controller";
+constexpr auto kWinSettingsKey = "ControllerPlannerWindow_geometry";
+}  // namespace
+
+void ControllerDisplay::restore_window_geometry()
+{
+    if (!custom_widget_)
+        return;
+    QSettings settings(kWinSettingsOrg, kWinSettingsApp);
+    const QByteArray geom = settings.value(kWinSettingsKey).toByteArray();
+    if (!geom.isEmpty())
+        custom_widget_->restoreGeometry(geom);
+    else
+        custom_widget_->resize(820, 600);
+}
+
+void ControllerDisplay::save_window_geometry() const
+{
+    if (!custom_widget_)
+        return;
+    QSettings settings(kWinSettingsOrg, kWinSettingsApp);
+    settings.setValue(kWinSettingsKey, custom_widget_->saveGeometry());
+    settings.sync();
+}
+
+void ControllerDisplay::initialize(rc::LidarPointBuffer *lidar_buffer, Callbacks callbacks)
+{
+    const auto on_manual_target = callbacks.on_manual_target;
+    const auto on_clear_target = callbacks.on_clear_target;
+
+    // Own top-level window (parent == nullptr), NOT docked into the DSR graph viewer. This decouples
+    // the planner GUI from Agent.graph, so the agent runs with graph=false (no DSRViewer). Mirrors
+    // room_concept's RoomViewer.
+    custom_widget_ = std::make_unique<Custom_widget>();
+    custom_widget_->setWindowTitle(QStringLiteral("controller — planner"));
+    restore_window_geometry();
+    custom_widget_->show();
+
+    // No axis from the base viewer: it is pinned to the centre of this initial view rect, not to the
+    // room. The only axis drawn is the one on the room polygon centroid (see Viewer2D::draw_world_polygon).
+    viewer_2d_ = std::make_unique<rc::Viewer2D>(custom_widget_->frame, QRectF(-5.0, -5.0, 10.0, 10.0), false);
+    viewer_2d_->add_robot(0.5f, 0.6f, 0.f, 0.f, QColor("Tomato"));
+    viewer_2d_->set_lidar_buffer(lidar_buffer);
+    viewer_2d_->set_lidar_visible(custom_widget_->lidar_toggle_btn != nullptr
+                                 ? custom_widget_->lidar_toggle_btn->isChecked()
+                                 : false);
+    viewer_2d_->show();
+
+    QObject::connect(viewer_2d_.get(), &rc::Viewer2D::new_mouse_coordinates,
+                     custom_widget_.get(),
+                     [on_manual_target](const QPointF &point)
+                     {
+                         if (on_manual_target)
+                             on_manual_target(point);
+                     });
+    QObject::connect(viewer_2d_.get(), &rc::Viewer2D::mission_waypoint_moved,
+                     custom_widget_.get(),
+                     [cb = callbacks.on_waypoint_moved](int index, const QPointF &p)
+                     {
+                         if (cb) cb(index, static_cast<float>(p.x()), static_cast<float>(p.y()));
+                     });
+    QObject::connect(viewer_2d_.get(), &rc::Viewer2D::mission_waypoint_inserted,
+                     custom_widget_.get(),
+                     [cb = callbacks.on_waypoint_inserted](const QPointF &p)
+                     {
+                         if (cb) cb(static_cast<float>(p.x()), static_cast<float>(p.y()));
+                     });
+    QObject::connect(viewer_2d_.get(), &rc::Viewer2D::mission_waypoint_removed,
+                     custom_widget_.get(),
+                     [cb = callbacks.on_waypoint_removed](int index)
+                     {
+                         if (cb) cb(index);
+                     });
+    QObject::connect(viewer_2d_.get(), &rc::Viewer2D::right_click,
+                     custom_widget_.get(),
+                     [on_clear_target](const QPointF &)
+                     {
+                         if (on_clear_target)
+                             on_clear_target();
+                     });
+    QObject::connect(custom_widget_->lidar_toggle_btn, &QPushButton::toggled,
+                     custom_widget_.get(),
+                     [this](bool checked)
+                     {
+                         if (viewer_2d_)
+                             viewer_2d_->set_lidar_visible(checked);
+                     });
+    mission_panel_ = std::make_unique<rc::MissionPanel>(custom_widget_.get(), callbacks.mission);
+    // The affordance program window. Constructed hidden and fed every cycle; clicking the affordance
+    // name in the toolbar shows it. It is a QDialog with the Tool flag, so it floats over the 2D view
+    // without taking focus from it — this is meant to be watched WHILE driving.
+    affordance_panel_ = std::make_unique<rc::AffordancePanel>(custom_widget_.get());
+    // The button runs on the GUI thread; the session it acts on lives on the control thread. The
+    // callback the worker installs is an enqueue, never a direct call — same rule as every other
+    // control the panels own.
+    affordance_panel_->set_skip_callback(callbacks.on_skip_affordance);
+    custom_widget_->set_affordance_clicked([this]
+    {
+        if (affordance_panel_ == nullptr) return;
+        affordance_panel_->setVisible(not affordance_panel_->isVisible());
+        if (affordance_panel_->isVisible()) affordance_panel_->raise();
+        affordance_panel_visible_.store(affordance_panel_->isVisible(), std::memory_order_relaxed);
+    });
+    custom_widget_->attach_mission_panel(mission_panel_.get());
+
+}
+
+void ControllerDisplay::set_plain_l(float metres)
+{
+    if (mission_panel_) mission_panel_->set_plain_l(metres);
+}
+
+void ControllerDisplay::set_mission_list(const std::vector<std::string> &names, const std::string &selected)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.mission_names = names;
+    snapshot_.mission_selected = selected;
+    snapshot_.mission_list_pending = true;
+}
+
+bool ControllerDisplay::mission_running() const
+{ return mission_panel_ && mission_panel_->mission_running(); }
+
+bool ControllerDisplay::mission_recording() const
+{ return mission_panel_ && mission_panel_->recording(); }
+
+bool ControllerDisplay::confirm_mission_supersede()
+{ return mission_panel_ && mission_panel_->confirm_supersede(); }
+
+void ControllerDisplay::set_mission_state(const rc::MissionPanel::View &view,
+                                          const std::vector<Eigen::Vector2f> &waypoints,
+                                          int current_index)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.mission_view = view;
+    snapshot_.mission_waypoints = waypoints;
+    snapshot_.mission_index = current_index;
+}
+
+void ControllerDisplay::update(const std::optional<ControllerRobotPose> &robot_pose,
+                               const ControllerPolygon &world_polygon,
+                               const std::optional<ControllerPathPlan> &current_plan,
+                               const ControllerObstacleVisuals &obstacle_polys,
+                               const ControllerPolygons &obstacle_rfe_points,
+                               const std::optional<Eigen::Vector2f> &current_target_world,
+                               int last_display_wp_index,
+                               int max_lidar_draw_points,
+                               const std::optional<Eigen::Affine2f> &lidar_correction)
+{
+    // Staging only — copy into the snapshot, no Qt access. Safe from any thread.
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.robot_pose = robot_pose;
+    snapshot_.world_polygon = world_polygon;
+    snapshot_.current_plan = current_plan;
+    snapshot_.obstacle_polys = obstacle_polys;
+    snapshot_.obstacle_rfe_points = obstacle_rfe_points;
+    snapshot_.current_target_world = current_target_world;
+    snapshot_.last_display_wp_index = last_display_wp_index;
+    snapshot_.max_lidar_draw_points = max_lidar_draw_points;
+    snapshot_.lidar_correction = lidar_correction;
+    snapshot_.valid = true;
+    snapshot_.stamp_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+void ControllerDisplay::set_command_values(float adv_mm_s, float side_mm_s, float rot_rps)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.cmd_adv_mm_s = adv_mm_s;
+    snapshot_.cmd_side_mm_s = side_mm_s;
+    snapshot_.cmd_rot_rps = rot_rps;
+    snapshot_.cmd_values_pending = true;
+}
+
+void ControllerDisplay::set_command_text(const QString &text)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.command_text = text;
+    snapshot_.command_text_pending = true;
+}
+
+void ControllerDisplay::set_orient_overlay(float x, float y, float target_yaw, float current_yaw,
+                                          bool visible)
+{
+    std::scoped_lock lock(snapshot_mutex_);
+    snapshot_.orient_x = x;
+    snapshot_.orient_y = y;
+    snapshot_.orient_target_yaw = target_yaw;
+    snapshot_.orient_current_yaw = current_yaw;
+    snapshot_.orient_visible = visible;
+}
+
+void ControllerDisplay::set_affordance_execution(const rc::AffordanceExecution &v)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.affordance = v;
+}
+
+void ControllerDisplay::set_camera_masks(const rc::CameraMasksView &view)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.camera_masks = view;
+    snapshot_.camera_masks_pending = true;
+}
+
+void ControllerDisplay::set_selected_affordance(const QString &current, const QString &previous)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.affordance_current = current;
+    snapshot_.affordance_previous = previous;
+    snapshot_.selected_affordance_text_pending = true;
+}
+
+void ControllerDisplay::set_stuck_active(bool active)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.stuck_active = active;
+}
+
+void ControllerDisplay::set_session_totals(float metres, float seconds)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.session_distance_m = metres;
+    snapshot_.session_elapsed_s = seconds;
+}
+
+void ControllerDisplay::set_goal_distance(std::optional<float> dist_m, std::optional<float> yaw_err_rad,
+                                          bool aligning)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.goal_dist_m = dist_m;
+    snapshot_.goal_yaw_err_rad = yaw_err_rad;
+    snapshot_.goal_aligning = aligning;
+}
+
+// Running cross-track error. This replaced a four-series J plot: J's smoothness terms are properties
+// of the ROUTE (re-planned against a live grid each run, so a 119 mm waypoint repair moved jerk/m by
+// 38%), while rms repeats to cv 2.3% and is what the tracker itself controls.
+void ControllerDisplay::update_velocity_trace(float adv_mps, float rot_rps)
+{
+    auto *plot = custom_widget_ ? custom_widget_->mission_j_plot : nullptr;
+    if (plot == nullptr) return;
+    // Series are registered in Custom_widget's constructor, on the GUI thread; add_point() is
+    // mutex-guarded and documented callable from any thread, which is what lets this be fed straight
+    // from the motion commander's output loop instead of at the redraw rate.
+    const auto ok = [](float v) { return std::isfinite(v) ? v : 0.f; };
+    plot->add_point("adv", ok(adv_mps));
+    plot->add_point("rot", ok(rot_rps));
+    // Already mapped onto the speed axis by the control thread — see set_uncertainty_trace_value.
+    // A negative value means "no covariance reached the limiter", which is undefined rather than zero:
+    // NaN makes the line BREAK there, which is what the plot's gap marker is for.
+    const float unc = unc_trace_.load(std::memory_order_relaxed);
+    plot->add_point("sigma", unc >= 0.f ? unc : std::numeric_limits<float>::quiet_NaN());
+    // We are commanding, so the measured-fallback pair has nothing to say: gap it rather than let it
+    // hold its last value across the hand-over, which would draw a line through a stretch it did not
+    // describe.
+    const float gap = std::numeric_limits<float>::quiet_NaN();
+    plot->add_point("adv_meas", gap);
+    plot->add_point("rot_meas", gap);
+    vel_local_fed_.store(true, std::memory_order_relaxed);
+}
+
+void ControllerDisplay::update_velocity_trace_external(float ref_adv_mps, float ref_rot_rps,
+                                                      bool ref_fresh,
+                                                      float meas_adv_mps, float meas_rot_rps)
+{
+    auto *plot = custom_widget_ ? custom_widget_->mission_j_plot : nullptr;
+    if (plot == nullptr) return;
+    // Our own output loop spoke since the last control cycle — it is the higher-rate and more faithful
+    // source, so leave the trace to it. The exchange also arms the next window.
+    if (vel_local_fed_.exchange(false, std::memory_order_relaxed)) return;
+
+    const float gap = std::numeric_limits<float>::quiet_NaN();
+    const auto ok = [](float v) { return std::isfinite(v) ? v : 0.f; };
+
+    // A published command, from something that is not us. Drawn in the commanded series, because that
+    // is what it is.
+    plot->add_point("adv", ref_fresh ? ok(ref_adv_mps) : gap);
+    plot->add_point("rot", ref_fresh ? ok(ref_rot_rps) : gap);
+    // Nobody is publishing a command, so the only witness left is what the base actually DID. Its own
+    // series, so "measured" is never mistaken for "commanded".
+    plot->add_point("adv_meas", ref_fresh ? gap : ok(meas_adv_mps));
+    plot->add_point("rot_meas", ref_fresh ? gap : ok(meas_rot_rps));
+    // Whoever is commanding, it is not through OUR uncertainty limiter, so the sigma line has nothing
+    // to say about this stretch. A gap, not a zero — zero would read as "perfectly localised".
+    plot->add_point("sigma", gap);
+}
+
+void ControllerDisplay::set_uncertainty_trace_value(float sigma_on_speed_axis)
+{
+    unc_trace_.store(sigma_on_speed_axis, std::memory_order_relaxed);
+}
+
+void ControllerDisplay::set_lidar_rate_hz(float hz)
+{
+    lidar_hz_.store(hz, std::memory_order_relaxed);
+    if (custom_widget_) custom_widget_->set_lidar_hz(hz);
+}
+
+void ControllerDisplay::update_affordance_efe(const std::vector<AffordanceEfeSample> &samples)
+{
+    auto *plot = custom_widget_ ? custom_widget_->affordance_efe_plot : nullptr;
+    if (plot == nullptr)
+        return;
+
+    // Distinct, stable colours per affordance (assigned in first-seen order).
+    static const QColor kPalette[] = {QColor("Tomato"),     QColor("SteelBlue"), QColor("MediumSeaGreen"),
+                                      QColor("Goldenrod"),   QColor("MediumPurple"), QColor("Teal"),
+                                      QColor("OrangeRed"),   QColor("SlateGray")};
+    constexpr std::size_t kPaletteSize = sizeof(kPalette) / sizeof(kPalette[0]);
+
+    // Drop series whose affordance is no longer among the candidates (object removed from the graph),
+    // so the plot tracks the live scene instead of accumulating stale lines.
+    std::unordered_set<std::string> current;
+    current.reserve(samples.size());
+    for (const auto &s : samples)
+        current.insert(s.name);
+    for (auto it = efe_series_known_.begin(); it != efe_series_known_.end();)
+    {
+        if (current.find(*it) == current.end())
+        {
+            plot->remove_series(*it);
+            it = efe_series_known_.erase(it);
+        }
+        else
+            ++it;
+    }
+
+    // One line per affordance: the selection score (gain − λ·dist + hysteresis) — the EXACT value
+    // selection maximises, so the highest line among the eligible ones is the one that gets chosen.
+    // ★AN INELIGIBLE AFFORDANCE PLOTS A GAP, NOT A VALUE. Its score is still computable and still high,
+    // but it is not in the contest — a Completed or Invalid node is skipped by every selection branch —
+    // and drawing it as a continuous line said "this keeps winning on merit and keeps being passed
+    // over", which is a bug report about the selector rather than what it is: a node whose owning agent
+    // is not offering it. The break in the line is the answer.
+    for (const auto &s : samples)
+    {
+        if (efe_series_known_.find(s.name) == efe_series_known_.end())
+        {
+            plot->add_series(s.name, kPalette[efe_color_next_ % kPaletteSize], 1.8f);
+            ++efe_color_next_;
+            efe_series_known_.insert(s.name);
+        }
+        plot->add_point(s.name, s.eligible ? s.score : std::numeric_limits<float>::quiet_NaN());
+    }
+}
+
+void ControllerDisplay::clear_robot_trajectory()
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.clear_trajectory_pending = true;
+}
+
+void ControllerDisplay::set_lidar_stall(bool stalled, float seconds)
+{
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot_.lidar_stalled = stalled;
+    snapshot_.lidar_stall_s = seconds;
+}
+
+void ControllerDisplay::present()
+{
+    // GUI thread only. Consume the latest staged snapshot and draw it.
+    DisplaySnapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        snap = snapshot_;
+        snapshot_.command_text_pending = false;
+        snapshot_.cmd_values_pending = false;
+        snapshot_.selected_affordance_text_pending = false;
+        snapshot_.clear_trajectory_pending = false;
+        snapshot_.mission_list_pending = false;
+    }
+
+    if (!custom_widget_)
+        return;
+
+    if (snap.clear_trajectory_pending && viewer_2d_)
+        viewer_2d_->clear_robot_trajectory();
+
+    if (snap.cmd_values_pending)
+        custom_widget_->set_cmd_vel(snap.cmd_adv_mm_s, snap.cmd_side_mm_s, snap.cmd_rot_rps);
+
+    if (snap.command_text_pending)
+        custom_widget_->set_cmd_vel_text(snap.command_text);
+
+    if (snap.selected_affordance_text_pending)
+        custom_widget_->set_selected_affordance(snap.affordance_current, snap.affordance_previous);
+    // Re-published every frame, not only on the toggle: the window can also be closed by its own
+    // title-bar button, which never runs the toggle lambda and would leave the mirror stuck on true.
+    if (affordance_panel_)
+        affordance_panel_visible_.store(affordance_panel_->isVisible(), std::memory_order_relaxed);
+    if (affordance_panel_ and affordance_panel_->isVisible())
+    {
+        affordance_panel_->update_view(snap.affordance);
+        affordance_panel_->set_camera_view(snap.camera_masks);
+    }
+
+    custom_widget_->set_stuck_active(snap.stuck_active);   // widget dedups same-state calls
+    custom_widget_->set_goal_distance(snap.goal_dist_m, snap.goal_yaw_err_rad, snap.goal_aligning);
+    custom_widget_->set_session(snap.session_distance_m, snap.session_elapsed_s);
+    if (mission_panel_)
+    {
+        if (snap.mission_list_pending)
+            mission_panel_->set_missions(snap.mission_names, snap.mission_selected);
+        mission_panel_->apply(snap.mission_view);
+    }
+    if (viewer_2d_)
+        viewer_2d_->draw_mission(snap.mission_waypoints, snap.mission_index, snap.mission_view.recording,
+                                 // Draggable whenever nothing is being measured: editing the route under a
+                                 // running mission would invalidate the run without saying so.
+                                 not snap.mission_view.running,
+                                 // ONE path at a time: a real route suppresses the straight dotted links
+                                 // between waypoints, which are only a stand-in for one. Read from the same
+                                 // snapshot field draw_path() is about to draw, so the two cannot disagree
+                                 // about whether a route exists.
+                                 snap.current_plan.has_value()
+                                     and not snap.current_plan->world_path.empty());
+    // Mission status rides in the WINDOW TITLE. As a stretchy label in the mission row it forced the whole
+    // window wider than the 2D view needs; the title bar is free real estate and always visible.
+    // Control rate rides here too. It is the number that says whether the loop is keeping its deadline,
+    // and it was only ever visible on stdout — which is exactly where nobody looks while driving. Shown
+    // as rate plus the WORST period in the last window, because the mean stays healthy through a stall.
+    const float hz = control_hz_.load(std::memory_order_relaxed);
+    const float worst = control_worst_ms_.load(std::memory_order_relaxed);
+    QString rate;
+    if (hz > 0.f)
+        rate = QStringLiteral("%1 Hz").arg(hz, 0, 'f', 1)
+             + (worst > 0.f ? QStringLiteral(" (worst %1 ms)").arg(worst, 0, 'f', 0) : QString());
+    QString t = QStringLiteral("controller — planner");
+    if (!rate.isEmpty()) t += QStringLiteral(" · ") + rate;
+    if (!snap.mission_view.status.empty())
+        t += QStringLiteral(" · ") + QString::fromStdString(snap.mission_view.status);
+    if (custom_widget_->windowTitle() != t)
+        custom_widget_->setWindowTitle(t);
+
+    // ── SAY WHEN THE CANVAS IS NOT BEING FED, AND WHICH OF THE TWO REASONS IT IS ────────────────
+    // ★A FROZEN CANVAS HAS THREE POSSIBLE CAUSES AND THEY NEED DIFFERENT FIXES, and telling them
+    // apart by inspection cost most of a session: (a) the snapshot was NEVER staged, so the pipeline
+    // has not completed a cycle; (b) it was staged but is OLD, so the pipeline has stopped being
+    // triggered — the data-driven gate, i.e. perception; (c) it is fresh and the canvas still looks
+    // frozen, which is a DRAWING fault and nothing to do with the pipeline. The snapshot carries the
+    // stamp that separates them, and nothing was reading it.
+    {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const std::uint64_t age = snap.stamp_ms ? now_ms - snap.stamp_ms : 0;
+
+        // Heartbeat: two rates, once every 5 s. See the note in the header for why a failure-only
+        // diagnostic could not answer this.
+        ++canvas_drawn_;
+        if (snap.stamp_ms != canvas_last_stamp_) { canvas_last_stamp_ = snap.stamp_ms; ++canvas_fed_; }
+        if (canvas_hb_ms_ == 0) canvas_hb_ms_ = now_ms;
+        if (now_ms - canvas_hb_ms_ >= 5000)
+        {
+            const double secs = (now_ms - canvas_hb_ms_) / 1000.0;
+            const int items = viewer_2d_ ? viewer_2d_->scene_item_count() : -1;
+            const auto probe = viewer_2d_ ? viewer_2d_->paint_probe() : rc::Viewer2D::PaintProbe{};
+            if (probe.pixel_hash == canvas_paint_hash_) ++canvas_paint_static_;
+            else                                        canvas_paint_static_ = 0;
+            canvas_paint_hash_ = probe.pixel_hash;
+            std::println("[canvas] fed {:.1f} Hz (pipeline staging frames), drawn {:.1f} Hz "
+                         "(present consuming them), snapshot age {:.2f} s, scene items {}",
+                         canvas_fed_ / secs, canvas_drawn_ / secs, age / 1000.0, items);
+            // ★SAY IT AT THE MOMENT IT HAPPENS. A canvas that is being fed and rebuilt but renders
+            // the SAME pixels twice running is the failure that reads as "the viewer is fine, the
+            // data stopped" — and it is not that. Naming it here is what makes it findable without
+            // an operator noticing the picture is old.
+            // ★★★THE VIEWPORT IS NOT BEING ASKED TO PAINT AT ALL. present() calls force_repaint() every
+            // frame, so paint_events ~= drawn. Zero means update() is dropped on the way in — the one
+            // state where calling update() harder is provably useless. repaint() is tried once, and
+            // whether it lands is the measurement that says which side of the widget the loss is on.
+            int recovery = -1;
+            if (probe.paint_events == 0 and canvas_drawn_ > 0 and viewer_2d_)
+            {
+                recovery = viewer_2d_->force_synchronous_repaint();
+                const char *verdict =
+                    recovery == rc::Viewer2D::kRecoveryRepaint
+                        ? "a synchronous repaint() DID land, so only the queued update was being lost"
+                    : recovery == rc::Viewer2D::kRecoveryVisibilityCycle
+                        ? "only a hide/show landed, so Qt's clip / obscured-by-sibling state for this "
+                          "widget was WRONG and every update() was being clipped to nothing"
+                        : "NEITHER a repaint() nor a hide/show landed -- the loss is not in this widget";
+                std::println("[canvas] NO PAINT EVENTS: {} present() calls in {:.0f} s asked the viewport to "
+                             "repaint and Qt sent it none (updates_enabled={}, visible={}, viewport {}x{}, "
+                             "visibleRegion {}x{}). {}.",
+                             canvas_drawn_, secs, probe.updates_enabled, probe.viewport_visible,
+                             probe.viewport_w, probe.viewport_h, probe.visible_w, probe.visible_h, verdict);
+            }
+            if (canvas_paint_static_ > 0 and canvas_fed_ > 0)
+                std::println("[canvas] NOT RENDERING: the scene is being fed and rebuilt, but the "
+                             "viewport has rendered identical pixels for {} heartbeats ({:.0f} s). "
+                             "view transform {}, scale {:.1f} px/unit.",
+                             canvas_paint_static_ + 1, (canvas_paint_static_ + 1) * secs,
+                             probe.finite_transform ? "finite" : "NON-FINITE (a NaN reached it)",
+                             probe.scale);
+            if (not canvas_csv_open_)
+            {
+                canvas_csv_.open("canvas_health.csv", std::ios::out | std::ios::trunc);
+                canvas_csv_.imbue(std::locale::classic());
+                if (canvas_csv_.is_open())
+                    canvas_csv_ << "# fed  = the control pipeline staging DISTINCT frames\n"
+                                   "# drawn= present() consuming them (its own 30 Hz timer)\n"
+                                   "# items= objects in the scene; changing => it IS being rebuilt\n"
+                                   "# fed~0 => perception. drawn~0 => the GUI thread. both healthy and a\n"
+                                   "# static view => a REPAINT fault, which is what force_repaint targets.\n"
+                                   "# paint_hash    = hash of an OFF-SCREEN render of the viewport. It is the only\n"
+                                   "#                 column that says the scene turned into PIXELS; items only says it\n"
+                                   "#                 was rebuilt. Frozen hash => the draw is empty. Live hash beside a\n"
+                                   "#                 frozen screen => the draw is fine and the flush is the fault.\n"
+                                   "# paint_static  = consecutive 5 s heartbeats with the SAME hash. >1 while fed>0 is\n"
+                                   "#                 the freeze, named at the moment it happens.\n"
+                                   "# finite_xform  = 0 means a non-finite coordinate reached the view transform, which\n"
+                                   "#                 makes every draw call in the frame a silent no-op.\n"
+                                   "# paint_hz      = REAL QEvent::Paint deliveries to the viewport. paint_hash comes from\n"
+                                   "#                 grab(), which calls paintEvent directly and bypasses the repaint\n"
+                                   "#                 manager, so it cannot see this. ~drawn_hz beside a frozen screen =>\n"
+                                   "#                 the paints happen and the FLUSH is the fault; ~0 => update() is being\n"
+                                   "#                 dropped before any paintEvent is sent.\n"
+                                   "# vis_w/vis_h   = Qt's own visibleRegion() for the viewport. ZERO while the widget is\n"
+                                   "#                 visible and sized means Qt believes it is fully obscured and is\n"
+                                   "#                 discarding every update() unpainted. This is the column that names\n"
+                                   "#                 a zero-paint freeze.\n"
+                                   "# recovery      = which lever got it painting again: 1 repaint() (only the queued\n"
+                                   "#                 update was lost), 2 hide/show (Qt's clip/obscured state was wrong),\n"
+                                   "#                 0 neither, -1 not attempted (the viewport was painting normally).\n"
+                                   "t_ms,fed_hz,drawn_hz,snapshot_age_s,scene_items,paint_hash,paint_static,finite_xform,"
+                                   "view_scale,paint_hz,updates_enabled,vp_w,vp_h,vis_w,vis_h,recovery\n";
+                canvas_csv_open_ = true;
+            }
+            if (canvas_csv_.is_open())
+            {
+                canvas_csv_ << now_ms << ',' << canvas_fed_ / secs << ',' << canvas_drawn_ / secs
+                            << ',' << age / 1000.0 << ',' << items
+                            << ',' << probe.pixel_hash << ',' << canvas_paint_static_
+                            << ',' << (probe.finite_transform ? 1 : 0) << ',' << probe.scale
+                            << ',' << probe.paint_events / secs << ',' << (probe.updates_enabled ? 1 : 0)
+                            << ',' << probe.viewport_w << ',' << probe.viewport_h
+                            << ',' << probe.visible_w << ',' << probe.visible_h << ',' << recovery << '\n';
+                canvas_csv_.flush();
+            }
+            canvas_hb_ms_ = now_ms; canvas_drawn_ = 0; canvas_fed_ = 0;
+        }
+        // Throttled to once a second, and only while it is actually a problem: a canvas being fed at
+        // the sensor's own rate says nothing.
+        if ((not snap.valid or age > 1000) and now_ms - last_stale_canvas_log_ms_ >= 1000)
+        {
+            last_stale_canvas_log_ms_ = now_ms;
+            if (not snap.valid)
+                std::println("[canvas] NOT DRAWING: the control pipeline has never staged a frame. "
+                             "Everything above the validity gate (panel, title, waypoints) still "
+                             "updates, which is why only the canvas looks frozen.");
+            else
+                std::println("[canvas] STALE by {:.1f} s: the pipeline staged a frame but has stopped "
+                             "being triggered. It is data-driven on a fresh LiDAR scan, so this is "
+                             "perception, not the viewer.", age / 1000.0);
+        }
+    }
+
+    // ★ABOVE THE VALID GATE, DELIBERATELY. Everything below is drawn from the control pipeline, and
+    // the pipeline is what stops when the scan stops — so a banner placed below could only ever appear
+    // when it was not needed. This is the one thing on the canvas that must survive the freeze.
+    if (viewer_2d_)
+        viewer_2d_->set_lidar_stall_banner(snap.lidar_stalled, snap.lidar_stall_s);
+
+    if (!snap.valid || !viewer_2d_)
+        return;
+
+    ControllerPolygon display_path;
+    if (snap.current_plan.has_value())
+        display_path = snap.current_plan->world_path;
+
+    viewer_2d_->draw_world_polygon(snap.world_polygon);
+    viewer_2d_->set_lidar_draw_correction(snap.lidar_correction.value_or(Eigen::Affine2f::Identity()));
+    viewer_2d_->draw_lidar_points_from_buffer(snap.max_lidar_draw_points);
+    viewer_2d_->draw_path({
+        .path = std::move(display_path),
+        // The plan's turning points, drawn as dots — but ONLY when the plan IS a set of turning points.
+        // A continuous route is thousands of 5 cm samples and dotting each one is noise, not information.
+        .waypoints = (snap.current_plan.has_value() and snap.current_plan->world_path.size() <= 64)
+                         ? snap.current_plan->world_path : ControllerPolygon{},
+        .obstacle_polys = snap.obstacle_polys,
+        .obstacle_rfe_points = snap.obstacle_rfe_points,
+    });
+    // ★See Viewer2D::force_repaint. The scene is rebuilt above; this makes sure it reaches the screen.
+    viewer_2d_->force_repaint();
+
+    if (!world_view_fitted_ && !snap.world_polygon.empty())
+    {
+        viewer_2d_->fit_view();
+        world_view_fitted_ = true;
+    }
+
+    if (snap.current_target_world.has_value())
+        viewer_2d_->update_target_marker(snap.current_target_world->x(), snap.current_target_world->y(), true);
+    else
+        viewer_2d_->update_target_marker(0.f, 0.f, false);
+
+    viewer_2d_->update_orient_overlay(snap.orient_x, snap.orient_y, snap.orient_target_yaw,
+                                      snap.orient_current_yaw, snap.orient_visible);
+
+    if (snap.robot_pose.has_value())
+        viewer_2d_->update_robot(snap.robot_pose->as_transform());
+}

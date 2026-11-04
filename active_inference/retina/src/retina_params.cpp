@@ -1,0 +1,276 @@
+/*
+ * retina_params.cpp — load_retina_params (config → RetinaParams).
+ */
+
+#include "retina_params.h"
+
+#include <filesystem>
+#include <print>
+#include <string>
+#include <vector>
+
+RetinaParams load_retina_params(const ConfigLoader& configLoader)
+{
+    RetinaParams params;
+
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.model_path", params.YOLO_MODEL_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.accepted_labels", params.YOLO_ACCEPTED_LABELS);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Yolo.conf_thresh", params.YOLO_CONF_THRESH);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Yolo.iou_thresh", params.YOLO_IOU_THRESH);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Yolo.second_best_margin", params.YOLO_SECOND_BEST_MARGIN);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.use_gpu", params.YOLO_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.use_trt", params.YOLO_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.mask_erode_kernel", params.YOLO_MASK_ERODE_KERNEL);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.mask_tray", params.YOLO_MASK_TRAY);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.tray_mask_ref_width", params.YOLO_TRAY_MASK_REF_WIDTH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.tray_mask_ref_height", params.YOLO_TRAY_MASK_REF_HEIGHT);
+    rc::ConfigLoaderUtils::load_optional_apply<std::vector<int>>(configLoader, "Yolo.tray_mask_polygon",
+        [&](const std::vector<int>& flat)
+        {
+            if (flat.size() >= 6 && flat.size() % 2 == 0)
+            {
+                params.YOLO_TRAY_MASK_POLYGON_PX.clear();
+                for (std::size_t i = 0; i + 1 < flat.size(); i += 2)
+                    params.YOLO_TRAY_MASK_POLYGON_PX.emplace_back(flat[i], flat[i + 1]);
+            }
+        });
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Yolo.tray_drop_fraction", params.YOLO_TRAY_DROP_FRACTION);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Yolo.zed_thread_period_ms", params.ZED_THREAD_PERIOD_MS);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Voxel.mask_depth_gate_band_m", params.MASK_DEPTH_GATE_BAND_M);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Voxel.mask_outlier_radius_m", params.MASK_OUTLIER_RADIUS_M);
+    rc::ConfigLoaderUtils::load_optional<int>(configLoader, "Voxel.mask_outlier_min_neighbors", params.MASK_OUTLIER_MIN_NEIGHBORS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Transforms.interpolate_rt", params.TRANSFORMS_INTERPOLATE_RT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.domain_id", params.MEDIA_DOMAIN_ID);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.rgb_topic", params.MEDIA_RGB_TOPIC);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.depth_topic", params.MEDIA_DEPTH_TOPIC);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.lidar_topic", params.MEDIA_LIDAR_TOPIC);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.lidar_use_media", params.LIDAR_USE_MEDIA);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Media.ricoh_topic", params.MEDIA_RICOH_TOPIC);
+
+    // Ricoh 360 peripheral detection (default OFF — see header).
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.yolo_enabled", params.RICOH_YOLO_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.yolo_thread_period_ms", params.RICOH_YOLO_THREAD_PERIOD_MS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.yolo_n_strips", params.RICOH_YOLO_N_STRIPS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.yolo_strips_per_frame", params.RICOH_YOLO_STRIPS_PER_FRAME);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.semantic_enabled", params.RICOH_SEMANTIC_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.semantic_decimation", params.RICOH_SEMANTIC_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.yolo_strip_overlap_px", params.RICOH_YOLO_STRIP_OVERLAP_PX);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Ricoh.yolo_merge_iou", params.RICOH_YOLO_MERGE_IOU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.publish_masks", params.RICOH_PUBLISH_MASKS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.mask_depth", params.RICOH_MASK_DEPTH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Ricoh.mask_depth_helios_only", params.RICOH_MASK_DEPTH_HELIOS_ONLY);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Ricoh.mask_fg_band_m", params.RICOH_MASK_FG_BAND_M);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Ricoh.azimuth_tune_deg", params.RICOH_AZIMUTH_TUNE_DEG);
+
+    // [RicohDepth] — monocular depth on the panorama (default OFF; display-only, see depth_processor.h).
+    // ── [PlaceMemory] ────────────────────────────────────────────────────────────────────────────
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.enabled", params.PLACE_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.model_path", params.PLACE_MODEL_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.use_gpu", params.PLACE_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.use_trt", params.PLACE_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.input_w", params.PLACE_INPUT_W);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.input_h", params.PLACE_INPUT_H);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.n_sectors", params.PLACE_N_SECTORS);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "PlaceMemory.pool_p", params.PLACE_POOL_P);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.band_lo", params.PLACE_BAND_LO);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.band_hi", params.PLACE_BAND_HI);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.center", params.PLACE_CENTER);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "PlaceMemory.sector_soft", params.PLACE_SECTOR_SOFT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.decimation", params.PLACE_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.build_map", params.PLACE_BUILD_MAP);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "PlaceMemory.insert_min_dist_m", params.PLACE_INSERT_MIN_DIST_M);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.save_every_n", params.PLACE_SAVE_EVERY_N);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.map_path", params.PLACE_MAP_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.map_blob_path", params.PLACE_MAP_BLOB_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.log_queries", params.PLACE_LOG_QUERIES);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.log_grid", params.PLACE_LOG_GRID);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.log_stride", params.PLACE_LOG_STRIDE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "PlaceMemory.log_dir", params.PLACE_LOG_DIR);
+
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.enabled", params.RICOH_DEPTH_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.model_path", params.RICOH_DEPTH_MODEL_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.input_size", params.RICOH_DEPTH_INPUT_SIZE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.use_gpu", params.RICOH_DEPTH_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.use_trt", params.RICOH_DEPTH_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.n_strips", params.RICOH_DEPTH_N_STRIPS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.overlap_px", params.RICOH_DEPTH_OVERLAP_PX);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.band_half_elev_deg", params.RICOH_DEPTH_BAND_HALF_ELEV_DEG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.gnomonic", params.RICOH_DEPTH_GNOMONIC);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.gnomonic_fov_deg", params.RICOH_DEPTH_GNOMONIC_FOV_DEG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.zdepth_to_range", params.RICOH_DEPTH_ZDEPTH_TO_RANGE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.lidar_diag", params.RICOH_DEPTH_LIDAR_DIAG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.sample_stride", params.RICOH_DEPTH_SAMPLE_STRIDE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "ZedDepth.enabled", params.ZED_ROOM_DEPTH_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "ZedDepth.decimate", params.ZED_ROOM_DEPTH_DECIMATE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "ZedDepth.yolo_depth_enabled", params.ZED_DEPTH_ENABLED);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "ZedDepth.diff_span_m", params.ZED_DEPTH_DIFF_SPAN_M);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.info_select", params.RICOH_DEPTH_INFO_SELECT);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.min_gain_nats", params.RICOH_DEPTH_MIN_GAIN_NATS);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.suspect_resid_mult", params.RICOH_DEPTH_SUSPECT_RESID_MULT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.save_frames", params.RICOH_DEPTH_SAVE_FRAMES);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.frames_dir", params.RICOH_DEPTH_FRAMES_DIR);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.frame_jpeg_quality", params.RICOH_DEPTH_FRAME_QUALITY);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.metric_lo_m", params.RICOH_DEPTH_METRIC_LO_M);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.metric_hi_m", params.RICOH_DEPTH_METRIC_HI_M);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "RicohDepth.decimation", params.RICOH_DEPTH_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "RicohDepth.overlay_alpha", params.RICOH_DEPTH_OVERLAY_ALPHA);
+    // Ricoh azimuth calibration is no longer a config knob — it lives in the graph (ricoh node's
+    // cam_equirect_azimuth_sign/offset), applied by CameraAPI. See retina_params.h.
+
+    // Ego-motion mask-corruption annotation (default ON — pure producer-side metadata).
+    rc::ConfigLoaderUtils::load_optional(configLoader, "MaskMotion.enabled", params.MASK_MOTION_ENABLED);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "MaskMotion.exposure_s", params.MASK_MOTION_EXPOSURE_S);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "MaskMotion.timing_jitter_s", params.MASK_MOTION_TIMING_JITTER_S);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "MaskMotion.timing_offset_s", params.MASK_MOTION_TIMING_OFFSET_S);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "MaskMotion.csv_log", params.MASK_MOTION_CSV_LOG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "MaskColor.enabled", params.MASK_COLOR_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "MaskColor.cell_px", params.MASK_COLOR_CELL_PX);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "MaskMotion.pose_extrapolate", params.MASK_POSE_EXTRAPOLATE);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "MaskMotion.pose_extrap_max_dt_s", params.MASK_POSE_EXTRAP_MAX_DT_S);
+
+    // Human-pose branch (default OFF — see header).
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.enabled", params.HUMAN_POSE_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.model_path", params.HUMAN_POSE_MODEL_PATH);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "HumanPose.conf_thresh", params.HUMAN_POSE_CONF_THRESH);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "HumanPose.iou_thresh", params.HUMAN_POSE_IOU_THRESH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.input_size", params.HUMAN_POSE_INPUT_SIZE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.use_gpu", params.HUMAN_POSE_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.use_trt", params.HUMAN_POSE_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional<std::uint64_t, int>(configLoader, "HumanPose.hold_ms", params.HUMAN_POSE_HOLD_MS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.decimation", params.HUMAN_POSE_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "HumanPose.kp_conf_min", params.SKELETON_KP_CONF_MIN);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "HumanPose.depth_patch", params.SKELETON_DEPTH_PATCH);
+
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.enabled", params.SEMANTIC_SEG_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.model_path", params.SEMANTIC_SEG_MODEL_PATH);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Semantic.conf_thresh", params.SEMANTIC_SEG_CONF_THRESH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.input_size", params.SEMANTIC_SEG_INPUT_SIZE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.use_gpu", params.SEMANTIC_SEG_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.use_trt", params.SEMANTIC_SEG_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.decimation", params.SEMANTIC_SEG_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.publish_node", params.SEMANTIC_PUBLISH_NODE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.publish_probs", params.SEMANTIC_PUBLISH_PROBS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorApproach.enabled", params.DOOR_APPROACH_LOG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorApproach.path", params.DOOR_APPROACH_LOG_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorApproach.label", params.DOOR_APPROACH_LABEL);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.enabled", params.DOOR_SPECIALIST_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.model_path", params.DOOR_SPECIALIST_MODEL);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.input_size", params.DOOR_SPECIALIST_INPUT_SIZE);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.use_gpu", params.DOOR_SPECIALIST_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.use_trt", params.DOOR_SPECIALIST_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "DoorSpecialist.score_floor", params.DOOR_SPECIALIST_SCORE_FLOOR);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "DoorSpecialist.decimation", params.DOOR_SPECIALIST_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Semantic.publish_min_interval_s", params.SEMANTIC_PUBLISH_MIN_INTERVAL_S);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.publish_masks", params.SEMANTIC_PUBLISH_MASKS);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.accepted_labels", params.SEMANTIC_ACCEPTED_LABELS);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Yolo.probe_floor", params.YOLO_PROBE_FLOOR);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Semantic.mask_min_area_frac", params.SEMANTIC_MASK_MIN_AREA_FRAC);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Semantic.mask_overlap_drop_frac", params.SEMANTIC_MASK_OVERLAP_DROP_FRAC);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Semantic.mask_morph_kernel", params.SEMANTIC_MASK_MORPH_KERNEL);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Semantic.mask_score_default", params.SEMANTIC_MASK_SCORE_DEFAULT);
+
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.enabled", params.SAM2_ENABLED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.encoder_path", params.SAM2_ENCODER_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.decoder_path", params.SAM2_DECODER_PATH);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.use_gpu", params.SAM2_USE_GPU);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.encoder_use_trt", params.SAM2_ENCODER_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.decoder_use_trt", params.SAM2_DECODER_USE_TRT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.decimation", params.SAM2_DECIMATION);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.mask_prior", params.SAM2_MASK_PRIOR);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "Sam2.mask_prior_logit", params.SAM2_MASK_PRIOR_LOGIT);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.metrics_log", params.SAM2_METRICS_LOG);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.publish_refined", params.SAM2_PUBLISH_REFINED);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Sam2.refine_labels", params.SAM2_REFINE_LABELS);
+
+    // Custom drawing windows (default ON).
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Voxel.show_voxel_viewer", params.SHOW_VOXEL_VIEWER);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Voxel.show_yolo_viewer", params.SHOW_YOLO_VIEWER);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Voxel.show_ricoh_viewer", params.SHOW_RICOH_VIEWER);
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Voxel.perf_log", params.PERF_LOG);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "StreamWatchdog.hold_enter_s", params.HOLD_ENTER_S);
+    rc::ConfigLoaderUtils::load_optional<float, double>(configLoader, "StreamWatchdog.recover_s", params.HOLD_RECOVER_S);
+
+    rc::ConfigLoaderUtils::load_optional(configLoader, "Component.Debug.Verbose", params.VERBOSE_DEBUG);
+
+    return params;
+}
+
+bool preflight_models(const RetinaParams& params)
+{
+    // One row per model the configuration actually asks for. `required` mirrors the gate in
+    // SpecificWorker::initialize() that constructs the stage -- if the two ever disagree, this check
+    // is either blocking a valid config or waving a broken one through, so they are worth re-reading
+    // together when a stage moves.
+    struct Need { bool required; const std::string& path; const char* flag; const char* purpose; };
+    const bool ricoh = params.RICOH_YOLO_ENABLED;
+    const std::vector<Need> needs{
+        { true,
+          params.YOLO_MODEL_PATH,        "(always)",
+          "instance segmentation - the ZED and ricoh seg stages" },
+        { params.HUMAN_POSE_ENABLED,
+          params.HUMAN_POSE_MODEL_PATH,  "HumanPose.enabled",
+          "human pose" },
+        { params.SEMANTIC_SEG_ENABLED or (ricoh and params.RICOH_SEMANTIC_ENABLED),
+          params.SEMANTIC_SEG_MODEL_PATH,"Semantic.enabled / Ricoh.semantic_enabled",
+          "ADE20K semantic segmentation" },
+        { params.SAM2_ENABLED,
+          params.SAM2_ENCODER_PATH,      "Sam2.enabled",
+          "SAM2 mask refinement (encoder)" },
+        { params.SAM2_ENABLED,
+          params.SAM2_DECODER_PATH,      "Sam2.enabled",
+          "SAM2 mask refinement (decoder)" },
+        { params.ZED_DEPTH_ENABLED or (ricoh and params.RICOH_DEPTH_ENABLED),
+          params.RICOH_DEPTH_MODEL_PATH, "ZedDepth.yolo_depth_enabled / RicohDepth.enabled",
+          "monocular depth" },
+        { ricoh and params.PLACE_ENABLED,
+          params.PLACE_MODEL_PATH,       "PlaceMemory.enabled",
+          "DINOv2 panoramic place memory" },
+    };
+
+    std::vector<const Need*> missing;
+    for (const auto& n : needs)
+    {
+        if (not n.required) continue;
+        if (n.path.empty())                          // configured ON with no path at all
+        { missing.push_back(&n); continue; }
+        std::error_code ec;
+        if (not std::filesystem::is_regular_file(n.path, ec)) missing.push_back(&n);
+    }
+    if (missing.empty()) return true;
+
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    std::print("\n"
+        "[models] ══════════════════════════════════════════════════════════════════════════════════\n"
+        "[models] ★★ retina REFUSES TO START: {} required model file(s) are missing.\n"
+        "[models]\n", missing.size());
+    for (const auto* n : missing)
+    {
+        std::print("[models]   {}\n"
+                   "[models]       needed by : {}\n"
+                   "[models]       purpose   : {}\n",
+                   n->path.empty() ? "<no path configured>" : n->path, n->flag, n->purpose);
+        if (not n->path.empty())
+        {
+            const std::filesystem::path p(n->path);
+            std::print("[models]       looked at : {}\n",
+                       (p.is_absolute() ? p : cwd / p).lexically_normal().string());
+        }
+    }
+    std::print(
+        "[models]\n"
+        "[models]   Models are NOT shipped in this repository -- you download the upstream weights and\n"
+        "[models]   export them to ONNX yourself. See the \"Models\" section of README.md for the\n"
+        "[models]   directory layout, the flag -> file table, and the export commands.\n"
+        "[models]\n"
+        "[models]   ★ Paths are relative to the WORKING DIRECTORY you launched from, not to the binary.\n"
+        "[models]     Current working directory: {}\n"
+        "[models]     If the files exist but are listed above, you are almost certainly running from\n"
+        "[models]     the wrong directory -- launch from the component root.\n"
+        "[models]\n"
+        "[models]   Or set the corresponding flag to false, and the capability stays off ON PURPOSE\n"
+        "[models]   rather than by accident.\n"
+        "[models] ══════════════════════════════════════════════════════════════════════════════════\n\n",
+        cwd.string());
+    return false;
+}

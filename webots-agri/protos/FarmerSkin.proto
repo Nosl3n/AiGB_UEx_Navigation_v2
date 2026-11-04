@@ -1,0 +1,83 @@
+#VRML_SIM R2025a utf8
+# FarmerSkin.proto — Robert (MakeHuman FBX skin) customized with farmer flannel plaid shirt,
+# work denim trousers and leather work boots.
+
+PROTO FarmerSkin [
+  field SFVec3f    translation 0 0 0
+  field SFRotation rotation    0.57735 0.57735 0.57735 2.0944
+  field SFVec3f    scale       1 1 1
+  field SFString   name        "granjero_skin"
+  field SFBool     castShadows TRUE
+]
+{
+  Skin {
+    translation IS translation
+    rotation IS rotation
+    scale IS scale
+    name IS name
+    modelUrl "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/skin_animated_humans/protos/skins/robert.fbx"
+    appearance [
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/skin_animated_humans/protos/textures/robert_skin.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "skin"
+      }
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/skin_animated_humans/protos/textures/robert_eyes.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "eyes"
+      }
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/skin_animated_humans/protos/textures/robert_eyebrow.png"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "eyebrow"
+      }
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/humans/skin_animated_humans/protos/textures/robert_hair.png"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "hair"
+      }
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "textures/granjero_shoes.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "shoes"
+      }
+      PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "textures/granjero_suit.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+        name "suit"
+      }
+    ]
+    castShadows IS castShadows
+  }
+}

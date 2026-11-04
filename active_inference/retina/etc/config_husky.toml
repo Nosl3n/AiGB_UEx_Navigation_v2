@@ -1,0 +1,529 @@
+# retina for the Husky A300 in the open field (webots-agri), PEOPLE first: ZED instance segmentation (field
+# objects + people) and YOLO-pose skeletons for human_concept. Derived from config.toml; lines tagged HUSKY
+# changed. Indoor specialists (doors, tables, room envelope) and everything Ricoh/360 are off.
+
+# --- Common Agent Data ---
+[Agent]
+id = 9
+name = "retina"
+
+# --- Single Instance Configuration ---
+# Use this if you only have one graph.
+configFile = ""
+domain = 0
+tree = false
+graph = false   # DSR node-link viewer crashes in paintAndFlush under participant churn (e.g. bottle_concept
+                # joining). Voxel3D + YOLO run as standalone windows, so no DSR view is needed here.
+2d = false
+3d = false
+
+# --- Multiple Instance Template ---
+# If you define multiple instances, the single instance config above will be ignored.
+# [Agent.instance_name]
+# configFile = ""
+# domain = 1
+# tree = true
+# graph = true
+# 2d = true
+# 3d = true
+
+# Zero-copy RGBD media plane (consumer). DEDICATED DDS domain, isolated from the
+# DSR Agent.domain = 0 so media discovery churn never perturbs cortex/DSR resync.
+# Must MATCH the robot_concept producer.
+[Media]
+domain_id   = 7
+rgb_topic   = "rc/zed/rgb"
+depth_topic = "rc/zed/depth"
+ricoh_topic = "rc/ricoh/rgb"   # RGBD_360 panorama (Image360Frame plane)
+lidar_topic = "rc/lidar3d/points"
+lidar_use_media = true   # false ⇒ DSR graph 'lidar3D' node only
+
+[Period]
+Compute = 25   # 40 Hz ceiling; cycle is ~13 ms (L seg + pose), so headroom to keep up with the ~24 Hz RGB feed
+Emergency = 500
+
+[Presence]
+required_agent_names = ["robot_concept", "openfield_concept"]   # HUSKY: the field world frame comes from openfield_concept, not room_concept
+optional_agent_names = ["human_concept"]
+config_dir           = "etc"
+monitor_period_ms    = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms      = 1500
+stale_grace_ms       = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+# ★OWN THE SELF NODE. cortex creates an `agent`-type node literally named "<Agent.name> <Agent.id>"
+# (dsr_agent_info_api.cpp) on the first heartbeat. This agent used to declare NO [Owns] at all, so it
+# never deleted that node on shutdown and relied entirely on a surviving PEER noticing the DDS
+# participant drop and deleting it by id. Every other agent lists itself here, and door_concept's
+# config documents the exact failure that leaves behind — the agent's own node leaking into the
+# persistent graph on a graceful shutdown. Fixed while renaming, because the rename is precisely the
+# moment a leftover node under the OLD name becomes a DUPLICATE carrying the same agent id, which is
+# worse than a stale one: the presence monitor keys peers by id, so the two overwrite each other
+# every scan and the peer flaps Ready/Stale forever.
+nodes    = ["retina 9"]
+# The perception products (masks / skeleton / semantic, type semantic_grid) are deliberately NOT
+# listed: they are swept by TYPE in graph_publisher::cleanup_semantic_grid_nodes(), and their names
+# are fixed product names unrelated to this agent's name.
+
+
+[Component.Debug]
+Verbose = false
+
+[Yolo]
+# TensorRT EP (FP16) for YOLO. Requires the TRT 10.9 stack the linked ONNX Runtime is built against
+# (see README "TensorRT version lock"). Set false to run on the CUDA EP only — version-independent,
+# same masks, no TRT speedup — if the TRT libs can't be reconciled (e.g. after an apt upgrade).
+use_trt =true
+model_path = "models/yolo26/yolo26x-seg.onnx"    # HUSKY: X (2026-10-15), with TensorRT FP16 in mind: 7.5 ms vs 31 ms on the CUDA EP
+                                                 # (RTX 5070 Ti). An A/B on 24 orchard frames (2026-10-14) found L as good for people
+                                                 # (mask IoU 0.87, one close-up X missed) — yolo26l-seg.onnx is kept beside it.
+conf_thresh = 0.25          # min class confidence to ACCEPT a seg detection/mask (argmax score floor); raise to reject weak masks
+iou_thresh  = 0.45          # NMS IoU: dedupe overlapping same-class boxes above this
+second_best_margin = 0.0    # if top class is NOT in accepted_labels but the runner-up IS and within this margin, adopt the runner-up (0 = off; try 0.10 to recover near-tie furniture)
+accepted_labels = ["person"]   # HUSKY: only people. Trunks and foliage come from the ADE20K [Semantic] block (trunk_concept /
+                               # vegetation_concept); no other COCO class has a consumer here. The model still scores all 80
+                               # classes — this list only decides what is published, so it costs nothing either way.
+mask_tray = false   # HUSKY: the tray polygon masks Shadow's own tray in the image; the Husky ZED sees no robot part
+tray_mask_ref_width  = 1280
+tray_mask_ref_height = 720
+# Flat-topped polygon bounding the robot tray (flat x,y pairs, referenced to 1280×720).
+# The real tray rim is nearly flat across the centre with rounded shoulders, NOT a
+# semicircle. This traces a flat plateau (y≈657 across the central ±220 px) then rounds
+# the shoulders down to the image bottom, then closes along the bottom edge.  The tray
+# is shallow, so the vertical extent is ~63 px at centre.  NOTE: this polygon no longer
+# blacks out the RGB pixels — YOLO runs on the clean frame and any detection overlapping
+# this region is dropped in postprocess (mask_tray gate).  Adjust if the mount changes.
+tray_mask_polygon = [
+    195, 720,  242, 710,  298, 695,  358, 677,  420, 662,
+    480, 659,  560, 658,  640, 657,  720, 658,  800, 659,
+    860, 662,  922, 677,  982, 695, 1038, 710, 1086, 720,
+    1280, 720,  0, 720
+]
+
+# ── ZED worker pull pacing ────────────────────────────────────────────────────────────────────────
+# How often the ZED perception worker asks its source for a frame when the last ask came up empty.
+# A POLL GRANULARITY, not a rate limit: a cycle that FINDS a frame runs at its own cost and never
+# sleeps, so lowering this cannot make perception run faster than the models allow.
+# ★4 ms (was a hardcoded 15) — at 15 this was the BINDING CONSTRAINT once SAM2 came off. Measured
+# (468 frames, etc/viewer_perf_zed_worker.csv): real work 25.3 ms against a 25 ms camera period, yet
+# the loop ran 49.1 ms and processed exactly 1 frame in 1.96. The worker finished just as the next
+# frame was landing, asked a moment too early, missed, and slept a full 15 ms — a frame lost to poll
+# granularity, not to compute. Raise it if the idle null-fetch poll (now 250 Hz vs 66) ever shows up
+# as CPU; the null path is cheap (a media drain that finds nothing) but it is not free.
+zed_thread_period_ms = 4
+
+[HumanPose]
+# Second YOLO-pose model on the same RGB frame → BODY_18 3D skeletons on the 'skeleton' DSR node
+# (camera frame, metres) consumed by human_concept. Default OFF — set enabled=true once the ONNX
+# model exists. Export with: yolo export model=yolo26m-pose.pt format=onnx  (gives yolo26m-pose.onnx).
+enabled = true   # HUSKY: people: YOLO-pose -> skeleton node -> human_concept
+model_path = "models/yolo26/yolo26x-pose.onnx"   # HUSKY: X (2026-10-15). 6.0 ms TensorRT FP16 / 23 ms CUDA EP. Exported with
+                                                # yolo export model=yolo26x-pose.pt format=onnx opset=17 simplify=True end2end=False
+conf_thresh = 0.30          # person-detection confidence floor
+kp_conf_min = 0.30          # per-joint floor; below this a keypoint is dropped (NaN)
+depth_patch = 2             # half-window (px) for the median-depth sample at each joint
+use_trt = true             # pose model is cheap; CUDA EP is fine and avoids the TRT version lock
+hold_ms = 500               # keep last good skeleton this long after a detection miss (anti-flicker on the YOLO viewer)
+decimation = 1              # run pose every Nth cycle; 1 = every frame (no skeleton stutter). Raise if GPU-bound
+
+[Semantic]
+# YOLO26 semantic-segmentation model (ADE20K-150) on the same RGB frame → a DENSE per-pixel class map.
+# HUSKY: this is the VEGETATION channel. The dense map itself is not published (publish_node = false);
+# only its vegetation classes leave retina, as instance masks on the 'masks' node (publish_masks below),
+# where vegetation_concept turns them into `plant` nodes. Model copied from the original stack
+# (~/robocomp/components/active_inference/retina/models/yolo26/), not versioned (*.onnx).
+enabled = true    # HUSKY: vegetation semantics (vegetation_concept)
+model_path = "models/yolo26/yolo26x-sem-ade20k.onnx"   # HUSKY: X (2026-10-15), official Ultralytics weights, exported like the
+                                                       # pose model. 5.3 ms TensorRT FP16 / 19 ms CUDA EP. Plain export: the
+                                                       # -probs build only grades furniture classes
+conf_thresh = 0.25          # per-pixel argmax-softmax floor; below it the pixel is "ignore" (255)
+input_size = 640
+use_trt = true             # dense model; CUDA EP avoids the TRT version lock
+decimation = 1              # HUSKY: every processed frame (was 6: ~1.9 Hz of vegetation looks). vegetation_concept and
+                            # trunk_concept weight each look by the time it stands for (their LookPeriodMs), so
+                            # the rate can change (decimation, model size, TensorRT) without retuning them.
+publish_node = false        # HUSKY: the ~1-2 MB dense label blob has no consumer here — keep it off the graph
+publish_min_interval_s = 0.5
+publish_probs = false       # graded posterior exists only in the -probs export (furniture classes)
+
+# Semantic-derived INSTANCE masks: one mask per connected region of an accepted class, dropped where a YOLO-seg
+# mask already covers it (YOLO is authoritative — a worker in front of a tree stays a person), appended to the
+# 'masks' node with class_id = 1000 + ADE20K id. HUSKY: the vegetation classes. NOT grass/field: low ground cover
+# is drivable and is not a plant the robot must go round.
+publish_masks = true
+accepted_labels = ["tree", "plant", "palm", "flower"]   # ADE20K-150 class names (must match the model's table)
+mask_min_area_frac = 0.003      # drop connected components smaller than this fraction of the frame area
+mask_overlap_drop_frac = 0.5    # drop a semantic component ≥this covered by a YOLO-seg mask (YOLO priority)
+mask_morph_kernel = 5           # open+close kernel (px) to denoise the class field before component labelling; ≤1 = off
+mask_score_default = 0.5        # confidence assigned when the model produces no per-pixel score map
+
+[Sam2]
+# SAM2.1 mask REFINEMENT: sharpen the mask of an already-located YOLO object. Runs a two-model ONNX
+# pipeline (encoder once/frame, decoder per object) prompted by each detection's bbox. Toggle "SAM2"
+# appears in the ZED window (display only — it cannot gate the stage while publish_refined is true).
+#
+# ★OFF 2026-08-14 — IT WAS HALF THE FRAME. Measured per-stage on the zed worker (417 frames, 7
+# detections, etc/viewer_perf_zed_worker.csv): SAM2 49.9 ms of a 95.3 ms loop = 52.3%, more than THREE
+# TIMES the other four models combined (seg 8.2, semantic_masks 6.7, semantic 4.7, pose 4.2), and it
+# scales per object at ~7.1 ms each. That is why `rgb` read ~10-12 Hz against a camera delivering at
+# ~31 Hz — throughput, not dropped frames.
+# ★enabled=false is the RIGHT switch, not decimation: specificworker.cpp gates the whole stage on it
+# (`if (params.SAM2_ENABLED)`), so nothing is constructed — no ONNX session, no 1024² TRT engine.
+# ★WHAT THIS COSTS. publish_refined below is now INERT (refined_fresh never becomes true), so the masks
+# reaching the concept fitters are RAW YOLO again. SAM2 was measured at -79% far-tail depth bleed, so
+# bottle/table/chair/cabinet lose that. Set back to true to restore it; decimation=2 is NOT the middle
+# ground it looks like — only non-decimated cycles substitute, so the fitters would see mask quality
+# ALTERNATING frame to frame, which is plausibly worse for them than uniformly raw masks.
+enabled = false
+encoder_path = "models/sam2/sam2.1_hiera_tiny.encoder.onnx"
+decoder_path = "models/sam2/sam2.1_hiera_tiny.decoder.onnx"
+use_gpu = true
+encoder_use_trt = true      # fixed-shape 1024² hiera → TRT FP16 speedup. FIRST launch builds the engine
+                            # (slow, minutes; cached in .trt_cache after) — subsequent launches are fast.
+decoder_use_trt = false     # dynamic-shape decoder (num_labels/points) → CUDA EP; cheap (~7ms) anyway
+decimation = 1              # run every enabled frame (needed for every-frame publish_refined substitution)
+mask_prior = true           # feed the YOLO mask as the decoder's mask_input prior → tighter boundaries
+mask_prior_logit = 4.0      # ±logit strength of that prior. High (8)=SAM2 echoes YOLO; low (2)=free to tighten.
+                            # A/B this + mask_prior=false against the metric CSV to see what refines most.
+metrics_log = false         # log etc/sam2_refine_metrics.csv: per-object depth-bleed YOLO vs SAM2 (the win)
+publish_refined = true      # route SAM2 masks into the published 'masks' node (→ concept fitters). When true,
+                            # SAM2 runs continuously (not just when the overlay toggle is on). Only fresh
+                            # (non-decimated) cycles substitute, so set decimation=1 for every-frame refinement.
+refine_labels = ["table", "chair", "monitor", "tv", "bottle", "cabinet"]   # which classes to refine ([] → all detections)
+
+[Voxel]
+# Custom drawing windows (own top-level windows). Set false for headless/production.
+show_voxel_viewer = true
+show_yolo_viewer  = true
+show_ricoh_viewer = false   # HUSKY: no Ricoh on the Husky
+perf_log = false   # per-frame compute/yolo/pose timing -> etc/viewer_perf.csv (diagnostic; flushes CSVs every
+                   # frame — leave OFF in production, flip true only to capture a timing trace)
+                   # ★ON again 2026-08-15 to verify the round-robin panorama pass: Ricoh.yolo_strips_per_frame
+                   # went 3 -> 1, so etc/viewer_perf_ricoh_worker.csv should show seg_ms ~11 ms instead of
+                   # ~32. That number is also the budget the ADE20K strip pass has to fit inside, so it
+                   # decides the next step as much as it confirms this one. OFF again once captured.
+                   # ★OFF again 2026-08-14 after the measurement below was captured.
+                   # ★Was ON 2026-08-14 to measure the ZED worker: `rgb` reads ~11.6 Hz against a ~25 Hz plane, and
+                   # that counter is ticked on take_result() (the worker's OUTPUT), not on arrival — so it is
+                   # throughput, not loss. The chain runs FOUR ONNX models per frame, all at decimation=1
+                   # (yolo-seg + pose + semantic + SAM2's two sessions). etc/viewer_perf_zed_worker.csv gives
+                   # the per-frame `stages_ms` that says WHICH one dominates; decide decimation from that, not
+                   # from model count. TURN THIS BACK OFF once the trace is captured — it flushes every frame.
+mask_depth_gate_band_m = 3.0   # ZED mask FOREGROUND gate: keep points within this depth band (m) of the mask's
+                               # near surface; farther points = wall-behind bleed (RGB↔depth skew while moving) → dropped.
+                               # ⚠ HARD THRESHOLD, TEMPORARY. At 1.5 it silently amputated the far half-metre of any
+                               # object deeper than 1.5 m (e.g. a 2 m table along its length). Widened to 3.0 so real
+                               # objects survive; SAM2's tighter masks already cut edge bleed at the source. TO BE
+                               # REMOVED once the model-conditioned association (fitter rejects bleed by its own
+                               # surface hypothesis) is tested live. Don't re-tune — the fix is to delete it. 0 disables.
+
+# [RateRegulator] REMOVED 2026-08-15. It adapted pose decimation to hold a target rate and had been
+# inert since perception moved to a worker thread — its decimation drove nothing, and it was fed a
+# compute cost from a thread that no longer runs inference. It could not have helped regardless: pose
+# is 4.2 ms of a 24 ms frame, while the real limiters were SAM2 (52%) and poll granularity.
+# The per-channel SOURCE cadence it used to expose is now on the Voxel3D panel as processed/feed.
+
+[StreamWatchdog]
+hold_enter_s = 1.5    # RGB stale this long → HOLD publishing
+recover_s    = 1.0    # sustained freshness required before resuming
+
+# Ricoh 360 peripheral detection (see RICOH_360_PERIPHERAL_DETECTION.md — no-depth "glance" evidence,
+# not yet wired to DSR). Runs on its OWN thread with its OWN YOLO model/session (rc::RicohYoloWorker) —
+# decoupled from compute()'s budget entirely, paced to yolo_thread_period_ms instead of traded against
+# the main perception rate via decimation. Split into 3 vertical strips to avoid the aspect-ratio
+# distortion of squashing 1920x960 straight to 640x640.
+
+[Ricoh]
+yolo_enabled = false   # HUSKY: no Ricoh on the Husky
+yolo_thread_period_ms = 50    # target worker-thread cycle (~20 Hz); 3-strip inference is the floor (~20ms)
+yolo_n_strips         = 3
+# Strips SEGMENTED PER FRAME. 0 = all three (original behaviour); 1 = round-robin one strip per frame.
+# ★The 360 seg is the largest single GPU block in this component — 32.0 ms of a 53 ms ricoh cycle,
+# measured per-stage — and it spends it re-segmenting a 360° field of view that mostly has not changed.
+# At 1, cost drops ~3x and every direction is still revisited every 3 frames (~160 ms at 18.8 Hz).
+# ★A FIXED ROTATION, not "look where the objects are": a greedy policy starves the empty strips, and a
+# NEW object appearing in a starved direction is exactly what a peripheral channel is for. It also
+# matters for the confirmation consumers — bottle/chair/door confirm STATIC objects through this
+# channel, so a strip that stops being visited stops confirming what stands in it.
+yolo_strips_per_frame = 1
+
+# ── ADE20K (YOLO-sem) on the SAME scheduled strip ─────────────────────────────────────────────────
+# ★THIS IS THE ONLY WAY cabinet_concept AND hood_concept EVER SEE A PERIPHERAL DETECTION. Their labels
+# are YOLO-sem classes (published as class_id = 1000 + ade_id), and the ricoh's YOLO-seg accepted_labels
+# above contains neither "cabinet" nor "hood" — so their ricoh code, 94 lines each and now shared,
+# could never fire even once. Affordable because the round-robin freed ~20 ms/frame (seg 32.0 -> 12.2
+# measured), leaving ~38 ms of the 50 ms worker budget.
+# It runs on the strip YOLO-seg just chose — the window is shared, not two counters that would drift —
+# and its output is a BEARING, not a mask: a 360 detection carries no usable geometry and every
+# consumer already refuses to fit it.
+# Model/thresholds are shared with [Semantic] (the ZED's ADE20K block); this is a SECOND session on the
+# ricoh worker, so watch cpu on the panel after enabling.
+semantic_enabled = false
+                                # Classes resolve from [Semantic].accepted_labels, which has both.
+semantic_decimation   = 1       # run every ricoh frame; raise if the second session costs too much
+yolo_strip_overlap_px = 200   # circular-pad margin so a seam-straddling object survives whole. 80→200 so a
+                              # chair on the wraparound seam (directly behind the robot) stays whole in one
+                              # strip. Clamped to strip_w/2=320; each strip → 1040px (1.6× squash, was 1.25×).
+yolo_merge_iou        = 0.5   # cross-strip box IoU above which two strips' boxes are the same object
+publish_masks = false
+mask_depth            = true  # reproject lidar into the panorama → publish 360 masks as FULL 3D (has_depth=1 +
+                              # mask_depth_var) instead of bearing-only. Flip ON only once agents read mask_depth_var into R.
+mask_depth_helios_only = true # use helios (co-located with the ricoh) only for the depth-fill; exclude bpearl
+mask_fg_band_m        = 0.60  # foreground depth band (m): keep lidar hits within this of the NEAREST silhouette
+                              # surface; farther returns are occluded floor-behind / under-object floor → dropped
+azimuth_tune_deg      = 0.0   # tune in DEGREES: extra yaw on room_T_ricoh over the graph cam_equirect_offset.
+                              # Dial the last few degrees vs the Lidar overlay (restart retina only), then bake the
+                              # total into the ricoh node's cam_equirect_azimuth_offset in shadow.json and reset to 0.
+                              # ~0.0175 rad per degree; +tune shifts the projected room one way, − the other.
+# Ricoh azimuth calibration (mirror sign + seam zero) now lives in the GRAPH as the ricoh node's
+# cam_equirect_azimuth_sign (-1) / cam_equirect_azimuth_offset (0) intrinsics, applied by CameraAPI.
+# Both the 360 projection overlay and the detection→bearing publisher go through CameraAPI — no knobs here.
+
+# ── Monocular DEPTH on the 360 panorama (yolo26l-depth) ────────────────────────────────────────
+# Same 3-vertical-strip trick as the 360 seg, but with its OWN geometry, because depth is a
+# GEOMETRIC task and the seg strips are wrong for it:
+#   * band_half_elev_deg crops to ±60° about the equator. The head was trained on perspective
+#     photos; equirect distortion grows toward the poles, so the top/bottom thirds are the least
+#     trustworthy part of the panorama AND the least useful (ceiling / floor right under the robot).
+#   * overlap_px is 64, not the seg path's 200. The overlap is CONTEXT ONLY — nothing is merged
+#     across it. With 3 strips on a 1920-wide panorama that makes each strip 640+128 = 768 px wide,
+#     exactly the model input width, so there is zero horizontal resampling; the ±60° band is 640
+#     rows, so the letterbox scale is 1.0 and only the top/bottom get grey padding.
+#
+# ★DISPLAY-ONLY. The model is scale-and-shift invariant PER INPUT IMAGE, so the three strips do not
+# share a scale: measured 2026-08-02 on the same overlapping columns, adjacent strips disagreed by
+# 2.78x and 0.45x. Nothing is blended across a seam and the popup normalises each strip separately
+# and draws the seam lines, so what you see is the only thing the model asserts — relative depth
+# ordering WITHIN a strip. Making it metric needs an anchor: a per-strip least-squares fit of
+# (a,b) in log space against the helios points Ricoh.mask_depth already reprojects into the
+# panorama. See src/depth_processor.h.
+
+[RicohDepth]
+enabled = false
+model_path          = "models/yolo26/yolo26l-depth.onnx"
+input_size          = 768     # exported imgsz; changing it without re-exporting will letterbox wrongly
+use_gpu             = true
+use_trt             = true    # ON 2026-08-02: gnomonic runs n_strips inferences per frame (6, was 3), so the
+                              # per-call cost matters much more than it did. Matches seg/pose/semantic, which all
+                              # use TRT. First run after enabling is SLOW while the engine is built and cached.
+n_strips            = 6       # 6 x 60° of azimuth → 75° gnomonic views, close to a normal lens
+# ★GNOMONIC. Each strip is rendered as a virtual PINHOLE camera looking along its azimuth, the model
+# runs on that, and the depth is mapped back. Raw equirect crops were measured (2026-08-02, live lab
+# panorama) to give depth ANTI-CORRELATED with geometry: the wall at 3-5 m came out as the nearest
+# thing in the strip and the floor 1.4 m under the robot as the farthest, both band edges collapsing
+# to "far". Equirect smears content toward the poles and a depth head reads textureless expanses as
+# sky. Set false to A/B against that old behaviour.
+gnomonic            = false  # A/B 2026-08-03: measure the raw-equirect path's [depth-lidar] r against
+                             # gnomonic's +0.90. Restore to true if the reprojection wins.
+gnomonic_fov_deg    = 0.0     # 0 ⇒ 360/n_strips * 1.25 (25% context margin), capped at 140°.
+                              # NARROW IS THE WHOLE POINT: 6 strips ⇒ 75°, 3 strips ⇒ 140° (still extreme).
+zdepth_to_range     = true    # datasets encode z-depth; converting to ray range is additive in log space
+overlap_px          = 64      # equirect path only (gnomonic gets its margin from the FOV)
+band_half_elev_deg  = 60.0    # equirect path only; under gnomonic the covered band FALLS OUT of the FOV
+decimation          = 1       # run every Nth worker frame; raise if it eats the ricoh thread's budget
+# Per-view Pearson r of the model's log-depth against the helios LiDAR range at the SAME panorama
+# pixels, + the least-squares (a,b) of log_range ≈ a·log_model + b. THE measurement that says whether
+# the model is seeing this room at all: r near 0 ⇒ it is not, and no amount of scaling will help;
+# r high with a ≈ 1 ⇒ only the scale is missing and (a,b) is the anchor that supplies it.
+# → etc/ricoh_depth_lidar.csv + a "[depth-lidar] mean r=..." line every 40 cycles.
+lidar_diag          = true
+# Keep 1 sample in N when RECORDING (the correlation still uses every hit). ~20k LiDAR hits land in a
+# panorama and neighbouring returns on one surface are redundant, so stride 16 loses nothing the fit
+# can use and keeps the dataset ~40x smaller — 635 MB for 406 frames at stride 1.
+sample_stride       = 16
+# ── Epistemic frame admission ─────────────────────────────────────────────────────────────────────
+# Admit a frame by the MUTUAL INFORMATION it carries about the map parameters, not by how far the
+# robot moved. The map is linear in its parameters given the knots, so with L = SUM x*x' the exact
+# gain is 0.5*(logdet(L+dL) - logdet(L)) nats — microseconds for a 16x16 matrix. It saturates on its
+# own: the 300th view of the same wall scores ~0 and is dropped, while a long sightline still scores
+# high because the spline's ends are barely constrained. Pose novelty was only ever a proxy for this.
+# Set false to fall back to the old 10 cm / 5 deg distance rule.
+info_select         = true
+min_gain_nats       = 0.10   # minimum information worth storing a frame for. Raise to keep only
+                             # strongly novel views; 0 admits everything that passes the guard below.
+                             # 0.50 proved too strict on a fresh set — 11 frames in one drive, below
+                             # what the spline needs to be identifiable. 0.10 admits ~4x more.
+# ★Consistency guard. D-optimality CANNOT tell leverage from corruption — a frame with a bad pose,
+# bad registration, or a person walking through has high leverage and scores as maximally informative,
+# so a naive rule would preferentially collect exactly the frames that poison the fit. A frame whose
+# median residual under the current map exceeds this multiple of the map's own anchored residual is
+# dropped unscored: novelty must be earned by data that AGREES, not merely by data that is unusual.
+suspect_resid_mult  = 3.0
+# Save each ADMITTED frame's panorama as <frames_dir>/<stamp_ms>.jpg. The stamp is the panorama's own
+# capture stamp and is also the CSV row's stamp_ms, so the two join with no schema change. Needed only
+# by the OFFLINE enrichment pass (YOLO-sem segments ceiling/floor/wall, then the room envelope from
+# room_concept supplies synthetic depth where the LiDAR cannot reach — the whole upper half of the band
+# has zero returns, and walls would extend the fit past its current 0.39–10.16 m support).
+# ~250–400 kB per frame; a few hundred frames ≈ 150 MB. Only written while Collect is armed.
+save_frames         = true
+frames_dir          = "etc/depth_frames"
+frame_jpeg_quality  = 92
+# Fixed metres span of the CORRECTED overlay ramp. Only used once etc/ricoh_depth_map.csv exists AND
+# this frame's LiDAR anchor solved; until then the overlay stays per-strip relative with seam lines.
+metric_lo_m         = 0.4
+metric_hi_m         = 8.0
+overlay_alpha       = 0.65    # popup blend weight of the depth ramp over the panorama
+
+# ── ROOM BELIEF vs the ZED's measured depth ───────────────────────────────────────────────────────
+# The ZED window's "RoomΔ" button cycles off -> PREDICTED -> DIFF. It ray-casts the room envelope
+# room_concept believes in (floor z=0, ceiling z=room_height, one vertical wall per polygon edge)
+# through every pixel and differences it against the camera's own depth. No neural model is involved:
+# the ZED already MEASURES depth and the room belief already PREDICTS it, so the difference IS the
+# belief's per-pixel residual — the quantity the free energy is built from, drawn as an image.
+#
+# ★Reading it: a well-fitted ROOM goes BLACK. Furniture and people stay bright because the envelope
+# deliberately excludes them — that is the residual working, not an error. The interesting failure is
+# bright STRUCTURE: a whole wall tilting, or the floor shading off with range, means the room model
+# itself is wrong. Red = the belief predicts farther than measured, blue = nearer.
+
+[ZedDepth]
+enabled = false   # HUSKY: room-envelope depth model needs walls
+decimate    = 2      # ray-cast on a 1/N grid and upsample (NEAREST — the envelope has real depth
+                     # discontinuities at corners, and interpolating one invents a surface)
+diff_span_m = 1.0    # |error| in metres that saturates the difference colour
+# The yolo26l-depth model on the ZED frame: NOT needed — the camera measures depth directly. Kept
+# available only as a way to score the monocular model against dense ground truth, which is a
+# different question from validating the room belief.
+yolo_depth_enabled = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+# ── [PlaceMemory] panoramic appearance keyframes → a pose mixture ──────────────────────────────────
+# WHAT IT IS FOR. When room_concept loses the robot, RoomConcept::grid_search_initial_pose falls back
+# to a blind lattice over the whole room (≥1 m / 90° ⇒ ~360 candidates in the 8.5 × 9.3 m apartamento),
+# carrying nothing over from the hundreds of times the robot has already stood in those places. This
+# encodes each ricoh panorama with DINOv2 ViT-S/14, keyed to the room pose it was captured at, so a
+# query panorama can propose WHERE — as a distribution, not an answer.
+#
+# ★ THIS PASS BUILDS THE MAP AND THE MEASUREMENT, NOT THE BEHAVIOUR. Nothing consumes the output yet;
+# the designed consumer is grid_search Stage 1 (room_concept.cpp:1764-1808), where mixture.sample(rng, 8)
+# replaces the lattice and feeds the unchanged Stage 2 → moment_match contract. Turning this on costs
+# GPU time and produces files; it changes no robot behaviour.
+#
+# ★ ORDER OF OPERATIONS: logger BEFORE map. tau/decay_r/insert_min_dist_m are OUTPUTS of
+# tools/place_eval, not inputs to it. So: log_queries=true → drive → place_eval → write the measured
+# numbers back here WITH provenance → build_map=true.
+enabled = false
+
+[PlaceMemory]
+enabled            = false
+model_path         = "models/dinov2/dinov2_vits14_reg_448x224.onnx"
+use_gpu            = true
+use_trt            = true   # ★ the FIRST run with a cold .trt_cache BUILDS an engine and stalls this
+                            # worker 30-60 s with no output of its own. A red line says so before it
+                            # happens, so it is not mistaken for a hang.
+input_w            = 448    # 2:1, matching the 1920x960 equirect ⇒ no aspect distortion.
+input_h            = 224    # ★ ASSERTED against the ONNX session's own input shape; a mismatch
+                            # refuses to run rather than silently producing wrong descriptors.
+n_sectors          = 16     # 22.5° per sector. 8 (45°) is coarser than the parallax scale and barely
+                            # beats the 90° lattice this is meant to replace.
+
+# ── The three pooling parameters below are MEASURED, and the obvious defaults are WRONG ────────────
+# Sweep over 5 panoramas x 15 rolls, 2026-08-28 (tools/export_dinov2.py):
+#     band     centre  pool_p |  roll acc   peak margin
+#     (0,16)   no      1.0    |    0.57       +0.017     ← "just mean-pool the whole image"
+#     (6,12)   no      1.0    |    1.00       +0.066
+#     (6,12)   yes     3.0    |    1.00       +0.354     ← shipped
+# The ranking is IDENTICAL for place discrimination (similarity contrast between frames <2 s and >60 s
+# apart, 90 frames / 2399 s: +0.046 naive vs +0.169 tuned), so it is not a trade-off.
+band_lo            = 6      # ★ patch rows kept, of 16. Measured |mean over azimuth| per row (1.0 = that
+band_hi            = 12     # elevation is CONSTANT around the circle, so carries no bearing info):
+                            #   rows 0-4   0.88-0.93  ceiling
+                            #   rows 7-11  0.70-0.77  horizon + near floor  ← the information
+                            #   rows 14-15 0.92-0.95  THE ROBOT'S OWN BODY — the ricoh looks down onto
+                            #              it, so the same rigid object is in every panorama from every
+                            #              position in the room. Half the image was nuisance.
+center             = true   # ★ per-frame mean subtraction. |mean token| over a frame is 0.656: DINOv2
+                            # tokens share a large common component carrying no positional information,
+                            # and a mean over L2-normalised tokens inherits it, so every sector-to-sector
+                            # cosine starts near 0.9 and the match peak drowns. Per-FRAME on purpose —
+                            # rolling a panorama leaves the frame mean unchanged, so centering is exactly
+                            # rotation-invariant and cannot break the circular shift.
+pool_p             = 3.0    # sign-preserving GeM. The usual objection (GeM assumes non-negative
+                            # features, ViT tokens are signed) is handled by the sign-preserving form.
+
+decimation         = 10     # ~2 Hz on the 50 ms ricoh worker ⇒ <1 ms/frame amortised against ~35 ms
+                            # of measured headroom. The map does not need 20 Hz.
+build_map          = false  # ON only for a mapping run, and only after place_eval has been run.
+insert_min_dist_m  = 0.5    # ★ MAP DENSITY, NOT A BELIEF GATE. This decides which samples to STORE —
+                            # the same kind of choice as a grid resolution. No evidence is discarded:
+                            # the pose that would have made a redundant keyframe is already represented
+                            # by its neighbour plus that neighbour's covariance. Falsifiable offline via
+                            # place_eval --sweep-dm. ★ There is deliberately NO yaw clause: one keyframe
+                            # already covers every heading, because a yaw-displaced view is a cyclic
+                            # permutation of descriptors already stored.
+save_every_n       = 20     # never write the map from inside a frame
+map_path           = "etc/place_map.csv"
+map_blob_path      = "etc/place_map.bin"
+
+log_queries        = false  # turn this on FIRST — it is what feeds tools/place_eval
+log_grid           = false  # ★ raw 16x32x384 patch grid, fp16, 393 KB/frame (~470 MB per 10 min at
+                            # 2 Hz). Logging the GRID rather than the pooled vector is what makes
+                            # n_sectors / pool_p / band an OFFLINE ablation instead of one robot drive
+                            # per option. Capture sessions only.
+log_stride         = 1
+log_dir            = "etc/place_log"
+sector_soft        = 0.0    # ★ 0 = hard sector bins. > 0 = raised-cosine windows of half-width
+                            # sector_soft x cols_per_sector, so adjacent sectors OVERLAP.
+                            # WHY IT EXISTS (measured 2026-08-28): rolling ONE panorama — position
+                            # identical by construction, so every drop is pure quantisation — gives a
+                            # SCALLOP in peak similarity, maxima at integer sector multiples and a
+                            # minimum at the half-sector offset:
+                            #     roll     0.00°  5.62°  11.25°  16.88°  22.50°   depth
+                            #     hard     1.000  0.830   0.773   0.800   0.912   0.227
+                            #     2.0x     1.000  0.878   0.906   0.856   0.923   0.144
+                            # This is why P1 (yaw INVARIANCE) fails on real data — 0.977 co-located
+                            # same-heading vs 0.653 co-located different-heading — while P2 (yaw
+                            # RECOVERY) passes at 99%: the argmax still lands right, the peak VALUE is
+                            # depressed. ★ It is not cosmetic: rho(sim) maps similarity to a POSITIONAL
+                            # spread, so a query sitting mid-sector is treated as if it were further
+                            # away than it is.
+                            # ★ DEFAULT 0 ON PURPOSE: the preliminary decay/tau constants in
+                            # common/place_memory/place_map.h were measured with HARD bins, and
+                            # shipping a different default would silently invalidate them. Setting this
+                            # to 2.0 is the FIRST thing to try in the Phase-3 ablation — then re-run
+                            # place_eval --decay --calibrate. The residual scallop after that is
+                            # patch-grid quantisation (a ViT is not shift-equivariant below its 14 px
+                            # patch) and no pooling choice removes it.
+
+# ── Approach instrumentation → etc/door_approach.csv ───────────────────────────────────────────────
+# Follows ONE semantic class against RANGE so the evolution of its evidence along an approach can be
+# read afterwards: p_class (what the model computed) and argmax_px (what the live pipeline believed)
+# on the same row, against range_m measured from ZED depth at the peak pixel.
+# ★One row per semantic frame INCLUDING frames where nothing was found — a detections-only log starts
+# at the moment of success and cannot show a detection appearing.
+
+[DoorApproach]
+enabled = false
+path    = "etc/door_approach.csv"
+label   = "door"            # must be an ADE20K class the loaded model exposes (see prob_class_ids)
+
+# ── Door SECOND OPINION → a model trained on doors, asked only when the cheap channel is silent ────
+# WHY: the ADE20K path's posterior collapses as the robot closes on a door — median P(door) 0.995 at
+# 5.5-6 m, 0.450 at 4.0-4.5 m, 0.110 at 3.5-4.0 m on a plainly visible CLOSED door, which it calls
+# `wall` at 0.676. No reweighting recovers information an output does not contain, so the only cure is
+# an independent model. It runs ONLY on frames where the semantic path produced no door mask (~37% of
+# frames; decimation 4 -> ~12% duty, first call within 0.62 s).
+# ★It must be allowed to DENY: "ran, found nothing" is evidence and weighs as much as a detection.
+#   The log records eligible/ran/n separately so a denial is never confused with never having asked.
+# Default OFF until the per-call cost on this box is measured with the real execution provider.
+
+[DoorSpecialist]
+enabled = false
+model_path  = "models/doors/doors_yolo11s_end2end.onnx"
+input_size  = 640
+# ⚠CPU. An 8th CUDA session aborted retina outright on the specialist's first inference:
+#   "Invalid handle. Cannot load symbol cublasLtGetVersion" -> SIGABRT (uncatchable).
+# retina already holds seven CUDA ONNX sessions. Re-enable the GPU only once that is understood.
+use_gpu     = false
+use_trt     = false
+score_floor = 0.05          # a REPORTING floor; nothing here decides whether a door exists
+# Counts SILENT frames only. At ~40 fps with ~37% silence, 8 gives ~1.8 calls/s — the 1.5-2 Hz the
+# offline study recommended, first call within ~0.5 s, inside door_concept's ~1.6 s removal budget.
+decimation  = 8

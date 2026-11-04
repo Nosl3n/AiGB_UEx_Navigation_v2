@@ -1,0 +1,510 @@
+#include "media_plane_source.h"
+
+#include <array>
+#include <format>
+
+#include "../../common/media_transport/media_transport.h"
+#include "../../common/media_transport/lidar_plane_reader.h"
+
+#include <genericworker.h>          // DSR graph API + generated cam_* attribute types
+
+#include <opencv2/imgproc.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <print>
+#include <string>
+#include <utility>
+
+MediaPlaneSource::MediaPlaneSource(std::shared_ptr<DSR::DSRGraph> graph)
+    : graph_(std::move(graph))
+{
+}
+
+MediaPlaneSource::~MediaPlaneSource()
+{
+    // Join BEFORE the subscribers are destroyed: the ingest thread is blocked inside one of them.
+    stop_ingest();
+}
+
+bool MediaPlaneSource::init_media_plane(std::uint32_t domain_id,
+                                      const std::string& rgb_topic,
+                                      const std::string& depth_topic)
+{
+    media_rgb_sub_   = std::make_unique<rc::media::MediaSubscriber>();
+    media_depth_sub_ = std::make_unique<rc::media::MediaSubscriber>();
+
+    rc::media::SubscriberConfig rgb_cfg;
+    rgb_cfg.domain_id     = domain_id;
+    rgb_cfg.topic_name    = rgb_topic;
+    rgb_cfg.history_depth = 8;
+    rc::media::SubscriberConfig depth_cfg = rgb_cfg;
+    depth_cfg.topic_name = depth_topic;
+
+    // Prefer the producer's media descriptor on the "zed" node — take the FULL config
+    // (domain, topic, history_depth, shared_memory_only, data_sharing) so this consumer
+    // tracks the producer's QoS automatically; fall back to the configured domain/topic
+    // (with defaults) if the descriptor isn't advertised yet.
+    if (graph_)
+        if (auto desc = rc::media::descriptor_from_graph(*graph_, "zed"); desc.has_value())
+        {
+            if (auto c = desc->subscriber_config("rgb");   c.has_value()) rgb_cfg   = *c;
+            if (auto c = desc->subscriber_config("depth"); c.has_value()) depth_cfg = *c;
+        }
+
+    const bool rgb_ok   = media_rgb_sub_->init(rgb_cfg);
+    const bool depth_ok = media_depth_sub_->init(depth_cfg);
+    if (!rgb_ok || !depth_ok)
+    {
+        std::print(stderr, "[retina] media plane subscriber init FAILED (rgb={}, depth={})\n", rgb_ok, depth_ok);
+        return false;
+    }
+    std::print("[retina] media plane ready rgb domain={} '{}' | depth domain={} '{}' data_sharing={}\n",
+               rgb_cfg.domain_id, rgb_cfg.topic_name, depth_cfg.domain_id, depth_cfg.topic_name,
+               media_rgb_sub_->data_sharing_active() && media_depth_sub_->data_sharing_active());
+    start_ingest();   // from here on, frames are collected on arrival, not when perception asks
+    return true;
+}
+
+void MediaPlaneSource::start_ingest()
+{
+    if (ingest_thread_.joinable())
+        return;
+    ingest_stop_.store(false, std::memory_order_relaxed);
+    ingest_thread_ = std::jthread([this]
+    {
+        while (not ingest_stop_.load(std::memory_order_relaxed))
+            drain_media_plane();   // blocks up to 50 ms inside wait_and_poll, so this is not a spin
+    });
+}
+
+void MediaPlaneSource::stop_ingest()
+{
+    ingest_stop_.store(true, std::memory_order_relaxed);
+    if (ingest_thread_.joinable())
+        ingest_thread_.join();     // bounded by the wait_and_poll timeout
+}
+
+void MediaPlaneSource::drain_media_plane() const
+{
+    // Diagnostic: positively confirm media-plane reception (mirrors robot_concept's
+    // producer-side "[Media] 5s stats"). Accumulate poll() delivery counts and print
+    // every 5 s on stdout, alongside [Tracks].
+    static std::uint64_t rx_rgb = 0, rx_depth = 0;
+    static auto last_rx_report = std::chrono::steady_clock::now();
+
+    if (media_rgb_sub_)
+    {
+        // BLOCK here (bounded) instead of polling: this is the wake-up. RGB is the primary stream, and
+        // depth is swept non-blocking straight after because the two are published per grab and land
+        // together — so one wait serves both and neither can starve the other.
+        rx_rgb += media_rgb_sub_->wait_and_poll([this](const rc::media::ImageFrame& f, std::int64_t)
+        {
+            rx_rgb_total_.fetch_add(1, std::memory_order_relaxed);   // EXACT source rate (see header)
+            // ★★ARRIVAL PROBE — measure the cadence HERE, before the aligner, because everything
+            // downstream is latest-wins and therefore cannot tell a bursty source from a slow consumer.
+            // Two clocks, and the pair is the whole point:
+            //   stamp gap  = the CAMERA's own spacing between consecutive grabs
+            //   wall gap   = when they actually landed at this subscriber
+            // uniform stamps + bursty wall  ⇒ DDS/wait_and_poll is batching; the source is fine
+            // bursty stamps                 ⇒ the producer really does grab irregularly
+            // Measured indirectly up to now and it kept misleading me: 596 of ~1500 PROCESSED jumps were
+            // SHORTER than one 37.5 ms grab period, which no uniform source can produce — but processed
+            // jumps are what SURVIVED the aligner, so they could not settle where the irregularity began.
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const std::uint64_t st_now = f.stamp_ms();
+                if (probe_prev_wall_.time_since_epoch().count() != 0 and probe_prev_stamp_ != 0
+                    and st_now > probe_prev_stamp_)
+                {
+                    const double wall = std::chrono::duration<double, std::milli>(now - probe_prev_wall_).count();
+                    const double sgap = static_cast<double>(st_now - probe_prev_stamp_);
+                    const auto bucket = [](double ms) -> int
+                    { return ms < 15 ? 0 : ms < 30 ? 1 : ms < 45 ? 2 : ms < 60 ? 3 : ms < 90 ? 4 : 5; };
+                    ++probe_stamp_hist_[bucket(sgap)];
+                    ++probe_wall_hist_[bucket(wall)];
+                }
+                probe_prev_wall_ = now;
+                probe_prev_stamp_ = st_now;
+            }
+            const int w = static_cast<int>(f.width());
+            const int h = static_cast<int>(f.height());
+            if (w <= 0 || h <= 0)
+                return;
+            const std::size_t npix = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+            if (f.format() == rc::media::FORMAT_BGR8 || f.format() == rc::media::FORMAT_RGB8)
+            {
+                if (f.size() < npix * 3)
+                    return;
+                cv::Mat view(h, w, CV_8UC3, const_cast<std::uint8_t*>(f.data().data()));
+                ZedRgbFrame rgb{.bgr = {}, .width = w, .height = h};
+                if (f.format() == rc::media::FORMAT_RGB8)
+                    cv::cvtColor(view, rgb.bgr, cv::COLOR_RGB2BGR);   // owned buffer (not the transient DDS view)
+                else
+                    rgb.bgr = view.clone();
+                const std::uint64_t st = f.stamp_ms();
+                zed_buf_.put_rgb(std::move(rgb), st);   // keyed by the grab stamp
+                latest_rgb_stamp_.store(st, std::memory_order_relaxed);
+            }
+        }, /*timeout_ms=*/50);
+    }
+
+    if (media_depth_sub_)
+    {
+        rx_depth += media_depth_sub_->poll([this](const rc::media::ImageFrame& f, std::int64_t)
+        {
+            const int w = static_cast<int>(f.width());
+            const int h = static_cast<int>(f.height());
+            if (w <= 0 || h <= 0)
+                return;
+            const std::size_t npix = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+            ZedDepthFrame depth{.depth = {}, .width = w, .height = h};
+            if (f.format() == rc::media::FORMAT_DEPTH_F32)
+            {
+                if (f.size() < npix * sizeof(float))
+                    return;
+                const float* p = reinterpret_cast<const float*>(f.data().data());
+                // ★NO UNIT CONVERSION ON THIS BRANCH. A mm->m scale was added here (uncommitted, arrived
+                // with a pull) on the assumption that "ZED publishes in sl::UNIT::MILLIMETER". The
+                // producer on this setup publishes FORMAT_DEPTH_F32 already in METRES, so it was a
+                // SECOND conversion: measured 2026-09-09 across the retina restart that first built it,
+                // the door's depth went 2.6128 m -> 0.0026128 m, exactly x0.001. Every deprojected mask
+                // then collapsed to a 2 mm-tall slab at 4.5 mm, no door could pass the min-height prior,
+                // and the whole door pipeline died for a reason that had nothing to do with doors.
+                // ⚠The Z16 branch below DOES scale, and that is correct: Z16 is integer millimetres by
+                // definition. F32 carries whatever unit the producer chose, which is why hardcoding one
+                // here is the bug rather than the value 0.001 being wrong. The unit belongs in the media
+                // descriptor the producer authors; until it is declared there, this branch must not
+                // assume one.
+                depth.depth.assign(p, p + npix);
+            }
+            else if (f.format() == rc::media::FORMAT_Z16)
+            {
+                if (f.size() < npix * sizeof(std::uint16_t))
+                    return;
+                const std::uint16_t* p = reinterpret_cast<const std::uint16_t*>(f.data().data());
+                depth.depth.resize(npix);
+                for (std::size_t i = 0; i < npix; ++i)
+                    depth.depth[i] = static_cast<float>(p[i]) * 0.001f;  // mm -> m fallback
+            }
+            else
+                return;
+            const std::uint64_t st = f.stamp_ms();
+            zed_buf_.put_depth(std::move(depth), st);   // keyed by the same grab stamp
+            latest_depth_stamp_.store(st, std::memory_order_relaxed);
+        });
+    }
+
+    const auto now_rx = std::chrono::steady_clock::now();
+    if (now_rx - last_rx_report >= std::chrono::seconds(5))
+    {
+        // data_sharing=1 ⇒ true zero-copy SHM loans on BOTH streams; 0 ⇒ SHM-transport memcpy.
+        const bool ds = media_rgb_sub_ and media_depth_sub_
+                        and media_rgb_sub_->data_sharing_active()
+                        and media_depth_sub_->data_sharing_active();
+        // Buckets: <15 | <30 | <45 | <60 | <90 | >=90 ms. A uniform 26.6 Hz source puts EVERY sample in
+        // the <45 bucket on both rows; anything else localises the irregularity to one clock or the other.
+        const auto hist = [](const std::array<int, 6>& h)
+        { return std::format("{}/{}/{}/{}/{}/{}", h[0], h[1], h[2], h[3], h[4], h[5]); };
+        std::println("[MediaRx] 5s stats rgb={} depth={} rgb_stamp={} depth_stamp={} data_sharing={}\n"
+                     "          arrival gaps <15/<30/<45/<60/<90/90+  stamp={}  wall={}",
+                     rx_rgb, rx_depth, latest_rgb_stamp_.load(), latest_depth_stamp_.load(), ds ? 1 : 0,
+                     hist(probe_stamp_hist_), hist(probe_wall_hist_));
+        probe_stamp_hist_.fill(0);
+        probe_wall_hist_.fill(0);
+        rx_rgb = rx_depth = 0;
+        last_rx_report = now_rx;
+
+        // FPS-drop diagnosis: fps/drops(frame_id gaps)/latency/sample_lost for the netmon web
+        // dashboard (server.py glob-merges every media_stats_*.json). Labeled per-component so
+        // this final-consumer view never collides with robot_concept's ingest-side view of the
+        // same topic name (see write_media_stats_json in media_transport.h).
+//         rc::media::write_media_stats_json(
+//             "/tmp/robocomp_netmon/media_stats_retina_zed.json",
+//             { { "retina:zed:rgb",   media_rgb_sub_   ? media_rgb_sub_->combined_stats()   : rc::media::StreamStats{} },
+//               { "retina:zed:depth", media_depth_sub_ ? media_depth_sub_->combined_stats() : rc::media::StreamStats{} } });
+        // rc::media::write_media_stats_json removed upstream (f1e7d7c) -- rewrite against the current descriptor writer if this netmon output is wanted back.
+    }
+}
+
+bool MediaPlaneSource::init_ricoh_media_plane(std::uint32_t domain_id, const std::string& topic)
+{
+    // Prefer the producer's descriptor on the "ricoh" node (its authored media
+    // domain/topic + Image360Frame type); fall back to the configured domain/topic.
+    if (graph_)
+        media_ricoh_sub_ = rc::media::make_image360_subscriber_from_graph(*graph_, "ricoh", "rgb360");
+
+    if (!media_ricoh_sub_)
+    {
+        rc::media::SubscriberConfig cfg;
+        cfg.domain_id     = domain_id;
+        cfg.topic_name    = topic;
+        cfg.history_depth = 8;
+        media_ricoh_sub_ = std::make_unique<rc::media::Image360Subscriber>();
+        if (!media_ricoh_sub_->init(cfg))
+        {
+            std::print(stderr, "[retina] ricoh media subscriber init FAILED (domain={}, '{}')\n",
+                       domain_id, topic);
+            media_ricoh_sub_.reset();
+            return false;
+        }
+        std::print("[retina] ricoh media plane ready (fallback) domain={} '{}'\n", domain_id, topic);
+    }
+    return true;
+}
+
+void MediaPlaneSource::poll_ricoh(bool force)
+{
+    if (!media_ricoh_sub_)
+        return;
+    const bool wanted = force || ricoh_wanted_.load(std::memory_order_relaxed);
+    media_ricoh_sub_->poll([this, wanted](const rc::media::Image360Frame& f, std::int64_t)
+    {
+        ricoh_last_stamp_ms_.store(f.stamp_ms(), std::memory_order_relaxed);   // cheap — feeds the RGB360 rate HUD
+        rx_ricoh_total_.fetch_add(1, std::memory_order_relaxed);                // EXACT source rate (see header)
+        if (!wanted)                       // window hidden: drain + discard, no decode/clone cost
+            return;
+        const int w = static_cast<int>(f.width());
+        const int h = static_cast<int>(f.height());
+        if (w <= 0 || h <= 0)
+            return;
+        const std::size_t npix = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+        if (f.size() < npix * 3)
+            return;
+        cv::Mat view(h, w, CV_8UC3, const_cast<std::uint8_t*>(f.data().data()));
+        std::scoped_lock lk(media_ricoh_mutex_);   // may race a concurrent ricoh_bgr_copy() from another thread
+        if (f.format() == rc::media::IMG360_FORMAT_RGB8)
+            cv::cvtColor(view, media_ricoh_.bgr, cv::COLOR_RGB2BGR);
+        else                               // IMG360_FORMAT_BGR8 (producer default) or unspecified
+            media_ricoh_.bgr = view.clone();
+        media_ricoh_.width    = w;
+        media_ricoh_.height   = h;
+        media_ricoh_.stamp    = f.stamp_ms();
+        media_ricoh_.frame_id = f.frame_id();
+        media_ricoh_.valid    = true;
+    });
+
+    // FPS-drop diagnosis: same media_stats_*.json dump as the ZED side (drain_media_plane),
+    // gated to once every 5s via an atomic timestamp since poll_ricoh() may run from more than
+    // one thread (see class comment on ricoh_stats_report_ns_).
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (auto last = ricoh_stats_report_ns_.load(std::memory_order_relaxed);
+        now_ns - last >= 5'000'000'000LL &&
+        ricoh_stats_report_ns_.compare_exchange_strong(last, now_ns, std::memory_order_relaxed))
+    {
+//         rc::media::write_media_stats_json(
+//             "/tmp/robocomp_netmon/media_stats_retina_ricoh.json",
+//             { { "retina:ricoh:rgb360", media_ricoh_sub_->combined_stats() } });
+        // rc::media::write_media_stats_json removed upstream (f1e7d7c) -- rewrite against the current descriptor writer if this netmon output is wanted back.
+    }
+}
+
+cv::Mat MediaPlaneSource::ricoh_bgr_copy() const
+{
+    std::scoped_lock lk(media_ricoh_mutex_);
+    return media_ricoh_.bgr;   // shallow (refcounted) copy — cheap, safe to use after the lock is released
+}
+
+bool MediaPlaneSource::init_lidar_media_plane(DSR::InnerEigenAPI* inner_eigen, std::uint32_t /*domain_id*/, const std::string& /*topic*/, bool use_media)
+{
+    lidar_use_media_ = use_media;
+    if (!use_media)
+    {
+        std::print("[retina] lidar media plane DISABLED (Voxel.lidar_use_media=false) — no LiDAR source\n");
+        return false;
+    }
+
+    // Shared multi-plane reader (the same one every agent uses): prefers the two per-device planes
+    // helios+bpearl (DEVICE frame), transformed to the robot frame + merged; falls back to the fused
+    // "helios"/"bpearl" planes. Domain/topic come from each plane's media descriptor (no config). Subscribers
+    // come up lazily inside get_lidar3D()->poll() — nothing touches DDS here. inner_eigen (passed by
+    // SceneProcessor, whose configure() ran first) backs the device->robot RT transform.
+    lidar_reader_ = std::make_unique<rc::media::LidarPlaneReader>(
+        graph_, inner_eigen, std::vector<std::string>{"helios", "bpearl"}, "lidar");
+    std::print("[retina] lidar media plane ready (shared reader: helios+bpearl → robot)\n");
+    return true;
+}
+
+std::optional<LidarData> MediaPlaneSource::get_lidar3D(const std::string& robot_name)
+{
+    if (!lidar_use_media_ || !lidar_reader_)
+        return std::nullopt;
+
+    // Diagnostic (every 5 s): fresh = merged sweeps this window; served = cycles that returned a scan.
+    // fresh==0 while served>0 ⇒ serving a STALE scan (producer stopped publishing).
+    static std::uint64_t fresh = 0, served = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+
+    // Merge helios+bpearl into the ROBOT frame; callers apply the dynamic
+    // room<-robot pose at the scan stamp (interpolate=false here — only static mount edges crossed).
+    if (!robot_name.empty())
+        if (auto sweep = lidar_reader_->poll(robot_name, /*interpolate=*/false);
+            sweep.has_value() && !sweep->points.empty())
+        {
+            // Count a COMPLETE media-plane update: the INTERSECTION of the contributing planes.
+            // A sweep whose merged stamp advanced because ONE plane refreshed still carries the other
+            // plane's CACHED points, so it is not a new observation of the whole field of view.
+            //
+            // ★AND NEITHER max NOR min GETS THIS RIGHT — both track the UNION. With helios at 0,50,100
+            // and bpearl at 25,75,125, max goes 25,50,75,100 and min goes 0,25,50,75: both advance every
+            // 25 ms, i.e. at 40 Hz for two 20 Hz planes, differing only in phase. The intersection is not
+            // an extremum of the current stamps at all — it is a question about HISTORY: has every plane
+            // produced a new sample since the last time we counted one? So the per-plane stamps AT THE
+            // LAST COUNT are what must be remembered. On the example that yields a count at 80 and 130 —
+            // once per 50 ms, 20 Hz, independent of phase, which is the rate of genuinely new full clouds.
+            // Touched only here (single consumer thread); the exported total stays atomic for the GUI.
+            {
+                const std::size_t np = sweep->plane_stamp_ms.size();
+                if (lidar_last_counted_.size() != np)
+                    lidar_last_counted_.assign(np, 0);
+                bool all_advanced = true, any_live = false;
+                for (std::size_t i = 0; i < np; ++i)
+                {
+                    const auto v = static_cast<std::uint64_t>(std::max<std::int64_t>(0, sweep->plane_stamp_ms[i]));
+                    if (v == 0) continue;               // plane not live — cannot hold the count hostage
+                    any_live = true;
+                    if (v == lidar_last_counted_[i]) { all_advanced = false; break; }
+                }
+                // One-shot: say how many planes the reader is actually merging. If this prints 1 only one
+                // of helios/bpearl is live and there is no per-plane structure to intersect — the rate then
+                // reflects whatever that single stream publishes, and a 20 Hz reading would have to come
+                // from the producer side, not from here.
+                static bool np_logged = false;
+                if (not np_logged and any_live)
+                {
+                    np_logged = true;
+                    std::print("[retina] lidar merge: {} plane(s) live -> feed counts a COMPLETE refresh of all {}\n",
+                               np, np);
+                }
+                if (any_live and all_advanced)
+                {
+                    for (std::size_t i = 0; i < np; ++i)
+                        lidar_last_counted_[i] =
+                            static_cast<std::uint64_t>(std::max<std::int64_t>(0, sweep->plane_stamp_ms[i]));
+                    rx_lidar_plane0_total_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            LidarData ld;
+            ld.xs.reserve(sweep->points.size());
+            ld.ys.reserve(sweep->points.size());
+            ld.zs.reserve(sweep->points.size());
+            for (const auto& p : sweep->points)
+            {
+                ld.xs.push_back(p.x());
+                ld.ys.push_back(p.y());
+                ld.zs.push_back(p.z());
+            }
+            ld.plane_id = sweep->plane_id;   // per-point source plane (helios=0, bpearl=1) for viewer colouring
+            ld.timestamp_ms = static_cast<std::uint64_t>(sweep->stamp_ms);
+            media_lidar_ = std::move(ld);
+            media_lidar_valid_ = true;
+            ++fresh;
+        }
+
+    std::optional<LidarData> out;
+    if (media_lidar_valid_ && !media_lidar_.xs.empty())
+    {
+        out = media_lidar_;
+        ++served;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::seconds(5))
+    {
+        const std::uint64_t lidar_stamp = out ? out->timestamp_ms : 0;
+        const std::uint64_t rgb_stamp   = latest_rgb_stamp_.load(std::memory_order_relaxed);
+        const std::int64_t  skew_ms     = (lidar_stamp && rgb_stamp)
+            ? static_cast<std::int64_t>(lidar_stamp) - static_cast<std::int64_t>(rgb_stamp)
+            : 0;
+        std::println("[LidarSrc] 5s media fresh={} served={} ({} pts) lidar_stamp={} rgb_stamp={} skew(lidar-rgb)={}ms",
+                     fresh, served, out ? out->xs.size() : 0u, lidar_stamp, rgb_stamp, skew_ms);
+        fresh = served = 0;
+        last_report = now;
+    }
+    return out;
+}
+
+std::uint64_t MediaPlaneSource::get_frame_timestamp_ms() const
+{
+    if (const auto t = last_frame_ts_.load(std::memory_order_relaxed); t != 0)
+        return t;   // stamp of the last aligned RGBD we assembled
+    if (const auto r = latest_rgb_stamp_.load(std::memory_order_relaxed); r != 0)
+        return r;
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Max stamp gap (ms) for an rgb/depth pair to be considered the SAME grab. They share the grab stamp,
+// so this only tolerates ms rounding jitter — a full-frame gap (a dropped depth) fails the match and
+// the cycle is skipped rather than pairing rgb-N with depth-(N-1).
+static constexpr std::uint64_t kZedPairMaxDiffMs = 20;
+
+std::optional<RGBDData> MediaPlaneSource::get_rgbd_frame_from_dsr() const
+{
+    // Pixels arrive over the zero-copy media plane. RGB and depth are two streams sharing the per-grab
+    // acquisition stamp; read the time-ALIGNED pair so the mask always meets its own frame's depth.
+    // NO DRAIN HERE ANY MORE — the ingest thread does it the moment data lands (see start_ingest).
+    // This call is now a pure READ of the aligner, so how fast perception asks no longer decides how
+    // many frames get collected.
+
+    // Reference stamp = the newest rgb ACTUALLY committed to the buffer (put is async, so the just-put
+    // frame may not be visible yet — take what's landed), then read the depth aligned to it.
+    const std::uint64_t ref = zed_buf_.newest_rgb_stamp();
+    if (ref == 0)
+        return std::nullopt;
+
+    auto pair = zed_buf_.read_aligned(ref, kZedPairMaxDiffMs);
+    if (!pair.has_value())
+        return std::nullopt;   // no depth within one grab of this rgb → skip (no skewed pairing)
+    auto& [rgb, depth] = *pair;
+    if (rgb.bgr.empty() || depth.depth.empty())
+        return std::nullopt;
+
+    const int rgb_w = rgb.width;
+    const int rgb_h = rgb.height;
+    const int depth_w = depth.width;
+    const int depth_h = depth.height;
+    if (rgb_w <= 0 || rgb_h <= 0 || depth_w <= 0 || depth_h <= 0)
+        return std::nullopt;
+
+    // Voxel pipeline assumes one xyz point per RGB pixel.
+    if (depth_w != rgb_w || depth_h != rgb_h)
+    {
+        qWarning() << "RGB/depth resolution mismatch. RGB=" << rgb_w << "x" << rgb_h
+                   << " depth=" << depth_w << "x" << depth_h;
+        return std::nullopt;
+    }
+
+    const std::size_t depth_size = static_cast<std::size_t>(depth_w) * static_cast<std::size_t>(depth_h);
+    if (depth.depth.size() < depth_size)
+        return std::nullopt;
+
+    // Camera intrinsics from the static 'zed' node (not per-frame).
+    float focal_x = 0.f;
+    float focal_y = 0.f;
+    if (graph_)
+    {
+        if (auto zed_node = graph_->get_node("zed"); zed_node.has_value())
+        {
+            if (auto fx = graph_->get_attrib_by_name<cam_depth_focalx_att>(zed_node.value()); fx.has_value())
+                focal_x = static_cast<float>(fx.value());
+            if (auto fy = graph_->get_attrib_by_name<cam_depth_focaly_att>(zed_node.value()); fy.has_value())
+                focal_y = static_cast<float>(fy.value());
+        }
+    }
+    if (focal_x <= 0.f || focal_y <= 0.f)
+        return std::nullopt;
+
+    RGBDData data;
+    data.bgr     = rgb.bgr.clone();   // owned copy for downstream
+    data.width   = rgb_w;
+    data.height  = rgb_h;
+    data.focal_x = focal_x;
+    data.focal_y = focal_y;
+    data.depth   = std::move(depth.depth);   // `depth` is a throwaway read-copy — move it
+    data.depth.resize(depth_size);
+    last_frame_ts_.store(ref, std::memory_order_relaxed);
+    return data;
+}

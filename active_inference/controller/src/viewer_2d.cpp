@@ -1,0 +1,1146 @@
+#include "viewer_2d.h"
+
+#include <abstract_graphic_viewer/abstract_graphic_viewer.h>
+
+#include <QBrush>
+#include <QFont>
+#include <QMouseEvent>
+#include <QPen>
+#include <QPainterPath>
+#include <QPolygonF>
+#include <QHash>
+#include <QImage>
+#include <QPixmap>
+
+#include <algorithm>
+#include <cmath>
+
+namespace rc
+{
+
+namespace
+{
+struct ObstaclePalette
+{
+    QColor pen;
+    QColor fill;
+    QColor center;
+    QColor edge;
+};
+
+// ── ONE HUE PER OBJECT ───────────────────────────────────────────────────────────────────────────
+// Every concept-agent object used to be drawn the same green, so a canvas with a table, four chairs, a
+// bottle and a fridge on it was one undifferentiated green mass and the only thing separating them was
+// a two-character label. Identity is a CATEGORICAL quantity; it gets categorical hues.
+//
+// WHY THESE SEVEN AND NOT MORE. The obstacle KINDS keep their existing colours — orange for anything
+// unmodelled, crimson for residual_concept's occupancy — and those are filled footprints too, so an
+// object hue that lands near either destroys the kind encoding to buy the object encoding. The seven
+// below are the largest set that clears, WITH those two reserved colours in the set, the all-pairs
+// separation gates on a light surface: worst pair ΔE 8.1 under simulated colour-vision deficiency
+// (protan/deutan) and 16.2 with normal vision, in OKLab×100. ALL pairs, not adjacent ones: two
+// footprints can end up side by side anywhere on a map, so there is no ordering to lean on.
+// Verified with the dataviz skill's validator, not by eye.
+// One slot (the lime) sits below 3:1 contrast against the light background; every footprint carries a
+// direct label in its own hue, which is the secondary encoding that requirement asks for.
+// PAST SEVEN OBJECTS THE SLOTS REPEAT. That is a deliberate wrap, not a generated hue: an eighth
+// invented colour would have no separation guarantee at all, and the label still tells them apart.
+constexpr int kObjectHueCount = 7;
+QColor object_hue(int slot)
+{
+    static const QColor kHues[kObjectHueCount] = {
+        QColor(0x3a, 0x95, 0xcd),   // blue
+        QColor(0x00, 0x8d, 0x65),   // teal-green
+        QColor(0xed, 0x3b, 0x87),   // magenta
+        QColor(0x7d, 0x4b, 0x92),   // plum
+        QColor(0x89, 0xb3, 0x1d),   // lime
+        QColor(0x23, 0x51, 0xde),   // indigo
+        QColor(0xa3, 0x61, 0xfb)};  // violet
+    // Slots come from a registry that only ever counts up from 0, so no negative normalisation is needed.
+    return kHues[slot % kObjectHueCount];
+}
+
+// The four roles, derived from ONE hue so they cannot drift apart: the pen and the centre dot carry the
+// validated colour at full opacity (they are what the eye actually matches on), the fill is the same hue
+// dropped to a wash so overlapping footprints stay readable, and the edge is a darkened form of it.
+ObstaclePalette palette_from_hue(const QColor &hue)
+{
+    QColor fill = hue;   fill.setAlpha(110);
+    QColor centre = hue; centre.setAlpha(235);
+    QColor edge = hue.darker(160); edge.setAlpha(240);
+    return {hue, fill, centre, edge};
+}
+
+ObstaclePalette obstacle_palette(ControllerObstacleKind kind, int object_slot = 0)
+{
+    switch (kind)
+    {
+        case ControllerObstacleKind::Object:
+        // Model objects interpreted by a concept agent (table/cylinder/chair/object) — one hue each,
+        // assigned per OBJECT IDENTITY by Viewer2D::object_color_slot.
+        return palette_from_hue(object_hue(object_slot));
+        case ControllerObstacleKind::Temporary:
+        // The controller's OWN temporary lidar obstacles (unexplained returns) — orange.
+        return {QColor(194, 103, 25),
+            QColor(245, 158, 11, 150),
+            QColor(251, 146, 60, 230),
+            QColor(154, 52, 18, 240)};
+        case ControllerObstacleKind::Obstacle:
+        // Graph "obstacle" nodes — also unmodelled, rendered orange like the temporary ones.
+        return {QColor(194, 103, 25),
+            QColor(245, 158, 11, 150),
+            QColor(251, 146, 60, 230),
+            QColor(154, 52, 18, 240)};
+        case ControllerObstacleKind::GridOccupancy:
+        // residual_concept occupancy-grid hulls = what the controller plans around as OCCUPIED.
+        // Semi-transparent crimson FILL so occupied area is shaded and free space stays clear.
+        return {QColor(150, 20, 40, 220),
+            QColor(220, 40, 60, 70),
+            QColor(150, 20, 40, 120),
+            QColor(150, 20, 40, 120)};
+        case ControllerObstacleKind::Plant:
+        // trunk_concept trunk discs — ONE fixed bark brown for every trunk: a trunk is read as "forbidden space
+        // here", not as an individual to tell apart from its neighbours, and a row of them must read as a row.
+        return {QColor(0x6d, 0x4c, 0x41),
+            QColor(0x8d, 0x6e, 0x63, 110),
+            QColor(0x6d, 0x4c, 0x41, 220),
+            QColor(0x4e, 0x34, 0x2e, 230)};
+        case ControllerObstacleKind::PlantTrunk:
+        // A plant's trunk at its measured diameter: solid bark brown, so it reads as the trunk itself.
+        return {QColor(0x4e, 0x34, 0x2e), QColor(0x6d, 0x4c, 0x41, 255), QColor(0x4e, 0x34, 0x2e), QColor(0x3e, 0x27, 0x23)};
+        case ControllerObstacleKind::PlantCanopy:
+        // A plant's canopy: a light leaf-green wash, so the trunk and the corridor show through.
+        return {QColor(46, 125, 50, 200), QColor(102, 187, 106, 70), QColor(46, 125, 50), QColor(27, 94, 32)};
+        case ControllerObstacleKind::PlantMissing:
+        // A part of a plant still unseen: a red outline with no fill, the "look here" mark.
+        return {QColor(211, 47, 47, 230), QColor(0, 0, 0, 0), QColor(211, 47, 47), QColor(183, 28, 28)};
+        default:
+        return {QColor(194, 103, 25),
+            QColor(245, 158, 11, 150),
+            QColor(251, 146, 60, 230),
+            QColor(154, 52, 18, 240)};
+    }
+}
+
+Eigen::Vector2f polygon_centroid(const std::vector<Eigen::Vector2f> &verts)
+{
+    if (verts.empty())
+        return Eigen::Vector2f::Zero();
+
+    float signed_area_twice = 0.f;
+    Eigen::Vector2f centroid = Eigen::Vector2f::Zero();
+    for (std::size_t index = 0; index < verts.size(); ++index)
+    {
+        const auto &from = verts[index];
+        const auto &to = verts[(index + 1) % verts.size()];
+        const float cross = from.x() * to.y() - to.x() * from.y();
+        signed_area_twice += cross;
+        centroid += (from + to) * cross;
+    }
+
+    if (std::abs(signed_area_twice) < 1e-5f)
+    {
+        for (const auto &vertex : verts)
+            centroid += vertex;
+        return centroid / static_cast<float>(verts.size());
+    }
+
+    return centroid / (3.f * signed_area_twice);
+}
+}
+
+class ControllerGraphicViewer : public AbstractGraphicViewer
+{
+public:
+    ControllerGraphicViewer(QWidget *parent, const QRectF &dim, bool draw_axis)
+        : AbstractGraphicViewer(parent, dim, draw_axis)
+    {
+        // ── A STALE PIXEL MUST NOT BE REPRESENTABLE ──────────────────────────────────────────────
+        // The base viewer leaves the view on BoundingRectViewportUpdate with NO background brush.
+        // Both halves of that are how a frozen canvas becomes SILENT:
+        //   · BoundingRectViewportUpdate repaints only the accumulated dirty rect and lets Qt scroll
+        //     the viewport by BLITTING, so a repaint that never comes leaves the previous frame's
+        //     pixels sitting where they were copied to. Measured 2026-09-10: the canvas held one
+        //     image for >30 s, byte-identical, while fed=24 Hz / drawn=31 Hz / items 2900..2960 all
+        //     said the scene was being rebuilt — and what was on screen was the room, the route and
+        //     the occupancy REPEATED at a 179 px horizontal pitch, i.e. several old paints stacked
+        //     at the offsets the view had scrolled through. Not one of them was current.
+        //   · with the brush left at Qt::NoBrush nothing erases the viewport, so a frame that draws
+        //     NOTHING (a non-finite item transform poisons the QPainter and every later draw call in
+        //     that paintEvent silently becomes a no-op) leaves the last good frame on screen for
+        //     ever. The failure looks exactly like a healthy canvas that stopped receiving data.
+        // Full updates + an opaque background make the whole viewport be erased and redrawn from the
+        // scene every paint, so what is on screen is always THIS frame or blank — never a ghost.
+        // It costs nothing here: present() already forces one full viewport update per frame.
+        setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+        setBackgroundBrush(QBrush(QColor(255, 255, 255)));
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton and event->modifiers() == Qt::NoModifier)
+        {
+            const QPointF cursor_in_scene = this->mapToScene(event->position().toPoint());
+            emit new_mouse_coordinates(cursor_in_scene);
+            event->accept();
+            return;
+        }
+
+        AbstractGraphicViewer::mousePressEvent(event);
+    }
+};
+
+Viewer2D::Viewer2D(QWidget *parent, const QRectF &grid_dim, bool show_axis)
+{
+    agv_ = new ControllerGraphicViewer(parent, grid_dim, show_axis);
+
+    connect(agv_, &AbstractGraphicViewer::new_mouse_coordinates,
+            this, &Viewer2D::new_mouse_coordinates);
+    connect(agv_, &AbstractGraphicViewer::right_click,
+            this, &Viewer2D::right_click);
+    // Mouse events reach the VIEWPORT, not the view, so the filter goes there.
+    agv_->viewport()->installEventFilter(this);
+}
+
+Viewer2D::~Viewer2D()
+{
+    clear_lidar_items();
+    clear_path_items();
+    clear_world_axis_items();
+    clear_robot_trajectory();
+    clear_mission_items();
+    clear_polygon_item(polygon_item_);
+}
+
+QWidget *Viewer2D::get_widget() const
+{
+    return agv_;
+}
+
+void Viewer2D::add_robot(float width, float length, float offset, float rotation, QColor color)
+{
+    agv_->add_robot(width, length, offset, rotation, color);
+}
+
+void Viewer2D::show()
+{
+    agv_->show();
+}
+
+void Viewer2D::fit_to_scene(const QRectF &rect)
+{
+    agv_->fitToScene(rect);
+}
+
+void Viewer2D::fit_view(float margin_ratio)
+{
+    QRectF bounds;
+    if (polygon_item_ != nullptr)
+        bounds = polygon_item_->boundingRect().translated(polygon_item_->pos());
+    else
+        bounds = agv_->scene.itemsBoundingRect();
+
+    if (!bounds.isValid() or bounds.isEmpty())
+        return;
+
+    const qreal dx = std::max(0.1, bounds.width() * std::max(0.f, margin_ratio));
+    const qreal dy = std::max(0.1, bounds.height() * std::max(0.f, margin_ratio));
+    agv_->fitToScene(bounds.adjusted(-dx, -dy, dx, dy));
+}
+
+void Viewer2D::update_robot(const Eigen::Affine2f &robot_pose)
+{
+    const auto translation = robot_pose.translation();
+
+    if (last_robot_pos_.has_value())
+    {
+        const Eigen::Vector2f current_pos = translation;
+        const float distance = (current_pos - *last_robot_pos_).norm();
+        if (distance > 0.01f && distance < 1.5f)
+        {
+            const QPen traj_pen(QColor(255, 87, 34), 0.04);
+            auto *segment = agv_->scene.addLine(last_robot_pos_->x(),
+                                                last_robot_pos_->y(),
+                                                current_pos.x(),
+                                                current_pos.y(),
+                                                traj_pen);
+            segment->setZValue(17);
+            robot_traj_items_.push_back(segment);
+
+            constexpr std::size_t max_traj_segments = 4000;
+            while (robot_traj_items_.size() > max_traj_segments)
+            {
+                auto *old = robot_traj_items_.front();
+                agv_->scene.removeItem(old);
+                delete old;
+                robot_traj_items_.erase(robot_traj_items_.begin());
+            }
+        }
+    }
+
+    last_robot_pos_ = Eigen::Vector2f(translation.x(), translation.y());
+    const float angle_rad = std::atan2(robot_pose.linear()(1, 0), robot_pose.linear()(0, 0));
+    agv_->robot_poly()->setPos(translation.x(), translation.y());
+    agv_->robot_poly()->setRotation(qRadiansToDegrees(angle_rad));
+}
+
+// See the declaration for why this is a registry and not a hash of the name. An object with no
+// identity to key on (older producers, or a visual built without one) all share slot 0 rather than
+// each grabbing a fresh colour — one shared "unidentified" hue is honest; seven of them would assert
+// distinctions the data does not contain.
+int Viewer2D::object_color_slot(const std::string &key)
+{
+    if (key.empty()) return 0;
+    const auto [it, inserted] = object_color_slots_.try_emplace(key, next_object_color_slot_);
+    if (inserted) ++next_object_color_slot_;
+    return it->second;
+}
+
+void Viewer2D::clear_polygon_item(QGraphicsPolygonItem *&item)
+{
+    if (item == nullptr)
+        return;
+
+    agv_->scene.removeItem(item);
+    delete item;
+    item = nullptr;
+}
+
+void Viewer2D::draw_world_polygon(const std::vector<Eigen::Vector2f> &verts)
+{
+    clear_polygon_item(polygon_item_);
+    clear_world_axis_items();
+
+    if (verts.size() < 2)
+        return;
+
+    QPolygonF poly;
+    for (const auto &vertex : verts)
+        poly << QPointF(vertex.x(), vertex.y());
+    if (verts.size() >= 3)
+        poly << QPointF(verts.front().x(), verts.front().y());
+
+    // 12 cm: the room outline is the frame everything else is read against, so it should read as the
+    // boundary rather than as one more line among the route, the trajectories and the obstacle hulls.
+    polygon_item_ = agv_->scene.addPolygon(poly,
+                                           QPen(QColor(67, 87, 100), 0.12),
+                                           QBrush(QColor(219, 227, 231, 80)));
+    polygon_item_->setZValue(8);
+
+    if (verts.size() >= 3)
+    {
+        const Eigen::Vector2f center = polygon_centroid(verts);
+        Eigen::Vector2f min_corner = verts.front();
+        Eigen::Vector2f max_corner = verts.front();
+        for (const auto &vertex : verts)
+        {
+            min_corner = min_corner.cwiseMin(vertex);
+            max_corner = max_corner.cwiseMax(vertex);
+        }
+
+        const float axis_length = std::clamp(0.07f * (max_corner - min_corner).minCoeff(), 0.25f, 0.5f);
+        QPen x_pen(QColor(214, 64, 69), 0.04);
+        x_pen.setCosmetic(false);
+        QPen y_pen(QColor(44, 146, 88), 0.04);
+        y_pen.setCosmetic(false);
+
+        auto *x_axis = agv_->scene.addLine(center.x(), center.y(), center.x() + axis_length, center.y(), x_pen);
+        auto *y_axis = agv_->scene.addLine(center.x(), center.y(), center.x(), center.y() + axis_length, y_pen);
+        x_axis->setZValue(9);
+        y_axis->setZValue(9);
+        world_axis_items_.push_back(x_axis);
+        world_axis_items_.push_back(y_axis);
+
+        auto *origin = agv_->scene.addEllipse(-0.03, -0.03, 0.06, 0.06,
+                                              Qt::NoPen, QBrush(QColor(38, 50, 56, 220)));
+        origin->setPos(center.x(), center.y());
+        origin->setZValue(9.1);
+        world_axis_items_.push_back(origin);
+
+        QFont axis_font;
+        axis_font.setPointSizeF(9.0);
+        auto *x_label = agv_->scene.addSimpleText("x", axis_font);
+        x_label->setBrush(QBrush(QColor(214, 64, 69)));
+        x_label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+        x_label->setPos(center.x() + axis_length + 0.04f, center.y() - 0.02f);
+        x_label->setZValue(9.2);
+        world_axis_items_.push_back(x_label);
+
+        auto *y_label = agv_->scene.addSimpleText("y", axis_font);
+        y_label->setBrush(QBrush(QColor(44, 146, 88)));
+        y_label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+        y_label->setPos(center.x() - 0.02f, center.y() + axis_length + 0.04f);
+        y_label->setZValue(9.2);
+        world_axis_items_.push_back(y_label);
+    }
+}
+
+void Viewer2D::set_lidar_buffer(LidarPointBuffer *buffer)
+{
+    lidar_buffer_ = buffer;
+}
+
+void Viewer2D::set_lidar_visible(bool visible)
+{
+    lidar_visible_ = visible;
+    if (!visible)
+        clear_lidar_items();
+}
+
+void Viewer2D::clear_lidar_items()
+{
+    for (auto *item : lidar_items_)
+    {
+        agv_->scene.removeItem(item);
+        delete item;
+    }
+    lidar_items_.clear();
+}
+
+void Viewer2D::clear_world_axis_items()
+{
+    for (auto *item : world_axis_items_)
+    {
+        agv_->scene.removeItem(item);
+        delete item;
+    }
+    world_axis_items_.clear();
+}
+
+void Viewer2D::clear_robot_trajectory()
+{
+    for (auto *item : robot_traj_items_)
+    {
+        agv_->scene.removeItem(item);
+        delete item;
+    }
+    robot_traj_items_.clear();
+    last_robot_pos_.reset();
+}
+
+void Viewer2D::draw_lidar_points_from_buffer(int max_points)
+{
+    if (!lidar_visible_)
+        return;
+    if (lidar_buffer_ == nullptr)
+        return;
+
+    const auto [cloud_opt] = lidar_buffer_->read_last();
+    if (!cloud_opt.has_value())
+    {
+        clear_lidar_items();
+        return;
+    }
+
+    const auto &[xs, ys, zs] = cloud_opt.value();
+    // Draw only returns that are plausibly ABOVE the floor. The buffer's own z-band starts at 0.20 m, which is
+    // enough to reject a head-on floor return but NOT a grazing one: helios sits ~1.1 m up and reads the floor
+    // 13-17 cm high, rising with range, so its far floor returns clear 0.20 m and land in the buffer. Drawn as
+    // filled ForestGreen dots they carpet the floor and hide everything the overlay exists to show.
+    // This is DISPLAY ONLY — the obstacle/ESDF paths are untouched, so nothing about what the robot avoids
+    // changes. kDrawMinZ is deliberately above the band rather than equal to it, for exactly that grazing margin.
+    constexpr float kDrawMinZ = 0.30f;
+
+    const std::size_t count = std::min(xs.size(), ys.size());
+    if (count == 0)
+    {
+        clear_lidar_items();
+        return;
+    }
+
+    const int clamped_max_points = std::max(1, max_points);
+    const std::size_t stride = std::max<std::size_t>(1, count / static_cast<std::size_t>(clamped_max_points));
+    const std::size_t draw_count = (count + stride - 1) / stride;
+
+    while (lidar_items_.size() > draw_count)
+    {
+        auto *item = lidar_items_.back();
+        agv_->scene.removeItem(item);
+        delete item;
+        lidar_items_.pop_back();
+    }
+
+    static const QRectF ellipse_rect(-1.5, -1.5, 3.0, 3.0);
+    QPen pen(QColor("ForestGreen"));
+    pen.setWidthF(0.0);
+    pen.setCosmetic(true);
+    QBrush brush(QColor("ForestGreen"));
+
+    // Dead-reckoning correction: re-anchor the (robot-attached) cloud from the scan-time pose to
+    // "now". Identity when overlay extrapolation is off, so this is a no-op in that case.
+    const bool correct = !lidar_draw_correction_.isApprox(Eigen::Affine2f::Identity());
+
+    std::size_t draw_index = 0;
+    for (std::size_t point_index = 0; point_index < count && draw_index < draw_count; point_index += stride)
+    {
+        if (point_index < zs.size() and zs[point_index] < kDrawMinZ) continue;   // floor carpet — display only
+        float px = xs[point_index];
+        float py = ys[point_index];
+        if (correct)
+        {
+            const Eigen::Vector2f c = lidar_draw_correction_ * Eigen::Vector2f(px, py);
+            px = c.x();
+            py = c.y();
+        }
+        if (draw_index < lidar_items_.size())
+        {
+            lidar_items_[draw_index]->setPos(px, py);
+            lidar_items_[draw_index]->setVisible(true);
+        }
+        else
+        {
+            auto *item = agv_->scene.addEllipse(ellipse_rect, pen, brush);
+            item->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+            item->setPos(px, py);
+            item->setZValue(5);
+            lidar_items_.push_back(item);
+        }
+
+        ++draw_index;
+    }
+
+    while (draw_index < lidar_items_.size())
+    {
+        lidar_items_[draw_index]->setVisible(false);
+        ++draw_index;
+    }
+}
+
+void Viewer2D::draw_path(const PathDrawData &data)
+{
+    clear_path_items();
+
+    if (!data.waypoints.empty())
+    {
+        constexpr float radius = 0.04f;
+        const QBrush graph_brush(QColor(0, 145, 199, 180));
+        for (const auto &point : data.waypoints)
+        {
+            auto *dot = agv_->scene.addEllipse(-radius, -radius, 2.f * radius, 2.f * radius,
+                                               Qt::NoPen, graph_brush);
+            dot->setPos(point.x(), point.y());
+            dot->setZValue(19);
+            path_draw_items_.push_back(dot);
+        }
+    }
+
+    if (!data.obstacle_polys.empty())
+    {
+        for (const auto &obstacle_visual : data.obstacle_polys)
+        {
+            const auto &obstacle = obstacle_visual.polygon;
+            if (obstacle.size() < 3)
+                continue;
+
+            // No kind test here: obstacle_palette ignores the slot for every non-Object kind, and only
+            // objects carry a color_key — object_color_slot("") returns 0 without touching the registry.
+            // ── The plants' semantic map (display only): a canopy disc, a trunk at its measured diameter, a
+            //    dashed red ring where a part is missing. Thin cosmetic pens (a 3 cm trunk under the 8.5 cm
+            //    obstacle pen would vanish), no centre dot, no label (88 plants of tags would bury the map);
+            //    the plant's name is the tooltip.
+            if (is_display_only(obstacle_visual.kind) and obstacle_visual.round)
+            {
+                const auto pal = obstacle_palette(obstacle_visual.kind);
+                const bool missing = obstacle_visual.kind == ControllerObstacleKind::PlantMissing;
+                QPen pen(pal.pen, missing ? 2.0 : 1.0);
+                pen.setCosmetic(true);
+                if (missing) pen.setStyle(Qt::DashLine);
+                QPointF c;
+                for (const auto &vertex : obstacle) c += QPointF(vertex.x(), vertex.y());
+                c /= obstacle.size();
+                const qreal r = obstacle_visual.round_radius_m;
+                auto *disc = agv_->scene.addEllipse(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), pen,
+                                                    missing ? QBrush(Qt::NoBrush) : QBrush(pal.fill));
+                disc->setZValue(obstacle_visual.kind == ControllerObstacleKind::PlantCanopy ? 16.0
+                                : obstacle_visual.kind == ControllerObstacleKind::PlantTrunk ? 18.5 : 18.6);
+                disc->setToolTip(QString::fromStdString(obstacle_visual.color_key));
+                path_draw_items_.push_back(disc);
+                continue;
+            }
+            const auto palette = obstacle_palette(obstacle_visual.kind,
+                                                  object_color_slot(obstacle_visual.color_key));
+            const bool is_grid_cell = obstacle_visual.kind == ControllerObstacleKind::GridOccupancy;
+            // Grid cells tile edge-to-edge — use a thin hairline pen so they read as one filled region
+            // (a 0.085 m border per 0.35 m cell would drown the fill). Real obstacles keep the bold edge.
+            QPen obstacle_pen(palette.pen, is_grid_cell ? 0.0 : 0.085);
+            obstacle_pen.setCosmetic(is_grid_cell);
+            const QBrush obstacle_brush(palette.fill);
+            const QBrush obstacle_center_brush(palette.center);
+            const QBrush obstacle_edge_brush(palette.edge);
+
+            // The centre is needed by the round branch as well as by the marker + label below.
+            QPointF center;
+            for (const auto &vertex : obstacle)
+                center += QPointF(vertex.x(), vertex.y());
+            center /= obstacle.size();
+
+            if (obstacle_visual.round and obstacle_visual.round_radius_m > 0.f)
+            {
+                // A ROUND table is drawn as the disc it is. The box would draw four corners and an
+                // orientation that the round belief does not contain — it has no yaw at all — so the
+                // rectangle was showing structure that had never been inferred. See the note on
+                // ControllerObstacleVisual::round: this is the DISPLAY only; the planner still avoids
+                // the circumscribing polygon.
+                const qreal r = obstacle_visual.round_radius_m;
+                auto *disc = agv_->scene.addEllipse(QRectF(center.x() - r, center.y() - r, 2 * r, 2 * r),
+                                                    obstacle_pen, obstacle_brush);
+                disc->setZValue(18);
+                path_draw_items_.push_back(disc);
+            }
+            else
+            {
+                QPolygonF qpoly;
+                for (const auto &vertex : obstacle)
+                    qpoly << QPointF(vertex.x(), vertex.y());
+                qpoly << QPointF(obstacle.front().x(), obstacle.front().y());
+
+                auto *polygon = agv_->scene.addPolygon(qpoly, obstacle_pen, obstacle_brush);
+                polygon->setZValue(18);
+                path_draw_items_.push_back(polygon);
+            }
+
+            // ── 2-sigma "known-ness" halo (DISPLAY ONLY) ──────────────────────────────────────────
+            // A dashed ring at 2*sigma_pos around the footprint: how well this object's POSITION is
+            // known, straight from the rt_covariance its concept agent publishes. Nine agents publish
+            // one and nothing used to read any of them.
+            //
+            // ★It is NOT what the planner avoids, and it is drawn so it cannot be mistaken for that:
+            // no fill, dashed, cosmetic pen, under the footprint. Same discipline as the round-table
+            // disc above — display may show what the belief contains; only the polygon is planned
+            // against. (The uncertainty-derived clearance is a separate, currently disabled, setting.)
+            //
+            // WATCH IT GROW: an agent inflates Sigma while it is not measuring, so the halo swells
+            // whenever the robot looks away and should shrink on a fixation. A halo that keeps growing
+            // is the visible form of "peripheral evidence is not bounding this belief".
+            if (obstacle_visual.sigma_pos_m > 0.f
+                and obstacle_visual.kind != ControllerObstacleKind::GridOccupancy)
+            {
+                // ★ITS OWN COLOUR, NOT THE OBJECT'S. The ring used to take palette.pen, so on a model
+                // object it came out the same green as the footprint it surrounds — two different
+                // quantities (where the object IS, how well that is KNOWN) in one colour, which is
+                // exactly the confusion the "not what the planner avoids" note above is trying to
+                // prevent. One dedicated magenta for every kind instead: uncertainty reads as a layer
+                // rather than as a property of whichever agent happened to publish the object.
+                // ★Hue picked to be unused in this scene — the greens (34,139,58), oranges
+                // (194,103,25), crimsons (150,20,40), blues (0,145,199 / 56,114,219) and the teal
+                // (22,160,133) are all taken, and the one purple (142,68,173) is the mission-recording
+                // waypoint, far enough round the wheel and only present while recording.
+                const qreal r = 2.0 * obstacle_visual.sigma_pos_m;   // 2 sigma ~ 95%
+                QColor hc(224, 64, 191); hc.setAlpha(150);
+                QPen halo_pen(hc, 0.0);
+                halo_pen.setCosmetic(true);
+                halo_pen.setStyle(Qt::DashLine);
+                auto *halo = agv_->scene.addEllipse(QRectF(center.x() - r, center.y() - r, 2 * r, 2 * r),
+                                                    halo_pen, Qt::NoBrush);
+                halo->setZValue(17);   // BELOW the footprint (18) — context, not the thing itself
+                halo->setToolTip(QStringLiteral("%1: position sigma %2 m (2σ ring)")
+                                     .arg(QString::fromStdString(obstacle_visual.label))
+                                     .arg(obstacle_visual.sigma_pos_m, 0, 'f', 3));
+                path_draw_items_.push_back(halo);
+            }
+
+            // Grid-occupancy hulls read as a filled region only — skip the dense contour dots + centre
+            // marker (they are the "small points" that made occupied/free space unreadable).
+            if (obstacle_visual.kind == ControllerObstacleKind::GridOccupancy)
+                continue;
+
+            // The per-edge contour dots are gone. They added nothing the filled polygon + its pen did not
+            // already show, and they were expensive: one QGraphicsEllipseItem every 0.12 m of perimeter,
+            // rebuilt every frame for every obstacle. That is hundreds of scene items per redraw, which is a
+            // real contributor to the viewer's jank. The outline is the polygon's own pen.
+            auto *dot = agv_->scene.addEllipse(-0.06, -0.06, 0.12, 0.12, Qt::NoPen, obstacle_center_brush);
+            dot->setPos(center);
+            dot->setZValue(19);
+            path_draw_items_.push_back(dot);
+
+            if (!obstacle_visual.label.empty())
+            {
+                QFont label_font;
+                label_font.setPointSizeF(8.0);
+                label_font.setBold(true);
+                auto *label = agv_->scene.addSimpleText(QString::fromStdString(obstacle_visual.label), label_font);
+                // ★INK, NOT THE OBJECT'S HUE. The tag is what tells two footprints apart when their
+                // colours are hard to separate — colour-vision deficiency, a projector, a printout —
+                // so it is the one thing that must stay readable in every case. Drawn in the object's
+                // own hue it inherited that hue's contrast against the background, which for the
+                // lighter slots is under 3:1: the label went faint exactly where it was needed most.
+                // Identity is carried by the footprint beside it; the text carries the name.
+                label->setBrush(QBrush(QColor(28, 37, 42)));
+                label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+                label->setPos(center.x() + 0.06, center.y() - 0.06);
+                label->setZValue(20);
+                path_draw_items_.push_back(label);
+            }
+        }
+    }
+
+    if (!data.obstacle_rfe_points.empty())
+    {
+        QPen rfe_pen(QColor(110, 92, 0, 230), 0.018);
+        rfe_pen.setCosmetic(false);
+        const QBrush rfe_brush(QColor(255, 225, 40, 245));
+        for (const auto &obstacle_points : data.obstacle_rfe_points)
+        {
+            for (const auto &point : obstacle_points)
+            {
+                auto *dot = agv_->scene.addEllipse(-0.045, -0.045, 0.09, 0.09, rfe_pen, rfe_brush);
+                dot->setPos(point.x(), point.y());
+                dot->setZValue(19.5);
+                path_draw_items_.push_back(dot);
+            }
+        }
+    }
+
+    if (data.path.empty())
+        return;
+
+    // ONE item for the whole path, not one per segment. This used to add a line AND a 12 cm dot per
+    // point, which is fine for the handful of turning points the leg planner produced and hopeless for a
+    // continuous route: 3300 samples at 5 cm became ~10 000 QGraphicsItems rebuilt every frame, drawn as
+    // a solid blob of overlapping dots that did not look like a route at all.
+    QPainterPath painter_path(QPointF(data.path.front().x(), data.path.front().y()));
+    for (std::size_t index = 1; index < data.path.size(); ++index)
+        painter_path.lineTo(data.path[index].x(), data.path[index].y());
+    auto *route_item = agv_->scene.addPath(painter_path, QPen(QColor(56, 114, 219), 0.06), Qt::NoBrush);
+    route_item->setZValue(20);
+    path_draw_items_.push_back(route_item);
+
+    // Vertex dots only when there are few enough for one to MEAN something. On a densely sampled curve
+    // every sample would carry a dot and the marks would say nothing the line does not already say.
+    if (data.path.size() <= 64)
+        for (const auto &point : data.path)
+        {
+            constexpr float radius = 0.06f;
+            auto *dot = agv_->scene.addEllipse(-radius, -radius, 2.f * radius, 2.f * radius,
+                                               Qt::NoPen, QBrush(QColor(56, 114, 219)));
+            dot->setPos(point.x(), point.y());
+            dot->setZValue(21);
+            path_draw_items_.push_back(dot);
+        }
+
+}
+
+void Viewer2D::clear_path_items()
+{
+    for (auto *item : path_draw_items_)
+    {
+        agv_->scene.removeItem(item);
+        delete item;
+    }
+    path_draw_items_.clear();
+}
+
+void Viewer2D::clear_mission_items()
+{
+    for (auto *item : mission_items_)
+    {
+        agv_->scene.removeItem(item);
+        delete item;
+    }
+    mission_items_.clear();
+}
+
+void Viewer2D::draw_mission(const std::vector<Eigen::Vector2f> &waypoints, int current_index, bool recording,
+                            bool draggable, bool route_visible)
+{
+    // Held rather than passed down, because render_mission() is also called mid-drag from the event
+    // filter, where there is no frame to ask.
+    route_visible_ = route_visible;
+    // A drag in flight OWNS the waypoint positions. present() redraws every cycle from the control thread's
+    // snapshot, which cannot yet contain the point being dragged — rendering that snapshot mid-drag snapped
+    // the marker back to its old place between mouse moves, which is what made dragging feel like it only
+    // jumped, or did nothing at all for a point whose move was overwritten before it was ever painted.
+    if (drag_index_ < 0)
+    {
+        mission_wps_ = waypoints;
+        mission_draggable_ = draggable;
+    }
+    mission_index_ = current_index;
+    mission_recording_ = recording;
+    render_mission();
+}
+
+void Viewer2D::render_mission()
+{
+    clear_mission_items();
+    if (mission_wps_.empty())
+        return;
+
+    // Violet while recording, teal while running — the two states look nothing alike, because clicking in
+    // the view means "append a waypoint" in one and "drive there now" in the other.
+    const QColor base = mission_recording_ ? QColor(142, 68, 173) : QColor(22, 160, 133);
+
+    // The links stand in for a route; a route replaces them. See route_visible_ in the header.
+    if (not route_visible_)
+    {
+        QPen link_pen(base.lighter(120), 0.03);
+        link_pen.setCosmetic(false);
+        link_pen.setStyle(Qt::DotLine);
+        for (std::size_t i = 0; i + 1 < mission_wps_.size(); ++i)
+        {
+            auto *line = agv_->scene.addLine(mission_wps_[i].x(), mission_wps_[i].y(),
+                                             mission_wps_[i + 1].x(), mission_wps_[i + 1].y(), link_pen);
+            line->setZValue(17);
+            mission_items_.push_back(line);
+        }
+    }
+
+    constexpr float radius = 0.10f;
+    for (std::size_t i = 0; i < mission_wps_.size(); ++i)
+    {
+        const bool is_current = static_cast<int>(i) == mission_index_;
+        const bool is_dragged = static_cast<int>(i) == drag_index_;
+        auto *dot = agv_->scene.addEllipse(-radius, -radius, 2.f * radius, 2.f * radius,
+                                           QPen(is_dragged ? QColor(255, 255, 255) : base.darker(140), 0.02),
+                                           QBrush(is_current ? QColor(241, 196, 15) : base));
+        dot->setPos(mission_wps_[i].x(), mission_wps_[i].y());
+        dot->setZValue(is_current or is_dragged ? 29 : 27);
+        mission_items_.push_back(dot);
+
+        auto *label = agv_->scene.addSimpleText(QString::number(i + 1));
+        label->setBrush(QBrush(Qt::white));
+        QFont f = label->font();
+        f.setPointSizeF(6.0);
+        label->setFont(f);
+        // The scene y axis points down for text; flip so the numbers read the right way up in room frame.
+        label->setTransform(QTransform().scale(0.02, -0.02));
+        const QRectF br = label->boundingRect();
+        label->setPos(mission_wps_[i].x() - 0.02 * br.width() * 0.5,
+                      mission_wps_[i].y() + 0.02 * br.height() * 0.5);
+        label->setZValue(30);
+        mission_items_.push_back(label);
+    }
+}
+
+bool Viewer2D::eventFilter(QObject *watched, QEvent *event)
+{
+    const auto index_valid = [this](int i) { return i >= 0 and i < static_cast<int>(mission_wps_.size()); };
+    // Right-drag a waypoint to move it. The base viewer binds a plain right-press to PANNING, so this
+    // filter consumes the press ONLY when it lands on a waypoint — panning still works everywhere else,
+    // which matters because panning is how you reach the parts of the room you are about to edit.
+    if (agv_ == nullptr or watched != agv_->viewport())
+        return QObject::eventFilter(watched, event);
+
+    // ★★★COUNT THE PAINTS. This is the one bit paint_probe() could not supply: grab() renders through
+    // QWidget::render(), which calls paintEvent DIRECTLY and bypasses the repaint manager entirely —
+    // so a live hash proves the SCENE and the paint CODE are healthy and says nothing about whether
+    // the normal repaint cycle is still running. Counting the real QEvent::Paint here splits the last
+    // two candidates: ~31 Hz beside a frozen screen means the paints happen and the FLUSH to the
+    // screen is the fault; ~0 means viewport()->update() is being dropped before a paintEvent is ever
+    // sent, and no amount of calling update() harder will help. Never consumes the event.
+    if (event->type() == QEvent::Paint)
+        ++paint_events_;
+
+    // Pick radius in METRES, not pixels: the scene is in metres and the view zooms, so a pixel radius
+    // would grab a different amount of world at every zoom level.
+    constexpr float pick_radius_m = 0.18f;
+
+    const auto scene_pos = [this](QMouseEvent *me)
+    { return agv_->mapToScene(me->position().toPoint()); };
+
+    if (event->type() == QEvent::MouseButtonPress)
+    {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() != Qt::RightButton or not mission_draggable_)
+            return false;
+        // Ctrl+right is the base viewer's "clear target"; over a WAYPOINT it means remove that
+        // waypoint instead. Off a waypoint it falls through untouched, so clearing a target still works.
+        const bool ctrl = (me->modifiers() & Qt::ControlModifier) != 0;
+        if (me->modifiers() != Qt::NoModifier and not ctrl)
+            return false;
+        const QPointF p = scene_pos(me);
+        // COINCIDENT WAYPOINTS ARE NORMAL — a hand-clicked tour that returns to the same corner stacks
+        // several on one spot. Ties go to the HIGHEST index, i.e. the one drawn last and therefore on top,
+        // so what you grab is what you can see. A strict `<` here silently grabbed the lowest index
+        // instead: clicking the visible marker moved a different, buried waypoint, which reads as "this
+        // point won't move" and leaves the edit apparently unsaved.
+        int best = -1;
+        float best_d2 = pick_radius_m * pick_radius_m;
+        for (std::size_t i = 0; i < mission_wps_.size(); ++i)
+        {
+            const float dx = static_cast<float>(p.x()) - mission_wps_[i].x();
+            const float dy = static_cast<float>(p.y()) - mission_wps_[i].y();
+            if (const float d2 = dx * dx + dy * dy; d2 <= best_d2) { best_d2 = d2; best = static_cast<int>(i); }
+        }
+        if (best < 0)
+        {
+            if (ctrl)
+                return false;                // Ctrl+right off a waypoint → base viewer clears the target
+            // Not on a waypoint. Remember where the button went down and let the press through so the
+            // base viewer can still start a pan; if the pointer never really moves we turn it into an
+            // INSERT on release instead. See kClickSlopPx.
+            pending_insert_ = true;
+            press_pos_px_ = me->position().toPoint();
+            return false;
+        }
+        if (ctrl)
+        {
+            // Remove, and do it from the local cache immediately for the same reason a drag does: the
+            // control thread's snapshot cannot know about the edit until its next cycle, and redrawing
+            // the stale list would flash the point back before it disappeared again.
+            const int index = best;
+            if (index_valid(index)) mission_wps_.erase(mission_wps_.begin() + index);
+            render_mission();
+            emit mission_waypoint_removed(index);
+            return true;
+        }
+        drag_index_ = best;
+        agv_->viewport()->setCursor(Qt::ClosedHandCursor);
+        return true;
+    }
+
+    // A pan disqualifies the pending insert as soon as the pointer travels: the gesture has become a
+    // drag, and the release that ends it must not drop a waypoint where the pan finished.
+    if (event->type() == QEvent::MouseMove and pending_insert_)
+    {
+        auto *me = static_cast<QMouseEvent *>(event);
+        const QPoint d = me->position().toPoint() - press_pos_px_;
+        if (std::abs(d.x()) > kClickSlopPx or std::abs(d.y()) > kClickSlopPx)
+            pending_insert_ = false;
+        return false;                        // never consumed: the base viewer is panning
+    }
+
+    if (event->type() == QEvent::MouseButtonRelease and pending_insert_)
+    {
+        auto *me = static_cast<QMouseEvent *>(event);
+        pending_insert_ = false;
+        if (me->button() != Qt::RightButton)
+            return false;
+        const QPoint d = me->position().toPoint() - press_pos_px_;
+        if (std::abs(d.x()) > kClickSlopPx or std::abs(d.y()) > kClickSlopPx)
+            return false;                    // it was a pan after all
+        // No local-cache update here: unlike a move or a remove, this viewer does not know WHERE in the
+        // list the point goes — that is the model's nearest-leg decision. The next snapshot brings it
+        // back with the right index, one cycle later, which is imperceptible and cannot disagree.
+        emit mission_waypoint_inserted(scene_pos(me));
+        return false;                        // let the base viewer finish its (zero-length) pan cleanly
+    }
+
+    if (event->type() == QEvent::MouseMove and drag_index_ >= 0)
+    {
+        auto *me = static_cast<QMouseEvent *>(event);
+        const QPointF p = scene_pos(me);
+        if (drag_index_ < static_cast<int>(mission_wps_.size()))
+            mission_wps_[drag_index_] = {static_cast<float>(p.x()), static_cast<float>(p.y())};
+        render_mission();   // follows the cursor immediately, no round trip through the control thread
+        return true;
+    }
+
+    if (event->type() == QEvent::MouseButtonRelease and drag_index_ >= 0)
+    {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() != Qt::RightButton)
+            return false;
+        const QPointF p = scene_pos(me);
+        if (index_valid(drag_index_))
+            mission_wps_[drag_index_] = {static_cast<float>(p.x()), static_cast<float>(p.y())};
+        const int index = drag_index_;
+        drag_index_ = -1;
+        agv_->viewport()->unsetCursor();
+        render_mission();
+        emit mission_waypoint_moved(index, p);
+        return true;
+    }
+
+    return QObject::eventFilter(watched, event);
+}
+
+int Viewer2D::scene_item_count() const
+{
+    return agv_ ? static_cast<int>(agv_->scene.items().size()) : -1;
+}
+
+void Viewer2D::force_repaint()
+{
+    if (agv_ and agv_->viewport()) agv_->viewport()->update();
+}
+
+int Viewer2D::force_synchronous_repaint()
+{
+    if (agv_ == nullptr or agv_->viewport() == nullptr)
+        return kRecoveryNoViewer;
+
+    // ── THREE LEVERS, WEAKEST FIRST, AND EACH ONE IS ALSO THE EXPERIMENT ──────────────────────────
+    // They are ordered by how much of Qt's cached state they invalidate, so WHICH one works names the
+    // fault: repaint() only skips the scheduling; hide/show re-runs the whole visibility and clip
+    // computation. Nothing here is a retry of the same thing at a different rate.
+    QWidget *vp = agv_->viewport();
+
+    // 1. Synchronous repaint: bypasses the repaint manager's SCHEDULING, but still goes through the
+    //    same markDirty() clipping. If this lands, only the queued update was being lost.
+    const int before_repaint = paint_events_;
+    vp->repaint();
+    if (paint_events_ > before_repaint)
+        return kRecoveryRepaint;
+
+    // 2. hide/show: forces Qt to recompute the widget's visibility, clip rect and obscured-by-sibling
+    //    state from scratch, and marks the whole widget dirty on show. This is the lever that cures a
+    //    viewport Qt has wrongly decided is fully covered — the state visible_w/visible_h reports.
+    const int before_cycle = paint_events_;
+    vp->hide();
+    vp->show();
+    vp->update();
+    if (paint_events_ > before_cycle)
+        return kRecoveryVisibilityCycle;
+
+    return kRecoveryFailed;
+}
+
+Viewer2D::PaintProbe Viewer2D::paint_probe()
+{
+    PaintProbe probe;
+    if (agv_ == nullptr or agv_->viewport() == nullptr)
+        return probe;
+
+    const QTransform t = agv_->transform();
+    probe.scale = t.m11();
+    // ★★★DRAINED AFTER THE GRAB, NOT BEFORE. Read here and zeroed at the END of this function, because
+    // grab() below delivers a paint event of its OWN: draining first leaked that one into the next
+    // window and every heartbeat then reported exactly 1 paint (0.199 Hz at a 5 s window) whether or
+    // not the repaint cycle was alive — which ALSO kept the zero-paint alarm below from ever firing.
+    // The instrument was measuring itself. Measured 2026-09-11, cost one more freeze to notice.
+    probe.paint_events = paint_events_;
+    probe.updates_enabled = agv_->viewport()->updatesEnabled();
+    probe.viewport_visible = agv_->viewport()->isVisible();
+    probe.viewport_w = agv_->viewport()->width();
+    probe.viewport_h = agv_->viewport()->height();
+    // ★WHAT QT THINKS IS ON SCREEN. If this is EMPTY while the widget is visible and sized, Qt believes
+    // the viewport is entirely obscured, and paintAndFlush() then clips its dirty region to nothing —
+    // every update() is discarded before a paint event is ever sent, silently and for ever. That is
+    // the one state in which calling update() harder is provably useless, and nothing else reports it.
+    const QRect vis = agv_->viewport()->visibleRegion().boundingRect();
+    probe.visible_w = vis.width();
+    probe.visible_h = vis.height();
+    probe.finite_transform = std::isfinite(t.m11()) and std::isfinite(t.m12())
+                         and std::isfinite(t.m21()) and std::isfinite(t.m22())
+                         and std::isfinite(t.dx())  and std::isfinite(t.dy());
+
+    // ★THE ONLY END-TO-END TEST OF THE PAINT PATH. grab() runs the widget's OWN paintEvent into an
+    // off-screen pixmap, so this hash is what the scene actually renders TO, independently of
+    // whether that render ever reaches the screen. It splits the two halves the item count cannot:
+    //   hash CHANGING while the screen is frozen => the scene paints fine and the flush is the fault;
+    //   hash FROZEN                              => the paint itself is drawing nothing, and
+    //                                               finite_transform says whether a NaN is why.
+    const QImage img = agv_->viewport()->grab().toImage().convertToFormat(QImage::Format_RGB32);
+    probe.pixel_hash = static_cast<std::uint32_t>(
+        qHashBits(img.constBits(), static_cast<std::size_t>(img.sizeInBytes()), 0));
+    paint_events_ = 0;   // discard the paint grab() just caused; see the note above
+    return probe;
+}
+
+void Viewer2D::set_lidar_stall_banner(bool visible, float seconds)
+{
+    if (agv_ == nullptr) return;
+    if (not visible)
+    {
+        if (stall_banner_) stall_banner_->setVisible(false);
+        if (stall_bg_)     stall_bg_->setVisible(false);
+        return;
+    }
+    if (stall_banner_ == nullptr)
+    {
+        // Background first so it sits UNDER the text. Both ignore the item transformation, so they
+        // keep a constant pixel size whatever the zoom.
+        stall_bg_ = agv_->scene.addRect(QRectF(0, 0, 300, 26), QPen(QColor(120, 0, 0), 0),
+                                        QBrush(QColor(190, 30, 30, 220)));
+        stall_bg_->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+        stall_bg_->setZValue(60);
+        stall_banner_ = agv_->scene.addSimpleText(QString());
+        stall_banner_->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+        stall_banner_->setBrush(QBrush(QColor(255, 255, 255)));
+        QFont f = stall_banner_->font();
+        f.setBold(true);
+        f.setPointSize(11);
+        stall_banner_->setFont(f);
+        stall_banner_->setZValue(61);
+    }
+    // ★THE TEXT SAYS WHAT IS STALE AND FOR HOW LONG, because "frozen" alone sends you looking at the
+    // viewer. The canvas is drawn from the control pipeline, and that pipeline is triggered BY the
+    // scan — so no scan means no new frame, and the number is the evidence for that claim.
+    stall_banner_->setText(QStringLiteral("  ⚠ LiDAR STALLED %1 s — the view is the last good frame  ")
+                               .arg(seconds, 0, 'f', 1));
+    // Anchor to the viewport's top-left every call: the view pans and zooms under the scene.
+    const QPointF tl = agv_->mapToScene(QPoint(12, 12));
+    stall_banner_->setPos(tl);
+    stall_bg_->setPos(tl);
+    stall_bg_->setRect(QRectF(0, 0, stall_banner_->boundingRect().width(),
+                              stall_banner_->boundingRect().height()));
+    stall_banner_->setVisible(true);
+    stall_bg_->setVisible(true);
+}
+
+void Viewer2D::update_target_marker(float x, float y, bool visible)
+{
+    if (target_marker_ == nullptr)
+    {
+        constexpr float radius = 0.12f;
+        target_marker_ = agv_->scene.addEllipse(-radius, -radius, 2.f * radius, 2.f * radius,
+                                                QPen(QColor(255, 50, 50), 0.03),
+                                                QBrush(QColor(255, 50, 50, 120)));
+        target_marker_->setZValue(22);
+    }
+
+    target_marker_->setPos(x, y);
+    target_marker_->setVisible(visible);
+}
+
+void Viewer2D::update_orient_overlay(float x, float y, float target_yaw, float current_yaw,
+                                     bool visible)
+{
+    // Long enough to read against the room, short enough not to reach across it. The ray is a
+    // DIRECTION, not a distance — nothing about an Orient says how far away anything is.
+    constexpr float kRayM = 1.20f;
+    constexpr float kArcM = 0.85f;
+
+    if (orient_ray_ == nullptr)
+    {
+        orient_ray_ = agv_->scene.addLine(0, 0, 0, 0, QPen(QColor(0, 170, 255), 0.04,
+                                                           Qt::SolidLine, Qt::RoundCap));
+        orient_ray_->setZValue(23);
+        orient_arc_ = agv_->scene.addPath(QPainterPath(), QPen(QColor(0, 170, 255, 170), 0.05),
+                                          QBrush(Qt::NoBrush));
+        orient_arc_->setZValue(23);
+    }
+
+    orient_ray_->setVisible(visible);
+    orient_arc_->setVisible(visible);
+    if (not visible) return;
+
+    // ★★★THE BODY'S NOSE IS AT +Y, AND A YAW OF ZERO POINTS AT +X. The overlay's job is to show where
+    // the ROBOT will be pointing, and the robot on this scene is drawn nose-forward along +y --
+    // AbstractGraphicViewer builds the silhouette with its rounded front at +sl. So a ray laid down at
+    // the raw yaw is geometrically correct about the angle and wrong about the thing being drawn: it
+    // sits 90 degrees off the direction the body will actually face, and the picture disagrees with
+    // the robot beside it. Both the ray and the arc take the same offset, so the sweep between "where
+    // it points now" and "where it was asked to point" is unchanged -- the whole figure rotates with
+    // the body it describes.
+    constexpr double kNoseOffset = M_PI / 2.0;
+    const double target_fwd  = target_yaw  + kNoseOffset;
+    const double current_fwd = current_yaw + kNoseOffset;
+
+    orient_ray_->setLine(x, y, x + kRayM * std::cos(target_fwd), y + kRayM * std::sin(target_fwd));
+
+    // The arc runs from where the robot points NOW to where it was asked to point, the short way —
+    // which is the way the executor turns, so the drawing and the motion cannot disagree about which
+    // direction the robot is about to go. It shrinks to nothing as the turn completes, so the picture
+    // empties out exactly when the affordance is satisfied.
+    const double sweep = std::atan2(std::sin(target_yaw - current_yaw),
+                                    std::cos(target_yaw - current_yaw));
+    QPainterPath arc;
+    const QRectF box(x - kArcM, y - kArcM, 2.0 * kArcM, 2.0 * kArcM);
+    // ★QT'S ARC ANGLES ARE THE NEGATION OF A WORLD YAW, AND THE VIEW'S FLIP DOES NOT UNDO IT. QPainterPath
+    // places an angle θ at (cx + r·cosθ, cy − r·sinθ): the minus is Qt assuming a y-DOWN painter and
+    // wanting positive angles to LOOK counter-clockwise there. Our scene coordinates are world metres
+    // with y up (AbstractGraphicViewer's scale(1,-1) is applied by the VIEW, after the path is built),
+    // so a world yaw ψ has to be handed over as −ψ, and the sweep with it. Passing them through
+    // unnegated draws the arc mirrored about the x axis and sweeping away from the target.
+    const double start_qt = -current_fwd * 180.0 / M_PI;
+    const double sweep_qt = -sweep * 180.0 / M_PI;
+    // arcMoveTo first: arcTo alone would draw a straight line in from wherever the path currently is.
+    arc.arcMoveTo(box, start_qt);
+    arc.arcTo(box, start_qt, sweep_qt);
+    orient_arc_->setPath(arc);
+}
+
+} // namespace rc

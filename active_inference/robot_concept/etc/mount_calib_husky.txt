@@ -1,0 +1,11 @@
+# MEASURED camera mounts for robot husky, applied OVER the mount that
+# Agent.configFile seeds at every start. Written by robot_concept on a graceful stop.
+# DELETE THIS FILE to return to the robot's JSON mount — that is the whole recovery
+# procedure, and the JSON itself is never modified.
+# mount,<cam>,tx,ty,tz,rx,ry,rz   (body->camera; rt_translation and
+#                                  rt_rotation_euler_xyz, Rx*Ry*Rz, radians)
+version,1
+written,2026-09-30T21:22:17
+mount,zed,0,0.419999987,0.550000012,-0.261799991,0,0
+# history, oldest first: hist,<version>,<iso>,<cam>,tx,ty,tz,rx,ry,rz
+hist,1,2026-09-30T21:22:17,zed,0,0.419999987,0.550000012,-0.261799991,0,0

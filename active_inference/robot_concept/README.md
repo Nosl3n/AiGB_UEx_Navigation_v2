@@ -1,0 +1,210 @@
+# robot_concept
+
+
+`robot_concept` consumes RGBD and lidar data, segments semantic objects with YOLO, voxelizes them in room coordinates, and publishes the resulting scene to DSR and the local OpenGL viewer.
+
+---
+
+## Quick Start Checklist (New Users)
+
+1. **Install GCC 15** (required for C++23 and `flat_set`)
+2. **Install system dependencies** (Qt6, OpenCV, TBB, Eigen, RoboComp/DSR)
+3. **Install ONNX Runtime GPU** (see below)
+4. **Install CUDA and (optionally) TensorRT** (see below)
+5. **Configure and build** (see below)
+6. **Copy and edit config file**
+7. **Run the agent**
+
+---
+
+
+## Requirements
+
+- **GCC 15** (required for C++23 and `flat_set`)
+- RoboComp / DSR runtime and the generated interfaces already available in the build environment.
+- OpenCV
+- TBB
+- Qt6 with OpenGL / OpenGLWidgets
+- ONNX Runtime GPU build for YOLO inference
+- CUDA runtime compatible with the chosen ONNX Runtime package
+- Optional: TensorRT for faster YOLO inference
+
+### GCC 15 Installation (Ubuntu)
+
+Ubuntu 24.04+ may provide GCC 15 directly:
+
+```bash
+sudo apt update
+sudo apt install g++-15
+```
+
+If not available, see [GCC Wiki](https://gcc.gnu.org/wiki/InstallingGCC) or use a tool like `update-alternatives` to select GCC 15.
+
+**Check your compiler:**
+
+```bash
+g++-15 --version
+```
+
+If you see errors about `flat_set` or C++23 features, you are not using GCC 15.
+
+tensorrt-dev
+
+## System Packages
+
+Typical Ubuntu packages needed for build/runtime:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential cmake pkg-config \
+  qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-scxml-dev \
+  libqt6opengl6-dev libopencv-dev libtbb-dev \
+  libeigen3-dev
+```
+
+If TensorRT acceleration is desired, install the matching TensorRT runtime/devel packages for the CUDA version of the target machine (e.g., `libnvinfer-dev`, `libnvinfer-plugin-dev`).
+
+
+
+## ONNX Runtime Installation
+
+This component does not assume a fixed ONNX Runtime location. CMake will search these in order:
+
+1. `-DONNXRUNTIME_ROOT=...`
+2. `ONNXRUNTIME_ROOT` environment variable
+3. Common prefixes such as `/usr/local/onnxruntime`, `/opt/onnxruntime`, `/usr`, `/usr/local`
+
+**Download ONNX Runtime GPU** from https://github.com/microsoft/onnxruntime/releases (choose the GPU tarball matching your CUDA version).
+
+Recommended layout on a new machine:
+
+```bash
+sudo mkdir -p /opt
+sudo tar -C /opt -xzf onnxruntime-linux-x64-gpu-<version>.tgz
+sudo ln -sfn /opt/onnxruntime-linux-x64-gpu-<version> /opt/onnxruntime
+```
+
+Then configure with:
+
+```bash
+cmake -S . -B build -DONNXRUNTIME_ROOT=/opt/onnxruntime
+```
+
+If you prefer system-wide linker visibility, you can also add the ONNX Runtime `lib` directory to the system loader config, but it is not required because the executable stores an rpath to the selected ONNX Runtime library directory.
+
+
+## Build
+
+```bash
+cd /path/to/robot_concept
+cmake -S . -B build -DONNXRUNTIME_ROOT=/opt/onnxruntime -DCMAKE_CXX_COMPILER=g++-15 -DCMAKE_C_COMPILER=gcc-15
+cmake --build build -j$(nproc)
+```
+
+If you have multiple GCC versions, always specify the compiler as above.
+
+## Configuration Files
+
+Two example config formats are provided:
+
+- `etc/config` for the legacy format
+- `etc/config.toml` for the TOML format
+
+For normal use, copy one of them and edit the copy:
+
+```bash
+cd /path/to/robot_concept
+cp etc/config.toml etc/local_config.toml
+```
+
+## DSR Graph — Sensor Frames (`husky.json`)
+
+The initial DSR graph is seeded from `husky.json` (root → husky → body). Sensor nodes hang off the `body` node
+via **RT** edges:
+
+| Edge (src → dst) | Translation (x, y, z) m | Rotation (rx, ry, rz) rad | Notes |
+|---|---|---|---|
+| body → helios | (0, −0.25, 0.95) | (0, 0, 0) | 3D LiDAR on the rear mast |
+| body → zed    | (0, 0.42, 0.55) | (−0.2618, 0, 0) | Stereo camera, tilted 15° about x |
+| body → imu    | (0, 0, 0.2251) | (0, 0, 0) | |
+| body → gps    | (0, −0.25, 1.02) | (0, 0, 0) | GNSS antenna above the LiDAR |
+
+The `mind` node holds one child per running agent with its presence state (`agent_presence_state`).
+
+## Run
+
+```bash
+cd /path/to/robot_concept
+bin/robot_concept --Ice.Config=etc/local_config.toml
+```
+
+
+## CUDA / TensorRT Notes
+
+- For CUDA-only inference, the default system runtime is usually enough.
+- For TensorRT inference, the ONNX Runtime GPU package, CUDA runtime, and TensorRT runtime **must be ABI-compatible**. If more than one CUDA/TensorRT stack is installed, ensure the desired one is first in `LD_LIBRARY_PATH`.
+
+**Examples:**
+
+CUDA 12.8:
+
+```bash
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+```
+
+CUDA 13.2:
+
+```bash
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda-13.2/lib64:$LD_LIBRARY_PATH
+```
+
+**Useful startup signals:**
+
+- `[YOLO] effective flags: use_gpu=true use_trt=true`
+- `[YoloSegDetector] TensorRT EP registered ...`
+- `[YoloSegDetector] CUDA EP registered`
+
+If TensorRT fails to initialize, the detector falls back to CUDA instead of crashing.
+
+
+## Install
+
+The component install target copies both example configs to RoboComp's `etc-default` directory:
+
+- `robot_concept.conf`
+- `robot_concept.toml`
+
+Standard install:
+
+```bash
+cmake --install build
+```
+
+## Editable Files
+
+Edit freely:
+
+- `src/*`
+- `etc/*`
+- `README.md`
+
+
+Do not edit `generated/*` directly; it is regenerated by RoboComp tools.
+
+---
+
+## Troubleshooting
+
+**Build fails with error about `flat_set` or C++23 features:**
+- You are not using GCC 15. Re-run CMake with `-DCMAKE_CXX_COMPILER=g++-15 -DCMAKE_C_COMPILER=gcc-15`.
+
+**ONNX Runtime not found:**
+- Make sure you downloaded the GPU tarball and set `ONNXRUNTIME_ROOT` correctly.
+
+**TensorRT or CUDA errors at runtime:**
+- Check that your CUDA and TensorRT versions match the ONNX Runtime build. See ONNX Runtime release notes for compatibility.
+- Use `LD_LIBRARY_PATH` to prioritize the correct CUDA/TRT libraries.
+
+**Still stuck?**
+- Check the [Issues](https://github.com/robocomp/robocomp/issues) or ask in the RoboComp community.

@@ -1,0 +1,52 @@
+# row_metaconcept — the rows of the field (field -> row -> plant) as `metaconcept` nodes row_<id>.
+# See src/specificworker.h for the contract and common/vegetation/rows.h for the inference.
+
+[Proxies]
+# No required Ice interfaces (DSR is the comms plane).
+
+[Agent]
+id = 28   # MUST be unique across the shared graph: robot=6 controller=8 retina=9 human=13 residual=14 openfield=25
+          # vegetation=26 trunk=27. A collision = CRDT actor-id clash -> SIGSEGV.
+name = "row_metaconcept"
+configFile = ""
+domain = 0
+tree = false
+graph = false
+"2d" = false
+"3d" = false
+
+[Period]
+Compute = 100
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+[Presence]
+required_agent_names = ["plant_concept"]
+optional_agent_names = ["openfield_concept", "controller"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 5000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+nodes = ["row_metaconcept 28", "row_*"]
+
+[Rows]
+NeighbourMaxM = 3.0   # a trunk's neighbours for the row heading: within this distance
+RowGapM = 1.0         # across-row gap that separates two rows (rows here are 2.5 m apart; a row scatters ~cm)
+AlongGapM = 4.0       # along-row gap that splits a row: ~3 missing trees at 1.25 m spacing
+MinMembers = 3        # trunks on a line needed to call it a row
+HalfWidthM = 0.5      # the rectangle reaches this far beyond the line (= the trunk disc radius)
+EndMarginM = 0.5      # ... and beyond the first and last trunk
+RowHeightM = 0.6
+UpdatePeriodMs = 1000

@@ -1,0 +1,527 @@
+# residual_concept for the Husky A300 in the open field (webots-agri).
+# Keys tagged `FIELD (Husky)` are retuned from the indoor values to the scale of what matters outdoors
+# (crop rows, people, other robots), so lone returns near the ground stop creating obstacles. Derived from config.toml: waits for
+# openfield_concept (the `field` world frame), no bpearl. With no agricultural concept running, EVERY return
+# (palms included) is unexplained and lands here — the null-hypothesis safety layer doing its job.
+
+[Proxies]
+# Proxies for required interfaces (unused by residual_concept, kept so the generated genericworker links).
+Webots2Robocomp = "webots2robocomp:tcp -h localhost -p 10006"
+
+# --- Common Agent Data ---
+[Agent]
+id = 14  # MUST be unique across the shared graph: room=5 robot=6 table=7 controller=8 retina=9 bottle=10 kinova=11 self_calib=12 human=13 door=15 scene_graph_viewer=16 chair=20 cabinet=21 refrigerator=22 ring_metaconcept=23. A collision = CRDT actor-id clash → SIGSEGV.
+name = "residual_concept"
+
+configFile = ""
+domain = 0
+tree = false
+graph = false   # headless perception agent (the shared DSR node-link viewer crashes under participant churn)
+2d = false
+3d = false
+
+[Period]
+Compute = 100
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+# ── Agent-presence protocol ───────────────────────────────────────────────────
+[Presence]
+required_agent_names = ["robot_concept", "openfield_concept"]   # robot_concept = lidar3D + robot node; room_concept = room node + floor/wall specialists. NO retina (residual uses LiDAR, not YOLO masks).
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 25000
+rejoin_grace_ms = 8000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+# Owned graph nodes torn down on shutdown / peer-loss. "residual*" matches every obstacle this agent
+# scaffolds (residual_1, residual_2, …) so none survive a restart.
+[Owns]
+nodes = ["residual_concept 14", "residual*"]   # "residual*" covers the belief-field node (now named "residual")
+
+# ── residual_concept agent loop ───────────────────────────────────────────────
+[ResidualConcept]
+FEps = 0.005
+KStable = 20
+DivergedRetireFrames = 0      # OFF — removal is now the evidence-based occupancy carve (see [Carve]), not a
+                              # no-data-fit counter (failing to fit ≠ compelling evidence the obstacle is gone)
+LogPeriodFrames = 30
+# Compute cycles per publish of the occupancy grid to the DSR graph (Period.Compute = 100 ms, so
+# 1 = 10 Hz, 5 = 2 Hz). RAISED 5 -> 1 on 2026-08-28: this grid is no longer a display, it is the only
+# channel carrying near-field obstacles (the H32F70 cannot see a 0.45 m box inside 0.57 m, and the
+# controller's ESDF has no memory). At 2 Hz the map is up to 500 ms stale = 0.25 m of travel at
+# 0.5 m/s, wider than the unobservable ring it exists to cover.
+# ⚠ROLLBACK FIRST IF AN AGENT PINS A CPU: this is the largest attribute in the graph and cortex keeps
+# a CRDT dot per write, so 5x the rate is 5x the dot growth (a known unbounded-growth path).
+# ★★★A/B 2026-08-28, REVERTED 1 -> 5 WHILE THE COST IS MEASURED. At 1 (10 Hz) the controller's
+# pose went stale in a 50 ms comb recurring every 101 ms — the same period as this publish — with
+# 56% of cycles driving on a pose 50-324 ms old, against a room_concept that computes at 16 ms and
+# should be feeding it far faster. Symptom seen by eye: the LiDAR overlay lags behind during a fast
+# pivot in the CONTROLLER's view but NOT in room_concept's, which is exactly the signature of a DSR
+# round-trip delay rather than a sensor one — room_concept computes the pose locally, the controller
+# reads it back through the graph. This attribute is the largest in the graph, so writing it 5x more
+# often puts every RT-edge update behind a ~28 KB broadcast in the subscriber's reader thread.
+# ★If reverting this does NOT collapse the comb, the cause is elsewhere and this should go back up:
+# the map is the only channel carrying near-field obstacles and 2 Hz means 0.25 m of staleness at
+# 0.5 m/s, wider than the unobservable ring it exists to cover. 2 (5 Hz) is the likely compromise —
+# 0.10 m of staleness at 40% of the traffic — but pick it on the measurement, not on taste.
+GridPublishEveryN = 5 
+WriteThresholdM = 0.03        # geometry dead-band: republish only past this centre/size change (m)
+# Conservative publish — LiDAR sees only NEAR faces, so the raw fit UNDER-sizes obstacles (far side occluded).
+# For safe navigation the published footprint must err LARGER: grow w/d by k·σ of the extent (occlusion
+# inflates that σ, so it grows exactly on the unobserved side — principled, not a fixed pad) + a per-side
+# robot-clearance margin. Internal fit/carve use the raw estimate; only the published box+hull are inflated.
+PublishExtentSigmaK = 2.0     # grow published w,d by k·σ (occlusion-aware; 0 = raw fit)
+PublishSafetyMarginM = 0.05   # + this clearance on EACH footprint side (robot clearance; ↑ for a wider berth)
+DissolveExplainedFrac = 0.60  # (with a specialist) fraction of interior explained → dissolve (fission accel)
+RtCovAddChain = true          # add J·Σ_chain·Jᵀ localization cov to the published RT cov
+UnobservableVar = 9.87        # ≈π² — roll/pitch unobservable for a footprint box
+DiagCsvPath = ""   # per-cluster diagnostic CSV ("etc/residual_diag.csv"); empty = off
+
+# ── Belief (AI2 box-footprint fit; the ONLY fit path) ─────────────────────────
+[ResidualModel]
+AI2SigmaBaseM = 0.03
+AI2ClutterFrac = 0.15
+AI2ClutterScaleM = 0.12
+AI2PriorPosStd = 0.50
+AI2PriorYawStd = 1.57
+AI2PriorSizeStd = 0.50        # broad — a residual has NO shape prior
+# Process noise = how much the TRUE state drifts per frame. A physical obstacle is RIGID + STATIC, so — as in
+# table/chair/bottle — shape process noise is small and EVIDENCE ACCUMULATES: the posterior precision grows
+# with every frame, so the per-frame Kalman gain on w/d/yaw falls and the box only changes when NEW evidence
+# rivals the ACCUMULATED evidence (what stabilises the shape). The old values (pos .02/yaw .10/size .06) were
+# 10–120× the other concepts — they re-inflated Σ each frame so the box re-fit ~80% to the instantaneous
+# cluster OBB → shape jitter. Fission is NOT modelled here as drift: when a specialist carves the cluster the
+# POINTS vanish → sustained counter-evidence → the belief yields through the dissolve/tracker path, not a
+# standing covariance leak. Size kept a touch looser than chair's 0.0005 (a residual envelope refines as more
+# of an unknown object is seen), but tight enough that growth is deliberate, not per-frame chasing.
+AI2ProcessStdPosM = 0.01
+AI2ProcessStdYaw = 0.01
+AI2ProcessStdSizeM = 0.005
+AI2CommonModePosStd = 0.03
+AI2CommonModeYawStd = 0.20
+AI2CommonModeSizeStd = 0.03
+AI2GnIters = 5
+MinSize = 0.05
+MaxSize = 4.0
+# Per-point reliability covariates (AI2): R_i = σ² + (RangeNoiseCoeff·range)² + (EgoMotionLagS·rot_rate·range)².
+# Far and rotation-smeared returns get high R → the box widens Σ instead of chasing them (stops the far
+# fragments from wandering as the robot advances). range = horizontal distance from the sensor origin.
+RangeNoiseCoeff = 0.01        # extra std (m) per m of range
+EgoMotionLagS = 0.05          # effective registration lag (s): rotation smear = lag·rot_rate·range
+LidarFrameNode = "helios"
+UseBpearl = false   # the Husky has no bpearl: helios + ZED only. The floor datum then stays z = 0 (flat field)
+                               # floor-grazing artefact (phantom floor ring round the robot) is removed by a
+                               # device-specific higher floor band — see Clusterer.BpearlFloorZ0.
+AI2CsvPath = "etc/residual_ai2.csv"   # per-cycle belief CSV (state + Σ diag + zed_pts); empty = off
+
+# ── Clusterer (LiDAR residual filter + 3D DBSCAN — the perception front-end) ───
+# Floor/ceiling/walls/robot are treated as SPECIALISTS (explainers), not thresholds: the residual is every
+# return the room+object models don't explain. The floor's tolerance GROWS with range (grazing physics).
+[Clusterer]
+FloorZ0 = 0.25   # FIELD (Husky): was 0.06 (indoor). Ground band for the ZED and the grid default: clods, low grass and ground noise are not obstacles
+# The LOW bpearl lidar (~0.1 m) grazes the floor at shallow angles even near the robot, so its floor-height
+# uncertainty is larger → without this it rings the robot with phantom floor obstacles. bpearl points below this
+# band (grown by FloorSlope·range) are dropped as floor; above it (real low obstacles helios misses) are kept.
+# Cost: bpearl no longer flags obstacles shorter than ~this near the robot. Watch the [bpearl-floor] log.
+BpearlFloorZ0 = 0.12          # device-specific floor band for bpearl only (> FloorZ0)
+HeliosFloorZ0 = 0.25          # FIELD (Husky): was the 0.20 default. Same ground band as FloorZ0 for the helios
+FloorSlope = 0.04             # REVERTED 0.10→0.04: the 0.10 band-aid was for the MIS-CALIBRATED floor (now fixed
+                              # upstream by lidar-height recalibration). At 0.10 the band reached 0.38 m @3m / 0.58 @5m
+                              # and was EATING the table LEGS at range → only the flat top survived → it fragmented.
+                              # 0.04 keeps a tight floor band so the legs survive and cluster with the top (leg-
+                              # supported volume = one stable box) — and low obstacles are preserved too.
+# FIELD (Husky): the obstacle band ends at the ROBOT'S OWN HEIGHT (mast + GPS antenna = 1.02 m) + margin.
+# Nothing above it can be hit, and it is the part of a person (torso, head: 1.0-1.8 m) that the helios — at
+# 0.95 m, beams -55..+15 deg — almost never crosses again once they walk away, so it stayed latched as an
+# unobservable cell (`zheld`) and left a trail behind every worker (205 such cells, all at 1.0-1.8 m, in the
+# 2026-10-01 run). Legs and hips (< 1.1 m) still mark — and are re-crossed by the downward beams, so they clear.
+CeilZ = 1.10
+RobotRadiusM = 0.45
+WallMarginM = 0.35            # room delimiting-polygon wall model tolerance
+ExplainMarginM = 0.05         # object-surface claim tolerance (≈sensor noise; tight so on-table survives)
+# Object collapse is a SOFT marginalisation, not a margin: explained-probability = Φ(−sdf/σ_tot), where σ_tot is
+# the object's OWN published position covariance (rt_covariance, which already includes the localisation-chain
+# term → a distant object's uncertainty grows with range through the graph) convolved with the sensor noise
+# below. No k, no floors. Watch the [collapse] log for each object's live σ. If a distant table still isn't
+# clearing, the root cause is upstream (its published covariance is overconfident / chain-cov off), not here.
+ExplainSensorSigmaM = 0.03      # irreducible LiDAR range noise (m): the only constant, a named physical quantity
+# The soft collapse crosses 0.5 exactly at the object's model-box edge, so on its own it can't clear cells the
+# box doesn't reach — table legs / box corners leak and inflate into a clearance halo. This claims M metres PAST
+# each object box edge to absorb a known under-fit. SAFETY-NEUTRAL while M < the planner's object clearance
+# (≈ half robot width, inflate_radius_m=0.25): that zone is already no-go via the OBJECT, so masking the
+# redundant residual there is free. Keep < 0.25. Upstream cure = the fitter covering the true extent. 0 = model-exact.
+ExplainFitMarginM = 0.10
+DbscanEpsM = 0.30             # ↑ 0.20→0.30: a downward-LiDAR tabletop is painted as concentric rings spaced just
+                              # above 0.20 → it flickered into 1-5 arc slivers. 0.30 bridges the ring gaps into ONE
+                              # cluster. Lower toward 0.22 if genuinely-separate objects (chairs near the table) merge.
+DbscanMinPts = 10   # FIELD (Husky): was 4. Demand point MASS to seed a cluster
+DbscanZScale = 0.35           # compress z so vertical layers of ONE object connect (anti-split); xy unchanged
+MinClusterPts = 30   # FIELD (Husky): was 6. A row, a person or a robot returns hundreds
+                              # is now done by the evidence-based lifecycle: a spurious small cluster gets carved
+                              # away by see-through evidence, a real small object sustains. So we can let small
+                              # boxes through here. Raise again only if genuine noise specks start birthing.
+# Navigation fragment-merge: two obstacles closer than the robot can pass between ARE one obstacle for
+# navigation, so any two clusters whose closest footprint points are within (RobotWidthM + MergeExcessM) are
+# unioned into ONE box+hull. This coalesces a LiDAR-shattered tabletop (concentric ring-arcs) into a single
+# coherent obstacle using LiDAR alone — so it holds every cycle even when the ZED FoV swings away. Merging a
+# chair pushed against the table is fine/desired (the robot won't fit between them). Set RobotWidthM=0 to off.
+# STOPGAP 2026-07-06: dropped 0.60→0.35. At robot-width (0.60) the merge transitively CHAINED a whole row of
+# distinct cubes into one giant convex box that over-blocked the free space around them. A near-horizontal
+# LiDAR grazes a cube in the same thin band as a tabletop, so shape/z can't tell "one shattered surface" from
+# "distinct objects a robot-width apart" — gap-merging can't cleanly separate them. 0.35 (just above DBSCAN
+# eps 0.30) bridges only tight single-surface fragmentation and leaves spaced objects individual. The proper
+# fix is PLANNER-side clearance: perception publishes tight individual boxes, the planner inflates each by the
+# robot radius (C-space), so narrow gaps auto-close without a merged box. Set RobotWidthM=0 to disable merge.
+RobotWidthM = 0.0             # MERGE OFF (regression triage 2026-07-07): the merge was chaining distinct clusters
+                             # into a room-sized blob that swallowed the cubes. Distinct objects stay separate;
+                             # "can't-fit-between" clearance belongs to the planner (C-space). Re-enable only if a
+                             # single shattered surface (tabletop) genuinely needs coalescing, at a small gap.
+MergeExcessM = 0.0           # extra bridge beyond the base gap
+MinVerticalExtentM = 0.30   # FIELD (Husky): was 0.05. A person crouching is > 0.5 m; a 5 cm lump is not worth avoiding in a field
+                              # it has <5 cm vertical extent AND is low. Above the floor band a ~5 cm object now
+                              # survives. (Lower toward 0.03 for even shorter, but that approaches the LiDAR floor-
+                              # noise band → risk of floor-smear phantoms; the floor band below is the deeper limit.)
+MinTopZM = 0.30               # ...an elevated flat sheet with top ≥ this (a tabletop) is a REAL obstacle → KEPT
+
+# ── ZED dense-depth boost ─────────────────────────────────────────────────────
+# When a residual box falls in the ZED FoV, project it into the depth image, backproject the depth in that
+# pixel region, keep the points inside the box (reject background), and add them to the belief likelihood —
+# a much denser signal than LiDAR for forward objects (the ZED sees ~110° / ~5 m; LiDAR still covers 360°).
+[Grid]
+# Temporal low-pass on the PUBLISHED belief field only (the heatmap + what the planner reads); the safety
+# occupancy latch is untouched (instant completeness preserved). ASYMMETRIC so risk is never lagged: a cell's
+# published risk RISES at FieldEmaUp (=1 → instant) and only FALLS at FieldEmaDown (slow → flicker holds risk,
+# stable). Lower FieldEmaDown = stickier/steadier field (but slower to clear a genuinely departed obstacle).
+FieldEmaUp   = 1.0    # blend toward higher risk (1 = instant; leave at 1 for safety)
+FieldEmaDown = 0.30   # blend toward lower risk per ~2 Hz publish (0.30 ≈ ~1 s settle; ↓ = steadier)
+# MOTION STABILITY. A far LiDAR hit is unreliable (angular footprint + localisation lever arm both grow with
+# range) and a moving robot's pose jitter makes far cells flicker. Evidence is scaled by ego-motion trust
+# 1/(1+|v|/MotionVel0+|ω|/MotionOmega0) AND a per-hit range weight r0²/(r0²+r²). Near/still hits keep full weight
+# (latch in one frame — completeness); far/while-moving hits accumulate over several frames (no phantom flicker).
+MotionVel0   = 0.5    # linear speed (m/s) at which sweep trust halves
+MotionOmega0 = 0.6    # yaw rate (rad/s) at which sweep trust halves
+# ── FORGETTING: evidence loses precision with time since last observation ──
+# Before this the grid accumulated monotonically. A cell observed by NEITHER a hit nor a miss got no update at
+# all, so anything ever latched behind an occluder was IMMORTAL — the symptom being residual mass parked in
+# front of a closed door, which no clearing beam can ever reach. beta_kappa_max did not help: it scales α and β
+# TOGETHER, so it caps confidence while preserving the mean. Now an unobserved cell relaxes toward the prior at
+# this half-life: P → 0.5 and Var → max, i.e. "I no longer know" — which is also what finally makes Var[P]
+# usable as the epistemic term (stale space becomes attractive to re-observe). Continuously-observed cells are
+# unaffected; live evidence beats decay every cycle (self_test property 7). 0 disables it (never forget).
+# Live run showed 'forgotten' ~0-1 cells/cycle at 30 s: a cell at the log-odds clamp needs
+# log2(l_clamp/occ_set) = 3.6 half-lives to un-latch, so 30 s meant ~109 s before stale mass cleared —
+# far too slow to matter. 10 s gives ~36 s, which is in the usual costmap range.
+ForgetHalfLifeS = 10.0   # ↓ = forgets faster; ↑ = stickier map
+# ...and forget OCCUPANCY ONLY. Symmetric decay also un-learns FREE space: a well-cleared cell sits at P≈0.012
+# (alpha=0.5, beta=39.5) and relaxing BOTH toward Jeffreys drags it back toward 0.5, so the map quietly forgets
+# free space it paid beams to establish. That is invisible in the polygon channel (lo_ decays toward 0 from below
+# and can never cross the positive occ_set, so a free cell cannot re-latch) but it IS published in the field
+# channel, which five concept agents read for birth-surprise gating. octomap's OcTreeStamped::degradeOutdatedNodes
+# makes exactly this distinction. Stale-mass removal is unchanged bit-for-bit: every cell the old rule could
+# un-latch has lo_ > occ_set > 0 and still decays. Measured 2026-08-19: decay was doing 42% of ALL un-latching,
+# so the term is load-bearing — the fix is to narrow WHAT it touches, not to lengthen the half-life.
+# Watch `decayed` and `held` in grid_diag.csv: held/(decayed+held) is the share of the unobserved map the old
+# symmetric rule was un-learning every cycle. false = the old behaviour, for A/B.
+ForgetOccupiedOnly = true
+# ...and forget only where a beam ACTUALLY REACHED this cycle. Measured live 2026-08-20: 750 of 2548 occupied
+# cells (29%) were decaying every cycle purely because nothing was looking at them, and at a 10 s half-life a
+# latched cell reaches occ_set after ~36 s unobserved — so an obstacle you drive away from vanishes from the
+# published map in half a minute, in an apartment where it has certainly not moved. The decay could not tell
+# "I stopped looking" from "it left", and treating those the same invents evidence we never collected.
+# The ray-DDA already knows the difference: slook_ marks every column a beam passed through, recorded BEFORE the
+# z-aware gate can reject that beam as free evidence, so it is a statement about VISIBILITY not occupancy.
+# Looked-at-and-not-confirmed decays; never-reached is held. This is what STVL does with a frustum test, but
+# derived from the real rays — which also repairs STVL's documented weakness (a point-in-cone test has no
+# occlusion model, so a voxel behind a wall gets punished as if it had been observed).
+# COST: a cell in a region the robot never revisits is now held indefinitely. That is the correct posterior for
+# "no information", and one return re-decides it the moment the robot goes back — but the time decay is no
+# longer a blanket garbage collector. Watch `unseen` vs `decayed` in grid_diag.csv. false = old behaviour.
+ForgetVisibleOnly = true
+# ...and erode at the PRECISION the failed observation actually had. Every hit and every miss in this grid is
+# already scaled by w(r)=r0^2/(r0^2+r^2) (r0 = Grid hit_reliable_range_m = 2.5 m) — deliberately, so a far
+# see-through barely clears and a distant obstacle PERSISTS until the robot closes on it. The decay was the one
+# term that ignored range: at 8 m everything defending a cell ran at 0.089 of full strength while the term
+# eroding it ran at 1.0, an 11x mismatch pointing at erasure. Same defect as a constant process noise — the rate
+# of forgetting must carry the covariate the rate of learning carries. "I looked from 8 m and did not confirm"
+# is weak evidence of absence (the beam may have passed BESIDE the obstacle) and must erode the posterior weakly.
+#   gamma_cell = 1 - (1 - gamma) * w(r),  r from the robot to the cell.
+# Near cells keep the configured half-life exactly; far cells forget proportionally slower. No new parameter.
+# Watch `decay_w` in grid_diag.csv: the mean w(r) of the cells being decayed. Well below 1 = the decaying
+# population is mostly distant and is now eroding slowly, which is the point. false = old range-blind behaviour.
+ForgetRangeWeighted = true
+# ...and the decay may NEVER remove a cell on its own. Measured 2026-08-22 on the live run: while the robot was
+# parked the map was rock stable (35 latch/release events per 200 cycles); the moment it started driving the whole
+# ~1200-cell map turned over 17 times in 4 minutes (21010 latched / 20782 released), and the published residual
+# set collapsed from a solid 193-cell obstacle at z=0.73 m, stable for 5000 cycles, to 0-45 flickering cells.
+# The decay released a latched cell as soon as lo fell back below occ_set (+0.40) — three times easier than the
+# occ_clear (-1.20) that free-space EVIDENCE has to clear, and reached without one beam ever contradicting the
+# obstacle — and that release ALSO wiped the cell's z-band, which is the only thing stopping the 94% of clearing
+# traffic that flies over and under an elevated obstacle from counting as see-through. So one forgetting release
+# flipped those beams from "carries no information" to "clears at full weight" and drove the cell to the -5 clamp.
+# Now: an occupied cell is released ONLY by accumulated evidence of FREENESS — see-through beams that actually
+# passed through its own z-band, each weighted by the precision w(r) it was collected at, summed against
+# everything the cell has banked (up to l_clamp) until lo < occ_clear. The decay keeps its other job, the belief
+# FIELD: P -> 0.5 and Var[P] -> max, so a stale cell becomes epistemically attractive and the robot is sent to
+# LOOK at it. Going to look is what should retire it.
+# COST, stated plainly: a cell nothing can ever observe again — mass latched behind a door that then closed — is
+# now immortal in the polygon channel. Deliberate: a safety layer under maximum uncertainty must call a cell
+# occupied. Watch `zheld` (new column in grid_diag.csv) = occupied cells whose only beams this cycle flew over or
+# under them; and `forgotten`, which must now stay 0 — nonzero means someone re-enabled the coupling.
+ForgetCanUnlatch = false   # true = the pre-2026-08-22 coupling (decay erodes lo_ and may release), for A/B
+# ── A GRAZING BEAM IS NOT A REFUTATION ────────────────────────────────────────────────────────────────────────
+# The table in the middle of the room cannot be removed unless it flies (it does not) or a table_concept claims
+# it (none is running). Measured on a simulated table driven through this exact grid with the real mounts
+# (helios upright 1.075 m, plate 0.75 m, robot circling at 1.6 m): the footprint was destroyed 2799 times in 900
+# cycles and held only 284 of its 384 cells; cells that had stood 402 cycles died in a handful. The release trace
+# named the killer exactly — band[0.75,0.75], clear_z = 0.76-0.82: beams skimming 1-7 cm ABOVE the plate they
+# were about to hit, inside the 0.10 m z_band_margin, each counted as a full-weight see-through. At 1 m range the
+# beam descends only 18 deg, so it crosses four or five plate cells within 2 cm of the surface before terminating
+# ON that surface. A flat surface at grazing incidence therefore erases itself.
+# Two terms replace the binary gate with P(this beam would have been BLOCKED), the same construction as
+# FloorResponsibility and the refrigerator's wall explain-away:
+#   1. p_block  - the material remembered here spans [zmn - k*sigma, zmx + k*sigma]; a beam outside it could not
+#                 have been stopped, so it refutes nothing. sigma is measured (range noise + the localisation
+#                 lever arm), not a tolerance.
+#   2. p_surface - if this cell's remembered top lies between the beam's height here and where the beam ENDED,
+#                 one continuous surface explains both the skim and the return, and the crossing carries nothing.
+# The hard z-gate is KEPT as the support of both, so they can only ever REDUCE a clearing weight: a strict
+# tightening, no new false-frees on a live safety layer.
+# A/B, 900 matched cycles: releases inside the footprint 2423 -> 36, cells held 284 -> 382 of 384, and open-floor
+# phantoms (21) and wall coverage (117) IDENTICAL in both arms. Control: a table CARRIED AWAY at cycle 500 still
+# cleared completely within ~100 cycles, so this is not a leak. Watch clear_surf in grid_diag.csv — with a table
+# in the room it must be NONZERO, and zero means grazing beams are still erasing flat surfaces.
+# ── 3-D VOXEL SENSOR MODEL (costmap_2d::VoxelLayer / STVL / OctoMap, with grid2d's log-odds rule) ──────────────
+# REWRITTEN 2026-08-22 after the robot drove into a table. The root error was running the inverse sensor model in
+# 2-D and reintroducing height as a per-cell z-band with compensating terms bolted on. EVERY failure of the last
+# three sessions — grazing beams erasing a tabletop, hollow objects, columns polluted by one stray return, the
+# blind near cone read as free, floor returns carrying no evidence — was an artifact of collapsing to 2-D BEFORE
+# the sensor model. The ray is now traced in 3-D over voxels and the 2-D cell is a PROJECTION of its column.
+# Deleted as unnecessary, not patched around: the z-band clearing gate and its margin, the soft blocking
+# probability, the sensor-envelope model and its whole [LidarField] block, the floor-return special case and its
+# support gate, and the running zmn/zmx hull. All of it falls out of the geometry.
+BinSpanM = 2.0        # height covered by the 64 voxel bins ⇒ 3.125 cm voxels. Matched to the ~3 cm registration
+                      # sigma: finer buys nothing, because below that the beam is genuinely within noise of the
+                      # surface. Measured: 6.25 cm → 2530 releases on a standing table, 3.125 cm → 1337.
+# DO NOT CLEAR CLOSE TO THE HIT. A voxel is 3 cm tall and a tabletop is 2 cm thick, so a beam grazing just over a
+# plate can still be inside the plate's own voxel — the documented VoxelLayer weakness. costmap_2d guards it by
+# not clearing the endpoint cell. Two guards, both parameter-light: this metric margin, and the rule that a voxel
+# holding material at the SAME height (±1 bin) as the voxel the beam stopped in is plausibly the very surface
+# that stopped it, so the crossing refutes nothing. A beam ending on a wall is untouched (those voxels hold no
+# material); a table that has GONE is untouched (its beams now end on the floor, a different bin).
+# A/B on the probe: 1337 → 442 releases inside the footprint at 3.125 cm. 0 disables BOTH (textbook VoxelLayer).
+ClearStopMaxM = 0.10
+# A cell may only be called FREE on the strength of the column the sensors actually resolved — but only over the
+# height where an unseen obstacle would be HIT. helios at 1.075 m cannot see below 0.65 m at 0.3 m range, so
+# sweeping past a chair leg there is not evidence it is absent. Scored in 4 sub-bands, not voxel by voxel: a
+# 32-layer lidar has ~10 cm beam spacing at 2.5 m and can never touch every 3 cm voxel, and demanding that
+# reported most of the map as unknown. 0 = no discount (the blind cone reads free, as costmap_2d does).
+CollisionBandTopM = 0.50
+# ── NOTHING INSIDE THE LIDAR CLEARANCE RADIUS MAY BE CLEARED ──────────────────────────────────────────────────
+# Every ray starts inside the disc the lidar3d driver self-filters and marks its way out — weighted by w(r),
+# which is LARGEST at r = 0. So the ring of cells the robot is standing in was being cleared at the highest
+# weight in the grid, in the one place no sensor can see. That is what deleted a table the moment the robot
+# closed on it. The rule is about the ROBOT, not one sensor's minimum range: it holds for the forward-mounted
+# ZED exactly as for the two lidars, and it is measured from the robot to the cell, not along the ray.
+# Match it to the lidar3d driver's [Footprint] radius, the same number SelfBodyRadiusM uses, so both agree on
+# one body model. Watch `blind_shell` in grid_diag.csv — it must be NONZERO whenever the robot is moving.
+LidarClearanceM = 0.55
+# FIELD (Husky): the plain ray model. A cell is OCCUPIED only where an obstacle return landed this cycle and FREE
+# wherever a beam crossed it in the nav band without returning; cells no beam reached keep their state. The
+# indoor model (per-height refutation, stiffening, hysteresis, range-weighted misses) assumes a mostly static
+# room and left every place a worker had stood as a phantom (~160 cells in empty corridors, the robot wedged).
+FreeAlongBeam = true
+# ...integrated as a 2-D log-odds per cell (+0.85 a hit, -0.40 a crossing) clamped to +-BeamMemoryLogOdds: a cell
+# a worker left clears after ~5 crossing sweeps (~0.5 s); foliage struck in one sweep out of three stays put.
+BeamMemoryLogOdds = 2.0
+
+# ── THE ROBOT'S OWN SHAPE (Husky) ────────────────────────────────────────────────────────────────────────────
+# "robot" = discount returns off the robot's real footprint (body width_m/depth_m, measured from husky_a300.obj:
+# 0.685 x 0.99 m) + SelfBodyMarginM, as a box centred on the ROBOT with its heading — not the SelfBodyRadiusM
+# disc around the LiDAR. The helios sits on a mast 25 cm behind the centre, so that disc left the front ZED
+# outside the body and the helios' hits on it became occupancy right in front of the robot (2026-10-01).
+SelfBodyShape = "robot"
+SelfBodyMarginM = 0.05
+
+# ── SPECKLE: a lone residual cell nothing is returning from any more ──────────────────────────────────────────
+# The live steady state was `resid=8 ncomp=0` — eight residual cells in components of ONE, each shipped to the
+# controller as an obstacle with nothing behind it. See residual-grid-polygons-per-cell-fence: 65 "obstacles",
+# all smaller than the robot footprint, shred free space rather than blocking it.
+# ★THIS IS A SIZE THRESHOLD and the model cannot derive it — flagged, as the rule requires. The cost is real: a
+# chair leg, a table leg or a pole narrower than the 5 cm cell occupies exactly one cell and this deletes it.
+# What makes it defensible is the EXEMPTION, which is the honest discriminator: a real thin obstacle is being
+# STRUCK cycle after cycle, while a phantom has merely failed to be refuted. A lone cell therefore ships for as
+# long as a return has recently landed in it — a statement about evidence arriving, not about size.
+# One pass over a snapshot, never iterated (erosion applied to its own output would eat a pair, then a line, and
+# so on down). At MinNeighbours = 1 a two-cell pair survives: the rule is "alone", not "small".
+# Watch `speckle` in the [grid] log against the residual count. 0 ⇒ off, every residual cell ships.
+SpeckleMinNeighbours = 2   # FIELD (Husky): was 1. An isolated cell or pair does not reach the planner
+SpeckleGraceCycles   = 10   # ...unless a return landed in it within this many cycles (~1 s at Period.Compute=100 ms)
+# ...and the same rule one scale up: an ISOLATED CLUMP. MinNeighbours can only ever remove a SINGLETON — a
+# diagonal pair defends itself and so does every 3-cell L — but the map that stops the planner is not made of
+# singletons. Measured 2026-09-03 over a 5.4-minute run: the published set held 27-33 connected components for a
+# steady 553-673 cells, ~300 of them more than 0.75 m from any wall. A component smaller than this is dropped
+# UNLESS one of its cells is still being STRUCK (same exemption, evaluated per COMPONENT so a real obstacle is
+# never eroded from its edges). Raise it to sweep harder; the cost is that a genuine object returning fewer than
+# this many cells AND not currently struck stops shipping, so it trades completeness — read `speckle` in
+# grid_diag.csv against `resid` in floor_diag.csv before raising it further. 0 or 1 ⇒ off (singleton test only).
+SpeckleMinComponentCells = 12   # FIELD (Husky): was 3 (7x7 cm). ~0.03 m2; a person footprint is ~50 cells of 5 cm
+# ── EVIDENCE IS WEIGHTED BY HOW WELL THE ROBOT IS LOCALISED ───────────────────────────────────────────────────
+# w(r) carries the sensor's geometry and MotionVel0/MotionOmega0 carry the robot's SPEED, but until now nothing
+# carried the POSE the sweep was registered through — and a standing robot scores speed-trust 1.0, which at
+# startup is exactly backwards: the stillest sweeps of a run are the ones the localiser has not converged for.
+# With l_hit·w(r) > occ_set at every range under ~2.65 m, one mis-registered return latches a cell in ONE frame,
+# and ForgetCanUnlatch=false means it then leaves only by a see-through beam through its own z-band (measured
+# median release age 371 cycles ≈ 37 s). That is where a startup floor of phantoms comes from.
+# No burn-in timer: the covariate is measured and already published. room_concept writes the SE(2) pose
+# covariance on the room→robot RT edge, so a return at range r carries σ_pos² + (r·σ_θ)² of extra room-frame
+# position variance and is weighted σ_ref²/(σ_ref² + that) — the same precision ratio as every other term here.
+# Converged pose ⇒ 1.0, so the one-frame latch for a NEAR hit (the safety property) is preserved bit-for-bit.
+# Hits and misses alike: a sweep through a bad pose is no better at refuting than at confirming.
+# ★Watch `pose_damped` in grid_diag.csv: it must be LARGE early and fall toward 0 as the localiser converges. A
+# whole run at 0 with pose_sig_pos/pose_sig_th also 0 means the RT edge carries no rt_covariance and the term is
+# silently inert — that is the failure it exists to prevent, not a null result. false = the old behaviour, for A/B.
+PosePrecision = true
+# Per-cell residual geometry (x, y, z, inside_poly, dist_wall_m, obj_sdf_m) → etc/residual_cells.csv every N
+# cycles. ↓600→25 on 2026-09-03: at 600 the FIRST dump was cycle 600, so the file could say nothing whatever
+# about the startup burst it was needed for (222 cells latched in cycle 0, ~2000 within two seconds). 25 covers
+# cycles 0-150 at ~600 rows each. Put it back to 600 once the startup window has been read. 0 = off.
+CellDumpEveryN = 25
+
+# Per-released-cell trace: which residual went, and what killed it. A standing table must produce NO rows inside
+# its footprint. Empty = off.
+ReleaseCsvPath = ""   # diagnostic, off by default: "etc/residual_releases.csv"
+
+# ── EACH DEVICE'S DEAD SHELL: a beam cannot refute what the sensor could not have seen ────────────────────────
+# Every ray starts AT the sensor, so the raytrace marks the voxels around the robot free — weighted by w(r),
+# which is LARGEST at r = 0. The near field, where the lidar is blind, was therefore being cleared hardest of
+# all. Below its minimum range a device returns nothing whatever is standing there, so a ray "passing through"
+# that shell is not an observation and must carry no free evidence. This is what deletes a table the moment the
+# robot closes on it. Going to 3-D did not fix it on its own — the rays still pass through those voxels.
+# Watch `blind_shell` in grid_diag.csv: working close to furniture it must be NONZERO.
+[LidarModel]
+HeliosMinRangeM = 0.40   # RS-Helios datasheet minimum
+BpearlMinRangeM = 0.10   # RS-Bpearl is a near-field dome
+ZedMinRangeM    = 0.30   # matches ZedBoost.MinDepthM
+# ── EACH DEVICE'S VERTICAL SAMPLING INTERVAL: how much of a column ONE crossing may refute ────────────────────
+# See OccGridParams::beam_spacing_rad. A voxel is 3.125 cm tall; helios's rings are 2.26 deg apart, which is
+# 8 cm at 2 m and 12 cm at 3 m. Marking a return into one 3 cm voxel is right — a return is a point measurement.
+# Demanding that a CLEARING ray pass through that same 3 cm voxel is not: between two ring lines 8 cm apart most
+# rays never do, so a voxel once marked was refutable only from the narrow band of poses that puts a ring line
+# through it. MEASURED on tools/grid_dynamics_probe.cpp (real helios fan, robot orbiting): after the obstacle was
+# carried away its cell sat at lo = +5.79 BIT-IDENTICAL for 150 cycles while the map applied 320 000 refutations
+# a cycle — none of them touched that voxel. That one asymmetry is all three live complaints at once: floor
+# speckle that never dies, an obstacle removed minutes late, a footprint that accretes over half a minute.
+# A crossing now refutes the bins within ±(spacing·t)/2 of its height, and HIT PRECEDENCE is applied over the
+# same footprint so a surface still being struck cannot be widened away.
+# A/B on the probe (0 = the old pencil): standing obstacle 33 → 39 of 64 cells · removal 19.5 → 3.7 s to half ·
+# a person who stood 3 s left 21 phantom cells NEVER cleared in 90 s → gone in 15.4 s. 0 ⇒ old behaviour.
+HeliosBeamSpacingRad = 0.0394   # RS-Helios-32: 70 deg over 31 gaps
+BpearlBeamSpacingRad = 0.0506   # RS-Bpearl-32: ~90 deg dome over 31 gaps
+ZedBeamSpacingRad    = 0.0068   # dense depth at ZedBoost.FovSubsample=4 — effectively a pencil, as it should be
+
+[ZedBoost]
+Enabled = true
+FeedDetection = true    # RE-ENABLED 2026-07-08: the mega-blob was the MERGE (now off), not ZED (only 79 pts survive
+                        # infra-subtract). With merge off, dense ZED is the RIGHT way to coalesce a real surface
+                        # (fills the tabletop so it clusters as ONE table) without chaining distinct objects — and
+                        # it covers the near-field-ahead LiDAR blind zone. Watch [cluster] max_npts for any blob.
+FeedGrid = true         # feed the dense ZED FoV into the OCCUPANCY GRID as a 2nd sensor (own camera ray origin).
+# (Grid.FieldEma* live in the [Grid] section below — temporal low-pass on the PUBLISHED belief field.)
+                        # LiDAR rings only GRAZE horizontal surfaces so tabletops never fill; ZED covers them
+                        # densely → the tabletop shows AND the per-cell evidence makes the costmap stable. OFF to A/B.
+# Robust ZED infrastructure subtraction: a point is floor/ceiling/wall if within k·σ(range) of it, where the
+# ZED stereo depth noise σ(r)=Sigma0M + SigmaQuad·r² (physical, grows with range²). Absorbs a small ZED depth
+# calibration offset AND far-range blur so a dense floor/wall sheet can't survive and bridge objects into a blob.
+InfraSigma0M = 0.03     # depth-noise floor (m): near-range noise + calibration offset
+InfraSigmaQuad = 0.006  # depth-noise range² coeff (m per m²): σ = Sigma0M + SigmaQuad·range²
+InfraK = 3.0            # band width in σ (↑ for a wider, safer subtraction if floor/wall still leak)
+InfraWallMarginM = 0.10 # base wall tolerance, grown by k·σ (walls are a hard boundary → generous is safe)
+SigmaM = 0.02      # per-ZED-point obs noise std (m) → R (ZED close depth is crisp; ↑ to trust it less)
+Subsample = 3     # take every Nth pixel (dense depth → keep the point count bounded)
+XyMarginM = 0.10  # keep a backprojected point within this of the footprint edge
+ZMarginM = 0.10   # ...and within this of the box z-band
+MinDepthM = 0.30  # ZED near limit
+MaxDepthM = 5.0   # ZED depth degrades with range² — ignore beyond this
+MaxPoints = 1500  # cap per instance (bounds the GN fit)
+
+# ── RGB-SEMANTIC floor down-weighting (2nd, uncorrelated cue vs ZED floor phantoms) ──
+# The retina's dense YOLO-sem label map (ADE20K-150) on the `semantic` node under `zed` is sampled per surviving
+# ZED grid-point (reproject → exact pixel). A FLOOR-class label at a NEAR-floor return down-weights its occupancy
+# HIT, so a phantom floor obstacle needs more evidence to latch. SAFE BY CONSTRUCTION: down-weight only (never
+# discard), HEIGHT-GATED (a clearly-elevated obstacle keeps full weight regardless of label), and FRESHNESS-decayed
+# (the 2 Hz map loses authority with age). Complements the geometric floor rejection (nav-band + infra-subtract).
+[Semantic]
+DownweightFloor = true   # master flag — ON (flipped 2026-07-12; ZED `semantic` node confirmed live).
+FloorSuppress   = 0.60   # max hit-weight reduction for a floor-class near-floor point (weight = 1 − this = 0.40)
+HeightScaleM    = 0.15   # a floor label's authority decays as exp(−(h/scale)²) over height h above the floor band
+FreshHalfLifeS  = 0.50   # suppression strength halves per this much map age (freshness-as-precision; 0 = no decay)
+# ADE20K-150 walkable-ground class ids (the ground/soil concept is split across several classes → list ALL synonyms
+# or the segmenter's choice among them leaks a floor phantom). Default set below; edit to match your model.
+# 3 floor · 6 road · 9 grass · 11 sidewalk · 13 earth/ground · 28 rug · 29 field · 46 sand · 52 path · 54 runway
+# · 91 dirt-track · 94 land/soil. Excluded on purpose: 53 stairs / 59 stairway / 121 step (hazards, not floor-flat).
+FloorClassIds   = "3,6,9,11,13,28,29,46,52,54,91,94"
+
+# ── DATA-DRIVEN FLOOR PLANE (fixes systematic floor phantoms in a NEW scenario) ──
+# The grid's obstacle test uses a floor band referenced to room z=0. If a new room's floor is OFFSET or TILTED
+# vs z=0 (localization datum / uneven floor / room-fit pitch), a large floor swath reads above the band, latches
+# as obstacles, and the z-aware clearing makes it permanent → the robot can't navigate. This estimates the floor
+# plane z=a·x+b·y+c robustly from the LiDAR each cycle and references the band to it, so the floor is explained
+# away wherever it actually is. Flat z=0 floor ⇒ plane≈(0,0,0) ⇒ identical to the fixed band (no regression).
+# The estimator ALWAYS runs and logs `[floor-plane] z = a·x + b·y + c (offset .. cm, tilt ..°)` — read that FIRST
+# to see how far off the floor is; then flip Enabled=true to apply it.
+[FloorPlane]
+Enabled       = true    # master flag. false ⇒ log-only (fixed band kept). true ⇒ grid band follows the fit.
+CandidateBandM = 0.25   # a return within this ABOVE the current floor estimate is a floor candidate for the fit
+TrimK         = 2.5     # robust trim: drop candidates > k·σ(MAD) after each fit (rejects legs / low obstacles)
+Iters         = 2       # robust reweighting rounds
+MinCandidates = 80      # fewer floor candidates than this ⇒ keep the previous plane (never fit on noise)
+Ema           = 0.10    # temporal smoothing toward the new fit (slow = stable)
+MaxOffsetM    = 0.30    # reject a fitted |offset| beyond this (keep previous plane) — a sanity guard
+MaxTilt       = 0.15    # reject a fitted |tilt a,b| beyond this (~8.5°/m) — a sanity guard
+
+# ── Instance tracker (birth/associate/death) — TUNED FOR STABILITY (not bottle's crisp-mask values) ──
+# A residual's OBB centroid jitters as the robot sees different faces, and residuals are large & transient,
+# so: looser gate + higher detection noise (absorb the centroid jump so a re-observed obstacle ASSOCIATES
+# instead of spawning a duplicate), higher birth hysteresis (motion transients don't birth), larger
+# birth-separation (residuals are big → suppress near-duplicates), and a SHORT death (clear transients in
+# ~3 s instead of bottle's 9 s that piled up to 27 during motion).
+[Tracker]
+GateMahalanobis = 16.0        # ~4σ (looser than bottle's 9) — residual centroids are noisy
+GateFallbackM = 0.40
+BirthFrames = 8               # ↑ from 6 — a cluster must persist to birth (kills motion-transient births)
+DeathFrames = 30              # ↓ from 90 — transients clear in ~3 s; real obstacles are re-observed each pass
+BirthMinSepM = 0.40           # ↑ from 0.10 — residuals are large; suppress near-duplicate births
+DetectionNoiseM = 0.15        # ↑ from 0.05 — S=P+R²I absorbs the OBB-centroid viewpoint jump → re-associate
+MergeOverlap = 0.25           # collapse two boxes fitted to the same object (footprint overlap), keep more-observed
+NllCost = false
+DeathEnabled = false          # OFF — removal is the evidence-based occupancy carve ([Carve]), not a miss counter.
+                              # DeathFrames above is unused while DeathEnabled=false (kept for reference).
+ExpectedVisibleRangeM = 6.0   # (still used to hold out-of-range instances in other bookkeeping)
+
+# ── Occupancy-evidence removal (Bayesian ray-carving) — "compelling evidence it's not there anymore" ──────
+# Each cycle the LiDAR sweep is carved against every instance box along each beam (sensor origin → return).
+# A beam that reaches the box and STOPS INSIDE is occupancy evidence (still there → log-odds ↑); one that
+# passes clean THROUGH and returns from beyond is free-space evidence (gone → log-odds ↓); one that stops
+# SHORT is occluded (no evidence → HOLD); out of range / behind → no beams cross → HOLD. The surface test is
+# SOFT (Gaussian CDF over the belief Σ + sensor noise) — no hard margin. The per-cycle evidence is common-mode
+# saturated (one confident observation's worth) so N correlated beams can't delete in one frame. An obstacle
+# is removed only when the accumulated log-odds says the space is empty. Parameters are physical rates /
+# a risk tolerance, NOT tuning gates.
+[Carve]
+SensorSigmaM = 0.03           # LiDAR range noise σ (m) — surface-localisation blur along the beam
+DetectionProb = 0.85          # P(a beam through an OCCUPIED box returns from it) — sensor hit rate
+ClutterProb = 0.05            # P(a beam through an EMPTY box returns from inside anyway) — spurious rate
+RemovalProb = 0.12            # remove when P(occupied) < this (log-odds ≈ −2). RISK tolerance: smaller ⇒ more
+                              # compelling evidence required before deleting (fewer false removals, slower clear)
+OccupancyLogOddsMax = 4.0     # ± clamp on the accumulated log-odds (keeps evidence finite AND recoverable)
+

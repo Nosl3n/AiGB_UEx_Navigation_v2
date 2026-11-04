@@ -1,0 +1,294 @@
+/*
+ * route_follower.h — drives a mission as ONE continuous route in arc-length coordinates.
+ *
+ * Owns the whole-route curve and the single scalar that says where the robot is on it. It replaces the
+ * waypoint/target/arrival loop entirely: there is no "current waypoint" to reach, no arrival radius, and
+ * no per-waypoint replan. See route_spline.h for why that scheme could not be repaired.
+ *
+ * THERE ARE NO LEGS. The recorded waypoints define the route and nothing else; the trajectory is
+ * characterised by continuous quantities (cross-track error, lateral acceleration, speed variation)
+ * measured at every instant, not by aggregating waypoint-to-waypoint segments.
+ *
+ * LAPS ARE CONCATENATED, not re-issued. Handing the follower a fresh path each lap would reset the MPPI
+ * warm start at every lap boundary — the same defect as the per-waypoint replan, thirty times rarer but
+ * the same kind. One path for the whole run means the state is reset exactly once.
+ *
+ * Pure Eigen/STL — no Qt, no DSR → unit-testable in isolation (self_test()).
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <limits>
+#include <functional>
+#include <optional>
+#include <vector>
+
+#include <Eigen/Dense>
+
+#include "route_spline.h"
+
+namespace rc
+{
+
+// Everything RouteFollower::repair's two callers differ by, PASSED rather than stashed. At namespace
+// scope because a nested class's default member initializers cannot be used in a default argument of the
+// enclosing class — and the default argument is the point: ordinary repairs should say nothing at all.
+struct RouteRepairOptions
+{
+    // false = re-author the window even though nothing is blocking it. Only recovery wants that: putting
+    // a waypoint BACK is not a response to a blockage, so the guard that stops detour storms would
+    // refuse every recovery. Leave true for anything reacting to an obstacle.
+    bool require_blockage = true;
+    // One more via-point to route through, at the arc length it holds in the tour, so a reinstated
+    // waypoint is visited in the authored order rather than wherever a shortest path would put it.
+    std::optional<std::pair<float, Eigen::Vector2f>> extra_via;
+};
+
+class RouteFollower
+{
+public:
+    // Plans every waypoint-to-waypoint hop with `plan` (the grid planner, so each hop is
+    // footprint-feasible), repeats the route `laps` times, and fits one curve through the lot.
+    // `plan(from, to)` returns nullopt if that hop is unreachable, which aborts the build — a route with
+    // a hole in it is not a route.
+    using PlanFn = std::function<std::optional<std::vector<Eigen::Vector2f>>(const Eigen::Vector2f &,
+                                                                            const Eigen::Vector2f &)>;
+    using FreeFn = std::function<bool(const Eigen::Vector2f &, float)>;
+
+    bool build(const Eigen::Vector2f &start,
+               const std::vector<Eigen::Vector2f> &waypoints,
+               int laps,
+               const PlanFn &plan,
+               const FreeFn &is_free,
+               float spacing = 0.05f,
+               float smoothing_m = 0.40f);
+
+    // LOCAL REPAIR — re-plan a WINDOW of the route around a newly-discovered blocker.
+    //
+    // A route is built once and driven in arc length, so the old "reset current_plan_ and let the next
+    // cycle replan" recovery cannot work: there is no per-target replan left to trigger. Rebuilding the
+    // whole route instead is not the answer either — it re-plans every hop and, worse, resets `progress_`,
+    // so laps and finished() would believe the robot was back at the start. What actually changed is
+    // LOCAL: one blocker, on one stretch of curve. So re-solve locally and splice.
+    //
+    // The window is [progress − back_m, progress + ahead_m]: `back_m` because the robot has just reversed
+    // out and the detour must start somewhere it can reach, `ahead_m` because the detour has to clear the
+    // blocker and rejoin the route. Both are STATED ALLOWANCES (how much route may be re-authored), in the
+    // same sense as RouteSpline's smoothing scale — not safety numbers.
+    //
+    // `plan` must already see the new obstacle (the caller refreshes the planner grid every cycle).
+    // Returns false if the window is degenerate or no detour exists; the caller then holds, and may retry
+    // once the obstacle ages out. Waypoint arc lengths are re-derived and progress is re-anchored, so laps
+    // and finished() stay meaningful across a repair.
+    // NotNeeded is not a failure — it is the common case and the reason this is an enum. A recovery
+    // reflex fires on "something happened near the robot", which is NOT the same question as "is my
+    // route still drivable". Re-authoring a route that is still footprint-feasible is how a transient
+    // blockage turns into a permanent detour, and it was observed doing exactly that (13 repairs in 23 s,
+    // in places the robot had driven cleanly many times).
+    enum class RepairResult { NotNeeded, Repaired, Failed };
+    // See RouteRepairOptions. This was briefly a `bool force` plus a member set immediately before the
+    // call and cleared inside it — which made repair() a function of hidden state, and made the
+    // "consumed by repair" contract false on its four early returns.
+    RepairResult repair(const Eigen::Vector2f &robot_pos,
+                        float back_m,
+                        float ahead_m,
+                        const PlanFn &plan,
+                        const FreeFn &is_free,
+                        const RouteRepairOptions &opts = {});
+
+    // ── WAYPOINTS DROPPED AT BUILD, AND GETTING THEM BACK ────────────────────────────────────────
+    // A waypoint the planner cannot reach when the route is built is dropped so the tour stays drivable.
+    // That was the end of it: the drop was permanent, and it was SELF-FULFILLING — the waypoint leaves
+    // the route, so the robot never drives toward it, so the close-range evidence that would free it is
+    // never gathered. A door that was shut at t=0, a chair pushed out, a person standing in a doorway:
+    // all of them removed a waypoint for the whole mission however briefly they were there.
+    //
+    // So a drop is now a DEFERRAL. The waypoint is remembered with the place it holds in the tour, and
+    // re-offered when the robot comes near enough for the map about it to have actually changed —
+    // which is what makes this cheap: no timer sweeps waypoints the robot is nowhere near, and a
+    // waypoint that is never approached is never re-tested.
+    struct Deferred
+    {
+        Eigen::Vector2f pos;      // the authored waypoint, as recorded
+        std::size_t after_index;  // where it belongs in wp_pos_ — the tour order survives the drop
+        int attempts = 0;         // re-entry tries, so a permanently blocked one stops costing searches
+        // ★AN ATTEMPT IS SPENT ON DISTANCE, NOT ON TIME — see reinstate_deferred. The budget used to
+        // burn at the caller's rate (1 Hz) from the moment the robot entered `ahead_m`, so a 4 m radius
+        // approached at 0.5 m/s spent all four tries in the first four seconds, between 4.0 m and 2.0 m
+        // — the far half of the approach, which is exactly where the map is still the one that deferred
+        // the waypoint in the first place. The waypoint was then retired for the rest of the run BEFORE
+        // the close-range evidence that would free it had been gathered: the same self-fulfilling drop
+        // the deferral exists to prevent, arrived at more slowly.
+        // So a try is only made when the robot has come materially CLOSER than at the last one. This is
+        // the range at which the last try was actually charged.
+        float last_try_m = std::numeric_limits<float>::infinity();
+        // The closest the robot has EVER come while this waypoint was still ahead of it. Retirement
+        // reports it, so "retired at 3.2 m" (never actually approached) reads differently from
+        // "retired at 0.4 m" (genuinely walled off). A give-up that cannot say how near the robot got
+        // is not evidence of anything.
+        float closest_m = std::numeric_limits<float>::infinity();
+    };
+    int deferred_count() const { return static_cast<int>(deferred_.size()); }
+
+    // Re-test the deferred waypoints the robot is now approaching and splice back any that have become
+    // reachable. Cheap to call often — it only plans for a waypoint that is within `ahead_m` of the
+    // robot, still ahead of it on the route, AND at least one range step nearer than the last try — but
+    // the caller should still rate-limit, because a successful recovery re-authors a window and that is
+    // not free.
+    // After kMaxReinstateAttempts refusals a waypoint is retired: at some point "blocked" is the answer,
+    // and re-planning to it every approach is a search per cycle that buys nothing. The budget is spent
+    // in EQUAL STEPS OF RANGE (ahead_m / kMaxReinstateAttempts), never on a clock, so the last try is
+    // always made at the closest the robot actually gets — see Deferred::last_try_m for what that fixed.
+    static constexpr int kMaxReinstateAttempts = 4;
+    struct ReinstateResult { int tested = 0, recovered = 0, retired = 0; };
+    ReinstateResult reinstate_deferred(const Eigen::Vector2f &robot_pos,
+                                       float ahead_m,
+                                       const PlanFn &plan,
+                                       const FreeFn &is_free);
+
+    // Hand the follower a distance field and weights, and every fit — build AND repair — is variationally
+    // optimised (see route_optimizer.h). Anchors are filled in from the route's own waypoints, so the
+    // caller supplies only the field and the weights. Leave unset and the route is fitted as before.
+    void set_optimizer(const RouteOptimizerConfig &cfg) { opt_ = cfg; }
+
+    bool valid() const { return spline_.valid(); }
+    const std::vector<Eigen::Vector2f> &path() const { return spline_.samples(); }
+    // The PLANNED POLYLINE the curve is fitted to — the concatenated A* hops, before any smoothing.
+    // Exposed so the two geometries can be written side by side and compared directly.
+    const std::vector<Eigen::Vector2f> &polyline() const { return poly_; }
+    const RouteSpline &spline() const { return spline_; }
+    float length() const { return spline_.length(); }
+
+    // Advance progress to the robot's projection on the curve. Monotone: progress never runs backwards,
+    // so a route that crosses itself cannot teleport the robot forwards or backwards along it.
+    float advance(const Eigen::Vector2f &robot_pos);
+    float progress() const { return progress_; }
+    float remaining() const { return std::max(0.f, spline_.length() - progress_); }
+    // A mission is finished when the ROBOT is at the end of the route — not when a projection is.
+    // `progress_` is a forward-only nearest-point search, so it creeps toward the end whether or not the
+    // robot is actually following the curve. Measured live: cross-track 1.10 m rms / 4.03 m max, progress
+    // 35.42 of 35.62 m, and the run reported "completed" with the robot standing at waypoint 6.
+    // Both conditions are now required, and the second one cannot be satisfied by a bookkeeping error.
+    // How much arc length may remain and still count as driven. Shared by finished() and laps_done() —
+    // they disagreed by exactly this amount, which is how a fully driven 3-lap run reported 2 of 3.
+    static constexpr float finish_tol_m = 0.20f;
+
+    bool  finished(const Eigen::Vector2f &robot_pos, float tolerance_m = finish_tol_m) const
+    {
+        if (remaining() > tolerance_m) return false;
+        if (not spline_.valid()) return true;
+        return (robot_pos - spline_.position_at(spline_.length())).norm() <= end_reach_m;
+    }
+    // How close to the route's END POINT the robot must physically be for the route to count as driven.
+    // Generous on purpose: this is a sanity check against a projection running away, not an arrival
+    // tolerance — the follower has no arrival radius by design.
+    static constexpr float end_reach_m = 1.0f;
+
+    // Which lap the given arc length falls in (1-based). There is no leg_at(): legs were the old
+    // waypoint segmentation, and once the route is one curve, cutting it at the recorded waypoints
+    // measures an artefact of how it USED to be driven rather than anything about the trajectory.
+    int lap_at(float s) const;
+    int lap() const { return lap_at(progress_); }
+    // Laps FINISHED behind `s`. Distinct from lap_at, which is the lap you are IN — and the distinction
+    // is not cosmetic: lap_at is clamped to laps_, so deriving "completed" as lap_at-1 can never reach
+    // laps_ and a finished single-lap run reported 0 of 1 forever.
+    int laps_completed_at(float s) const;
+    // Arc length of one lap, and how far the run has gone in TOTAL across laps. progress_ rewinds, so
+    // it is no longer a cumulative distance and anything reporting the run's extent must use this.
+    float lap_length() const { return std::max(0.f, spline_.length() - lap_start_s_); }
+    // ★COUNTED FROM REWINDS, NOT FROM laps_done_. The last lap does NOT rewind — laps_done_ reaches
+    // laps_ while progress_ stays at the end of the route — so using laps_done_ here counts that final
+    // lap twice (measured: 22.79 m reported on a 15.26 m two-lap run). A rewind is exactly the event
+    // "one lap of arc was driven and progress went back to the start", which is what this sums.
+    float total_progress() const
+    { return static_cast<float>(rewinds_) * lap_length() + std::max(0.f, progress_ - lap_start_s_); }
+    int laps_total() const { return laps_; }
+    float total_length() const { return static_cast<float>(std::max(1, laps_)) * lap_length(); }
+    // ★TRUE FOR EXACTLY ONE CALL, then cleared. A rewind is a DISCONTINUITY in arc length: the tracker's
+    // own projection is monotone within one traversal, so without being told it would sit at the end of
+    // the route while the robot drives the start of the next lap — the same staleness that put the
+    // tracker at the route's end point after a restart. The caller re-acquires on this.
+    bool rewound() { const bool r = rewound_; rewound_ = false; return r; }
+    int laps_done() const
+    {
+        if (laps_done_ >= laps_) return laps_;
+        // ★THE END-OF-ROUTE ALLOWANCE APPLIES ONLY ON THE FINAL LAP, and forgetting that STOPPED THE
+        // RUN AFTER LAP 1. finished() lets a run end with up to finish_tol_m still nominally remaining,
+        // so this used to answer "at the end of the route => every lap is done". That was true when the
+        // route CONTAINED every lap. It contains ONE now, so reaching its end completes THAT lap — and
+        // reporting the whole run complete made the mission stop the moment the first lap closed.
+        if (laps_done_ == laps_ - 1 and remaining() <= finish_tol_m) return laps_;
+        return laps_done_;
+    }
+    // ── LOCAL ELASTIC BAND ────────────────────────────────────────────────────────────────────────
+    // Deform the installed route in a WINDOW of control points against a live field, without refitting
+    // from the polyline and without disturbing the geometry outside the window. `distance`/
+    // `distance_gradient` are room-frame; normally the controller's live local ESDF rather than the
+    // static planner field the route was built with. Waypoint arc lengths are re-derived on success.
+    //
+    // ★`freeze_before` MUST cover the robot: arc length is measured from s=0, so a curve that moves
+    // BEHIND the robot shifts the meaning of progress(), every waypoint arc length and the carrot at
+    // once. The caller owns that guarantee — this class cannot see where the robot is.
+    RouteOptimizerReport deform_window(std::function<float(const Eigen::Vector2f &)> distance,
+                                       std::function<Eigen::Vector2f(const Eigen::Vector2f &)> distance_gradient,
+                                       std::size_t freeze_before, std::size_t freeze_after,
+                                       int iterations);
+    // How many control points the installed route has — the index space freeze_before/after live in.
+    std::size_t control_count() const { return spline_.control_points().size(); }
+
+    // Arc length at which each waypoint sits, in build order (laps concatenated).
+    const std::vector<float> &waypoint_arclengths() const { return wp_s_; }
+    int waypoints_per_lap() const { return wp_per_lap_; }
+    int corrections() const { return spline_.corrections(); }
+
+    static bool self_test();
+
+private:
+    // Fit the curve to poly_ and re-derive every waypoint's arc length from wp_pos_. Shared by build()
+    // and repair() so a repaired route is bookkept exactly like a freshly built one — the arc lengths
+    // cannot drift apart from the geometry, because there is only one place that computes them.
+    // `freeze_before` pins that many leading CONTROL POINTS — used on a repair so the stretch the robot
+    // is already driving cannot move under it. 0 on a fresh build, where nothing is being driven yet.
+    bool fit_from_polyline(const FreeFn &is_free, std::size_t freeze_before = 0,
+                           std::size_t freeze_after = std::numeric_limits<std::size_t>::max());
+    // Arc length of every waypoint ALONG THE POLYLINE — the metric the optimiser binds anchors in, and
+    // the only one that is defined before the curve exists. Distinct from wp_s_, which is arc length
+    // along the fitted CURVE and exists for progress and lap bookkeeping. Conflating the two deleted 15 m
+    // of a 3-lap tour; see fit_from_polyline.
+    std::vector<float> anchor_polyline_arclengths() const;
+    // Re-project every waypoint onto the current curve. Shared by the fit and the band so there is
+    // exactly one place arc lengths are computed.
+    void rederive_waypoint_arclengths();
+
+    RouteSpline spline_;
+    // The planned polyline the curve is fitted to. Kept (build() used to discard it) because a local
+    // repair needs something feasible to splice INTO: the curve's samples are a smoothed, resampled
+    // product, not a sequence of planner-approved hops.
+    std::vector<Eigen::Vector2f> poly_;
+    std::vector<Eigen::Vector2f> wp_pos_;   // waypoint positions, laps concatenated — re-projected after a repair
+    std::vector<float> wp_s_;      // arc length of every waypoint, laps concatenated
+    // Dropped at build and awaiting a second chance — see Deferred. Indices into wp_pos_, kept correct
+    // across a recovery (inserting one shifts every later entry).
+    std::vector<Deferred> deferred_;
+    RouteOptimizerConfig opt_;     // disabled until set_optimizer supplies a distance field
+    float spacing_ = 0.05f;        // fit parameters, remembered so a repair refits identically
+    float smoothing_ = 0.40f;
+    // Waypoints RECORDED per lap — the reachable ones, not the mission's count. lap_at divides by this,
+    // and the number of laps is stored explicitly rather than inferred as wp_s_.size()/wp_per_lap_: that
+    // inference silently returned 0 the moment one waypoint was skipped (29/30), which zeroed the lap
+    // counter and left laps_remaining pinned at its initial value forever.
+    int   wp_per_lap_ = 0;
+    int   laps_ = 1;
+    float progress_ = 0.f;
+    // ── LAPS ARE RESTARTS OF ONE CURVE ───────────────────────────────────────────────────────────
+    // The route is a run-in plus ONE closed lap. A lap completes by rewinding progress_ to
+    // lap_start_s_, so the per-lap cost is an assignment rather than a re-plan, and every lap is the
+    // same curve BY CONSTRUCTION — which is what lap_repeat_* has always claimed to measure.
+    int   laps_done_ = 0;        // completed laps; the only thing that knows which lap we are on
+    float lap_start_s_ = 0.f;    // where a lap begins: past the run-in, at the first waypoint
+    bool  rewound_ = false;      // consumed by rewound(); see there
+    int   rewinds_ = 0;          // how many times a lap actually rewound — see total_progress()
+};
+
+}  // namespace rc

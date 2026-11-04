@@ -1,0 +1,139 @@
+# openfield_concept — GPS + IMU + wheel-odometry localization for the open field (room_concept's
+# replacement in the agricultural worlds). See src/openfield_ekf.h for the model and frames.
+
+[Proxies]
+# The bridge's GPS (webots-bridge etc/config_husky: Endpoints.GPS). x = east, y = north, metres.
+GPS = "gps:tcp -h localhost -p 10009"
+# The bridge's supervisor interface: only Field.Source = "webots" uses it (getWorldExtents). Optional.
+Webots2Robocomp = "webots2robocomp:tcp -h localhost -p 10006"
+
+[Agent]
+id = 25   # registered in CONCEPT_AGENT_RECIPE.md (Agent-ID registry). A collision SIGSEGVs both agents.
+name = "openfield_concept"
+configFile = ""
+domain = 0
+tree = false
+graph = false
+2d = false
+3d = false
+
+[Period]
+Compute = 20        # 50 Hz: drains the ~120 Hz IMU stream and publishes the pose each tick
+Emergency = 500
+
+[Presence]
+required_agent_names = ["robot_concept"]
+optional_agent_names = ["controller", "residual_concept"]
+config_dir = "etc"
+monitor_period_ms = 500
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 5000
+stale_grace_ms = 120000
+agent_info_period_ms = 1000
+
+[Owns]
+# The world node is OURS (the frame every other agent reads; it was `field` until 2026-11-03), and so is the
+# inspection mode's affordance (afford_openfield); deleted on a graceful exit.
+nodes = ["openfield_concept 25", "afford_openfield"]
+subtrees = ["world"]
+
+[Field]
+# Source = "webots": the boundary comes from the world Webots has loaded (any world, no editing here):
+#   rectangle = bbox of the ObjectTypes nodes + MarginX/MarginY, grown to keep StartMargin around the
+#   robot's start, clipped to the TerrainTypes nodes (no ObjectTypes in the world -> the whole terrain).
+#   husky_apple.wbt -> x -8..8, y -13..12.8 · dos_fields.wbt -> x -6.8..19.3, y -13..12.3.
+#   If the bridge cannot be asked, it falls back to the polygon below (loudly).
+# Source = "config": the polygon below (the real robot: there is no simulator to ask).
+Source = "webots"
+ObjectTypes = ["AppleTree"]
+TerrainTypes = ["FieldTerrain", "RectangleArena"]
+MarginX = 3.0       # m beyond the outer rows
+MarginY = 6.0       # m beyond the row ends (headlands to turn in)
+StartMargin = 2.5   # m kept around the start pose
+# The field boundary -> the field node's delimiting_polygon. Give EITHER local metres (x east, y north,
+# origin = the world's gpsReference) OR GPS coordinates; local metres win if both are set.
+# The controller's planner marks everything outside it as occupied, and builds its grid over the
+# bounding box (and residual_concept its 5 cm occupancy grid), so keep it the size of the WORKING AREA.
+# husky_apple.wbt: the 5 x 12 tree plot (x -5.7..5.7, y -7.6..7.6 with crowns) plus headlands to turn in
+# and the robot's start at (1.25, -10.5): 16 x 26 m. The whole 30 x 30 m arena would cost ~3x the cells.
+PolygonX = [-8.0, 8.0, 8.0, -8.0]
+PolygonY = [-13.0, -13.0, 13.0, 13.0]
+# PolygonLat = [38.87927, 38.87927, 38.87953, 38.87953]
+# PolygonLon = [-6.97087, -6.97053, -6.97053, -6.97087]
+RoomHeight = 5.0    # obstacle-cloud ceiling (no ceiling outdoors)
+
+[Ekf]
+# Wheel odometry noise DENSITIES (m/sqrt(s)): sigma(v) = hypot(sigma0, slip*|v|).
+AdvSigma0 = 0.01
+AdvSlip = 0.05
+SideSigma0 = 0.005
+SideSlip = 0.10      # skid-steer side-slide while turning: hypot(sigma0, slip*|v*w|)
+GyroSigma0 = 0.002   # rad/sqrt(s), matches the bridge's SensorNoise.GyroSigma
+GyroScale = 0.01
+GpsSigmaM = 0.05     # per-fix std; the proto's 0.02 is CORRELATED noise, so 0.02 here would be over-confident
+YawSigmaRad = 0.005  # InertialUnit yaw (proto noise 0.002), inflated for its correlation
+GpsLever = [0.0, -0.25]   # antenna in the body frame (x right, y forward): husky.json body<-gps
+# GPS fusion model (src/openfield_variants.h). Defaults = the filter as it always was.
+GpsSigmaSource = "fixed"  # "fixed" = GpsSigmaM | "receiver" = the sigma the receiver reports (needs Gps.StatusFile)
+GpsLikelihood = "gauss"   # "gauss" | "student": Student-t (StudentNu dof) down-weights multipath jumps continuously
+StudentNu = 4.0
+LagCompensation = false   # true: a late fix is moved to NOW by the filter's own displacement since it was measured
+
+[Imu]
+Node = "imu"
+UseYaw = true
+YawUpdatePeriodMs = 100
+StallTimeoutMs = 2000   # primary-input gate: no IMU frame for this long -> back to Waiting
+
+[Gps]
+PollPeriodMs = 50
+StatusFile = ""           # the receiver's report (bridge GnssDegradation.StatusFile); "" = Ice GPS.getPos only
+
+[Viewer]
+# The localization window: estimated pose vs ground truth, GPS / odometry / IMU readouts, and switches to
+# take the GPS (and the IMU's absolute yaw) out of the filter to watch dead-reckoning drift.
+Enabled = true
+# The 3D semantic map window: the robot, the plants (trunk at its measured radius, canopy cone; unseen parts in
+# red), rows, plots and the field, rebuilt from the graph at ~2 Hz.
+World3D = true
+
+[Exploration]
+# The INSPECTION mode (src/field_explorer.h, src/openfield_exploration.h): openfield_concept's port of
+# room_concept's exploration. The field is a grid whose cells are UNKNOWN until the robot has looked at them; the
+# standpoint that most reduces that entropy (minus the travel, in nats) is offered to the controller as the
+# affordance `afford_openfield`. When no standpoint is worth its travel the inspection is COMPLETE: model_stable on
+# the world node, and field_metaconcept closes field_0.
+Enabled = true
+PeriodMs = 200
+CellM = 0.5                  # grid and standpoint resolution; < the free width of a corridor (~1.3 m - robot)
+SensorRangeM = 3.0           # e-folding range of p_det: trunks are confirmed by ZED masks + LiDAR at a few metres
+CanopyTransmittance = 0.1    # fraction of a look that passes through one row of canopy
+DetectRate = 1.0             # looks per second at p_det = 1
+DwellS = 3.0                 # how long the robot looks from a standpoint (≈ the controller's AffordanceDwellMs)
+PriorPlantP = 0.3            # prior probability that a cell holds a plant -> its prior entropy
+TravelCostNatsPerM = 0.2     # = the controller's AffordanceLambdaCost
+BoundaryClearanceM = 1.0
+RowClearanceM = 0.35         # robot half-width around a row rectangle (which already includes the keep-out)
+PlantClearanceM = 0.6
+FailedSuppressS = 60.0       # an unreachable standpoint's suppression decays with this time constant
+FailedRadiusM = 1.5          # ... and covers the cells around it
+OfferUnclaimedMs = 10000     # an offer nobody claims is retired
+LeaseMs = 180000             # backstop: a claim held this long without completing is released and retired
+StallMs = 30000              # a claimed standpoint the robot has not come StallProgressM closer to in this long
+StallProgressM = 0.3         #   is released (the consumer is holding with no route) and suppressed
+
+[Diag]
+CsvPath = "tmp/openfield_pose.csv"
+ExperimentCsv = ""        # 10 Hz: every filter (+ full covariance), ground truth and receiver status; "" = off
+
+[Experiment]
+ShadowFilters = false     # true: also run E1's A/B/C/D filters on the same data (logged, never published)
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"

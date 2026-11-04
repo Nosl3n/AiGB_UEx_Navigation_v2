@@ -1,0 +1,2415 @@
+#include "../../common/world_frame/world_frame.h"   // rc::world:: — room indoors, field outdoors
+#include "../../common/vegetation/plant_discs.h"    // rc::veg:: — vegetation_concept's plants as discs
+#include "controller_obstacle_tracker.h"
+
+#include "../../common/robot_footprint/robot_footprint.h"
+
+#include <array>
+#include <set>
+#include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <numeric>
+#include <print>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include "../../common/graph_provenance/creation_stamp.h"   // rc::provenance::stamp_creation
+
+std::array<Eigen::Vector2f, ControllerObstacleTracker::kRememberedEdgeCount>
+ControllerObstacleTracker::make_local_obstacle_corners(const ControllerObstacleState &state)
+{
+    const float half_width = state.width_m * 0.5f;
+    const float half_depth = state.depth_m * 0.5f;
+    return {Eigen::Vector2f(-half_width, -half_depth),
+            Eigen::Vector2f(half_width, -half_depth),
+            Eigen::Vector2f(half_width, half_depth),
+            Eigen::Vector2f(-half_width, half_depth)};
+}
+
+std::optional<ControllerObstacleTracker::RememberedEdgeSlot>
+ControllerObstacleTracker::classify_remembered_edge_slot(const ControllerObstacleState &state,
+                                                         const Eigen::Vector2f &local_point)
+{
+    const auto corners = make_local_obstacle_corners(state);
+    float best_distance = std::numeric_limits<float>::max();
+    float best_t = 0.f;
+    int best_edge = 0;
+
+    for (int edge_index = 0; edge_index < kRememberedEdgeCount; ++edge_index)
+    {
+        const Eigen::Vector2f &from = corners[edge_index];
+        const Eigen::Vector2f &to = corners[(edge_index + 1) % kRememberedEdgeCount];
+        const Eigen::Vector2f edge = to - from;
+        const float edge_length_sq = edge.squaredNorm();
+        if (edge_length_sq < 1e-6f)
+            continue;
+
+        const float projected_t = std::clamp((local_point - from).dot(edge) / edge_length_sq, 0.f, 1.f);
+        const Eigen::Vector2f projected = from + projected_t * edge;
+        const float distance = (local_point - projected).norm();
+        if (distance < best_distance)
+        {
+            best_distance = distance;
+            best_t = projected_t;
+            best_edge = edge_index;
+        }
+    }
+
+    if (best_distance > kRememberedEdgeDistanceThreshold)
+        return std::nullopt;
+
+    const int slot_index = std::min(kRememberedSlotsPerEdge - 1,
+                                    static_cast<int>(best_t * static_cast<float>(kRememberedSlotsPerEdge)));
+    return RememberedEdgeSlot{.edge_index = best_edge,
+                              .slot_index = slot_index,
+                              .distance_to_edge = best_distance};
+}
+
+int ControllerObstacleTracker::remembered_slot_index(const RememberedEdgeSlot &slot)
+{
+    return slot.edge_index * kRememberedSlotsPerEdge + slot.slot_index;
+}
+
+Eigen::Vector2f ControllerObstacleTracker::estimate_obstacle_center(const ControllerObstacleObservation &observation,
+                                                                    float width_m,
+                                                                    float depth_m)
+{
+    const Eigen::Vector2f view_dir = observation.centroid - observation.viewpoint;
+    const float view_norm = view_dir.norm();
+    if (view_norm < 1e-4f || observation.points.empty())
+        return observation.centroid;
+
+    const Eigen::Vector2f away_from_robot = view_dir / view_norm;
+    float observed_min = std::numeric_limits<float>::max();
+    float observed_max = -std::numeric_limits<float>::max();
+    for (const auto &point : observation.points)
+    {
+        const float projection = point.dot(away_from_robot);
+        observed_min = std::min(observed_min, projection);
+        observed_max = std::max(observed_max, projection);
+    }
+
+    const Eigen::Vector2f local_dir = Eigen::Rotation2Df(-observation.yaw_rad) * away_from_robot;
+    const float estimated_full_span = std::abs(local_dir.x()) * width_m
+                                    + std::abs(local_dir.y()) * depth_m;
+    const float observed_span = std::max(0.f, observed_max - observed_min);
+    const float hidden_span = std::max(0.f, estimated_full_span - observed_span);
+    const float observed_mid = 0.5f * (observed_min + observed_max);
+    const float target_projection = std::max(observed_max + 0.02f,
+                                             observed_mid + 0.5f * hidden_span);
+    const float centroid_projection = observation.centroid.dot(away_from_robot);
+    return observation.centroid + (target_projection - centroid_projection) * away_from_robot;
+}
+
+Eigen::Vector2f ControllerObstacleTracker::estimate_initial_obstacle_center(const ControllerObstacleObservation &observation)
+{
+    return estimate_obstacle_center(observation, observation.width_m, observation.depth_m);
+}
+
+std::string ControllerObstacleTracker::published_obstacle_name(std::uint64_t obstacle_id)
+{
+    return "obs" + std::to_string(obstacle_id);
+}
+
+std::string ControllerObstacleTracker::object_label_prefix(const std::string &object_type)
+{
+    if (object_type == "table") return "t";
+    if (object_type == "chair") return "c";
+    if (object_type == "cylinder" || object_type == "bottle") return "b";
+    if (!object_type.empty())
+        return std::string(1, static_cast<char>(std::tolower(object_type.front())));
+    return "x";
+}
+
+float ControllerObstacleTracker::distance_visibility_scale(const ControllerParams *params,
+                                                           const ControllerRobotPose &robot_pose,
+                                                           const ControllerObstacleState &state)
+{
+    if (params == nullptr)
+        return 1.f;
+
+    const float distance_to_obstacle = (state.center - robot_pose.pos).norm();
+    const float reference_distance = std::max(0.5f, params->temporary_obstacle_front_distance_m);
+    return std::clamp(reference_distance / std::max(reference_distance, distance_to_obstacle),
+                      0.2f,
+                      1.f);
+}
+
+void ControllerObstacleTracker::recompute_observation_summary(ControllerObstacleObservation &observation,
+                                                              float padding_m,
+                                                              float occlusion_depth_m)
+{
+    if (observation.points.size() < 3)
+        return;
+
+    float weight_sum = 0.f;
+    observation.centroid.setZero();
+    for (std::size_t index = 0; index < observation.points.size(); ++index)
+    {
+        const float weight = index < observation.weights.size() ? observation.weights[index] : 1.f;
+        observation.centroid += weight * observation.points[index];
+        weight_sum += weight;
+    }
+    observation.centroid /= std::max(1e-4f, weight_sum);
+
+    Eigen::Matrix2f covariance = Eigen::Matrix2f::Zero();
+    for (std::size_t index = 0; index < observation.points.size(); ++index)
+    {
+        const float weight = index < observation.weights.size() ? observation.weights[index] : 1.f;
+        const Eigen::Vector2f delta = observation.points[index] - observation.centroid;
+        covariance += weight * delta * delta.transpose();
+    }
+    covariance /= std::max(1e-4f, weight_sum);
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(covariance);
+    Eigen::Vector2f principal = Eigen::Vector2f::UnitX();
+    if (solver.info() == Eigen::Success)
+        principal = solver.eigenvectors().col(1).normalized();
+
+    observation.yaw_rad = std::atan2(principal.y(), principal.x());
+    const Eigen::Rotation2Df world_to_local(-observation.yaw_rad);
+    Eigen::Vector2f min_local = Eigen::Vector2f::Constant(std::numeric_limits<float>::max());
+    Eigen::Vector2f max_local = Eigen::Vector2f::Constant(-std::numeric_limits<float>::max());
+    for (const auto &point : observation.points)
+    {
+        const Eigen::Vector2f local = world_to_local * (point - observation.centroid);
+        min_local = min_local.cwiseMin(local);
+        max_local = max_local.cwiseMax(local);
+    }
+
+    observation.width_m = std::max(0.12f, max_local.x() - min_local.x() + 2.f * padding_m);
+    observation.depth_m = std::max(0.12f, max_local.y() - min_local.y() + 2.f * padding_m);
+
+    const Eigen::Vector2f view_local = world_to_local * (observation.viewpoint - observation.centroid);
+    const float view_norm = view_local.norm();
+    if (view_norm > 1e-4f && occlusion_depth_m > 0.f)
+    {
+        const Eigen::Vector2f dominant = view_local.cwiseAbs();
+        if (dominant.x() >= dominant.y())
+            observation.width_m += std::min(occlusion_depth_m, occlusion_depth_m * dominant.x() / view_norm);
+        else
+            observation.depth_m += std::min(occlusion_depth_m, occlusion_depth_m * dominant.y() / view_norm);
+    }
+}
+
+void ControllerObstacleTracker::set_params(const ControllerParams *params)
+{
+    params_ = params;
+}
+
+void ControllerObstacleTracker::set_dependencies(std::shared_ptr<DSR::DSRGraph> graph,
+                                                 DSR::InnerEigenAPI *inner_eigen_api,
+                                                 const ControllerGraphState *graph_state)
+{
+    graph_ = std::move(graph);
+    inner_eigen_api_ = inner_eigen_api;
+    rt_api_ = graph_ ? graph_->get_rt_api() : nullptr;
+    graph_state_ = graph_state;
+}
+
+void ControllerObstacleTracker::set_graph_layout_callback(std::function<void()> callback)
+{
+    graph_layout_callback_ = std::move(callback);
+}
+
+void ControllerObstacleTracker::clear_published_obstacles()
+{
+    for (auto &instance : temporary_obstacles_)
+    {
+        delete_published_obstacle_node(instance);
+        instance.published_node_id = 0;
+    }
+    virtual_obstacles_.clear();   // local-only, nothing to delete from DSR
+}
+
+ControllerObstacleModelParams ControllerObstacleTracker::make_model_params() const
+{
+    ControllerObstacleModelParams model_params;
+    if (!params_)
+        return model_params;
+
+    model_params.robust_loss = params_->temporary_obstacle_robust_loss;
+    model_params.robust_loss_scale_m = params_->temporary_obstacle_robust_loss_scale_m;
+    return model_params;
+}
+
+ControllerPolygons ControllerObstacleTracker::temporary_obstacle_rfe_points() const
+{
+    ControllerPolygons rfe_points;
+    rfe_points.reserve(temporary_obstacles_.size());
+
+    for (const auto &instance : temporary_obstacles_)
+    {
+        ControllerPolygon points;
+        points.reserve(instance.remembered_points.size());
+
+        const auto &state = instance.model.state();
+        for (const auto &remembered_point : instance.remembered_points)
+            points.push_back(to_world_point(state, remembered_point.local_point));
+
+        rfe_points.push_back(std::move(points));
+    }
+
+    return rfe_points;
+}
+
+void ControllerObstacleTracker::delete_published_obstacle_node(const TemporaryObstacleInstance &instance)
+{
+    if (!graph_)
+        return;
+
+    if (instance.published_node_id != 0 && graph_->delete_node(instance.published_node_id))
+    {
+        if (graph_layout_callback_)
+            graph_layout_callback_();
+        return;
+    }
+
+    if (graph_->delete_node(published_obstacle_name(instance.id)) && graph_layout_callback_)
+        graph_layout_callback_();
+}
+
+void ControllerObstacleTracker::sync_temporary_obstacles_to_dsr(std::uint64_t timestamp_ms)
+{
+    if (!graph_ || !rt_api_ || !graph_state_ || graph_state_->world_id == 0)
+        return;
+
+    auto world_node = graph_->get_node(graph_state_->world_id);
+    if (!world_node.has_value())
+        return;
+
+    const float world_pos_x = graph_->get_attrib_by_name<pos_x_att>(world_node.value()).value_or(200.f);
+    const float world_pos_y = graph_->get_attrib_by_name<pos_y_att>(world_node.value()).value_or(200.f);
+    bool inserted_obstacle_node = false;
+
+    for (auto &instance : temporary_obstacles_)
+    {
+        const auto &state = instance.model.state();
+        const std::string node_name = published_obstacle_name(instance.id);
+
+        std::optional<DSR::Node> node_opt;
+        if (instance.published_node_id != 0)
+            node_opt = graph_->get_node(instance.published_node_id);
+        if (!node_opt.has_value())
+        {
+            instance.published_node_id = 0;
+            node_opt = graph_->get_node(node_name);
+            if (node_opt.has_value())
+                instance.published_node_id = node_opt->id();
+        }
+
+        if (!node_opt.has_value())
+        {
+            DSR::Node obstacle_node = DSR::Node::create<obstacle_node_type>(node_name);
+            graph_->add_or_modify_attrib_local<level_att>(obstacle_node, 3);
+            graph_->add_or_modify_attrib_local<parent_att>(obstacle_node, graph_state_->world_id);
+            graph_->add_or_modify_attrib_local<pos_x_att>(obstacle_node, world_pos_x + 120.f + 18.f * static_cast<float>(instance.id % 6));
+            graph_->add_or_modify_attrib_local<pos_y_att>(obstacle_node, world_pos_y + 40.f + 18.f * static_cast<float>(instance.id / 6));
+            rc::provenance::stamp_creation(*graph_, obstacle_node);   // birth stamp: epoch ms + local ISO-8601
+            const auto node_id = graph_->insert_node(obstacle_node);
+            if (!node_id.has_value())
+                continue;
+            instance.published_node_id = node_id.value();
+            inserted_obstacle_node = true;
+            node_opt = graph_->get_node(node_id.value());
+            if (!node_opt.has_value())
+                continue;
+        }
+
+        auto node = node_opt.value();
+        graph_->add_or_modify_attrib_local<width_m_att>(node, state.width_m);
+        graph_->add_or_modify_attrib_local<depth_m_att>(node, state.depth_m);
+        graph_->add_or_modify_attrib_local<height_m_att>(node, kPublishedObstacleHeightM);
+        graph_->add_or_modify_attrib_local<level_att>(node, 3);
+        graph_->add_or_modify_attrib_local<parent_att>(node, graph_state_->world_id);
+        if (!graph_->update_node(node))
+            continue;
+
+        rt_api_->insert_or_assign_edge_RT(world_node.value(),
+                                          instance.published_node_id,
+                                          {state.center.x(), state.center.y(), 0.5f * kPublishedObstacleHeightM},
+                                          {0.f, 0.f, state.yaw_rad},
+                                          timestamp_ms);
+    }
+
+    if (inserted_obstacle_node && graph_layout_callback_)
+        graph_layout_callback_();
+}
+
+std::vector<Eigen::Vector2f> ControllerObstacleTracker::read_temporary_obstacle_points(std::uint64_t timestamp_ms,
+                                                                                        const ControllerRobotPose &robot_pose,
+                                                                                        const Eigen::Vector2f &region_center_world,
+                                                                                        float region_radius_m,
+                                                                                        bool forward_only)
+{
+    std::vector<Eigen::Vector2f> candidate_points_world;
+    if (!params_)
+        return candidate_points_world;
+
+    const auto fused_points_world = read_recent_lidar_points_in_world(timestamp_ms,
+                                                                    params_->temporary_obstacle_history_scans);
+    if (fused_points_world.empty())
+        return candidate_points_world;
+
+    const Eigen::Affine2f robot_from_world = robot_pose.as_transform().inverse();
+    candidate_points_world.reserve(fused_points_world.size());
+
+    const float max_front_distance = std::max(0.2f, params_->temporary_obstacle_front_distance_m);
+    const float half_width = std::max(0.1f, params_->temporary_obstacle_half_width_m);
+    const float cluster_margin = std::max(0.f, params_->temporary_obstacle_cluster_margin_m);
+    const float known_obstacle_explanation_margin_m = std::clamp(0.5f * std::max(0.f, params_->temporary_obstacle_padding_m),
+                                                                 0.05f,
+                                                                 0.14f);
+    const float search_radius = std::max(region_radius_m + cluster_margin, cluster_margin + 0.1f);
+    const float max_robot_distance = max_front_distance + search_radius + 0.25f;
+    // Returns inside the robot's own footprint are self/body/floor-ring hits, not obstacles — and any
+    // real contact is already inside the footprint anyway. Drop them so we never fit an obstacle glued
+    // to the body. This is the FOOTPRINT, tested at each return's own bearing: the old code used a 0.50 m
+    // disc (clearance_m), which deleted every return in 0.79 m² around the robot — 3.4× the robot's actual
+    // area — including the obstacles closest to it, the ones that matter most.
+    // ★NOT A FUNCTION-LOCAL static ANY MORE, AND THAT MATTERS MORE HERE THAN ANYWHERE ELSE. A `static const
+    // … = shadow()` is initialised once per PROCESS, so it would go on filtering with Shadow's body for the
+    // life of a P3Bot run no matter what the session installed — silently, in the one place whose whole job
+    // is deciding which returns are the robot itself. The session owns the body; this reads it.
+    const rc::RobotFootprint &footprint = body_;
+
+    for (const auto &point3d_world : fused_points_world)
+    {
+        const Eigen::Vector2f point_world(point3d_world.x(), point3d_world.y());
+        if ((point_world - region_center_world).norm() > search_radius)
+            continue;
+        const Eigen::Vector2f from_robot = point_world - robot_pose.pos;
+        // ★THE QUARTER TURN, IN THE OTHER DIRECTION. `robot_pose.theta` is ALREADY the footprint's own
+        // rotation — as_transform() applies it unrotated, and a room YAW is theta + pi/2 (see the
+        // trajectory controller's terminal-align branch). Handing it to the _yaw overload subtracted a
+        // quarter turn that was never added, so the self-filter's lobe pointed 90 degrees off the body:
+        // it kept returns lying along the robot's own flanks — which then got fitted as obstacles glued
+        // to it — and deleted real ones ahead. Same 4.2 cm, opposite sign.
+        if (from_robot.norm() < footprint.support_radius(robot_pose.theta, from_robot))
+            continue;
+
+        const Eigen::Vector2f point_robot = robot_from_world * point_world;
+        if (forward_only)
+        {
+            // Must be genuinely AHEAD of the body, not merely ahead of the origin. point_robot is already in
+            // the footprint's own frame (x right, y forward), so this is the front extent directly.
+            if (point_robot.y() <= footprint.support_radius(0.f, {0.f, 1.f}))
+                continue;
+            if (point_robot.y() > max_front_distance)
+                continue;
+            if (std::abs(point_robot.x()) > half_width)
+                continue;
+        }
+        else if (point_robot.norm() > max_robot_distance)
+        {
+            continue;
+        }
+
+        const bool explained_by_known_obstacle = std::any_of(known_graph_obstacles_.cbegin(),
+                                                             known_graph_obstacles_.cend(),
+                                                             [&point_world, known_obstacle_explanation_margin_m](const auto &state)
+                                                             {
+                                                                 return point_explained_by_obstacle(state.state,
+                                                                                                    point_world,
+                                                                                                    known_obstacle_explanation_margin_m);
+                                                             });
+        if (explained_by_known_obstacle)
+            continue;
+
+        candidate_points_world.push_back(point_world);
+    }
+
+    return candidate_points_world;
+}
+
+std::optional<ControllerObstacleObservation> ControllerObstacleTracker::build_temporary_obstacle_observation(std::uint64_t timestamp_ms,
+                                                                                                              const ControllerRobotPose &robot_pose,
+                                                                                                              const Eigen::Vector2f &region_center_world,
+                                                                                                              float region_radius_m,
+                                                                                                              bool forward_only)
+{
+    if (!params_)
+        return std::nullopt;
+
+    const auto candidate_points_world = read_temporary_obstacle_points(timestamp_ms,
+                                                                      robot_pose,
+                                                                      region_center_world,
+                                                                      region_radius_m,
+                                                                      forward_only);
+    if (static_cast<int>(candidate_points_world.size()) < std::max(3, params_->temporary_obstacle_min_points))
+        return std::nullopt;
+
+    return ControllerObstacleModel::make_observation(candidate_points_world,
+                                                     robot_pose.pos,
+                                                     std::max(0.f, params_->temporary_obstacle_padding_m),
+                                                     std::max(0.f, params_->temporary_obstacle_occlusion_depth_m));
+}
+
+Eigen::Vector2f ControllerObstacleTracker::to_local_point(const ControllerObstacleState &state, const Eigen::Vector2f &point)
+{
+    return Eigen::Rotation2Df(-state.yaw_rad) * (point - state.center);
+}
+
+float ControllerObstacleTracker::obstacle_sdf(const ControllerObstacleState &state, const Eigen::Vector2f &point)
+{
+    const Eigen::Vector2f local_point = to_local_point(state, point);
+    const Eigen::Vector2f half_extents(state.width_m * 0.5f, state.depth_m * 0.5f);
+    const Eigen::Vector2f d = local_point.cwiseAbs() - half_extents;
+    const Eigen::Vector2f outside = d.cwiseMax(0.f);
+    return outside.norm() + std::min(std::max(d.x(), d.y()), 0.f);
+}
+
+bool ControllerObstacleTracker::point_explained_by_obstacle(const ControllerObstacleState &state,
+                                                            const Eigen::Vector2f &point,
+                                                            float margin_m)
+{
+    return obstacle_sdf(state, point) <= std::max(0.f, margin_m);
+}
+
+bool ControllerObstacleTracker::obstacles_overlap(const ControllerObstacleState &lhs,
+                                                  const ControllerObstacleState &rhs,
+                                                  float margin_m)
+{
+    const float margin = std::max(0.f, margin_m);
+    if (point_explained_by_obstacle(lhs, rhs.center, margin)
+        || point_explained_by_obstacle(rhs, lhs.center, margin))
+        return true;
+
+    const auto lhs_polygon = ControllerObstacleModel::polygon_from_state(lhs);
+    for (const auto &vertex : lhs_polygon)
+    {
+        if (point_explained_by_obstacle(rhs, vertex, margin))
+            return true;
+    }
+
+    const auto rhs_polygon = ControllerObstacleModel::polygon_from_state(rhs);
+    for (const auto &vertex : rhs_polygon)
+    {
+        if (point_explained_by_obstacle(lhs, vertex, margin))
+            return true;
+    }
+
+    return false;
+}
+
+float ControllerObstacleTracker::obstacle_distance_shape_metric(const ControllerObstacleState &reference,
+                                                                const ControllerObstacleState &candidate,
+                                                                bool candidate_has_shape)
+{
+    const float ref_diag = std::hypot(reference.width_m, reference.depth_m);
+    const float cand_diag = std::hypot(std::max(candidate.width_m, 0.f), std::max(candidate.depth_m, 0.f));
+    const float center_scale = std::max(0.25f, 0.5f * (ref_diag + std::max(cand_diag, 0.25f)));
+    const float center_term = (reference.center - candidate.center).norm() / center_scale;
+    const float yaw_delta = std::abs(std::atan2(std::sin(reference.yaw_rad - candidate.yaw_rad),
+                                                std::cos(reference.yaw_rad - candidate.yaw_rad)));
+
+    float metric = center_term + 0.35f * (yaw_delta / static_cast<float>(M_PI));
+    if (candidate_has_shape)
+    {
+        metric += 0.5f * std::abs(reference.width_m - candidate.width_m) / std::max(reference.width_m, 0.1f);
+        metric += 0.5f * std::abs(reference.depth_m - candidate.depth_m) / std::max(reference.depth_m, 0.1f);
+    }
+    return metric;
+}
+
+Eigen::Vector2f ControllerObstacleTracker::to_world_point(const ControllerObstacleState &state, const Eigen::Vector2f &point)
+{
+    return state.center + Eigen::Rotation2Df(state.yaw_rad) * point;
+}
+
+void ControllerObstacleTracker::retire_temporary_obstacles_explained_by_graph()
+{
+    if (temporary_obstacles_.empty() || known_graph_obstacles_.empty())
+        return;
+
+    const float overlap_margin_m = std::max(0.08f,
+                                            params_ ? 0.5f * std::max(params_->temporary_obstacle_padding_m, 0.f)
+                                                    : 0.08f);
+
+    auto first_retired = std::remove_if(temporary_obstacles_.begin(),
+                                        temporary_obstacles_.end(),
+                                        [this, overlap_margin_m](const auto &instance)
+                                        {
+                                            const auto &state = instance.model.state();
+                                            const bool explained = std::any_of(known_graph_obstacles_.cbegin(),
+                                                                               known_graph_obstacles_.cend(),
+                                                                               [&state, overlap_margin_m](const auto &known_state)
+                                                                               {
+                                                                                   return obstacles_overlap(known_state.state,
+                                                                                                            state,
+                                                                                                            overlap_margin_m);
+                                                                               });
+                                            if (explained)
+                                                delete_published_obstacle_node(instance);
+                                            return explained;
+                                        });
+    temporary_obstacles_.erase(first_retired, temporary_obstacles_.end());
+}
+
+ControllerObstacleObservation ControllerObstacleTracker::augment_with_remembered_points(const ControllerObstacleObservation &observation,
+                                                                                         const TemporaryObstacleInstance &instance) const
+{
+    ControllerObstacleObservation augmented = observation;
+    augmented.points.reserve(observation.points.size() + instance.remembered_points.size());
+    augmented.weights.reserve(augmented.points.capacity());
+
+    if (augmented.weights.size() < observation.points.size())
+        augmented.weights.resize(observation.points.size(), 1.f);
+
+    const auto &state = instance.model.state();
+    for (const auto &remembered_point : instance.remembered_points)
+    {
+        augmented.points.push_back(to_world_point(state, remembered_point.local_point));
+        augmented.weights.push_back(1.f / (1.f + 4.f * remembered_point.rfe));
+    }
+
+    recompute_observation_summary(augmented,
+                                  params_ ? std::max(0.f, params_->temporary_obstacle_padding_m) : 0.f,
+                                  params_ ? std::max(0.f, params_->temporary_obstacle_occlusion_depth_m) : 0.f);
+    return augmented;
+}
+
+void ControllerObstacleTracker::update_remembered_points(TemporaryObstacleInstance &instance,
+                                                         const ControllerObstacleObservation &observation)
+{
+    auto &remembered_points = instance.remembered_points;
+    const auto &state = instance.model.state();
+
+    for (auto &remembered_point : remembered_points)
+    {
+        const auto slot = classify_remembered_edge_slot(state, remembered_point.local_point);
+        if (!slot.has_value())
+        {
+            remembered_point.rfe = kRememberedRfeMax + 1.f;
+            continue;
+        }
+
+        const Eigen::Vector2f world_point = to_world_point(state, remembered_point.local_point);
+        const float sdf = obstacle_sdf(state, world_point);
+        remembered_point.rfe = kRememberedRfeAlpha * remembered_point.rfe + sdf * sdf;
+    }
+
+    std::array<std::vector<std::pair<RememberedPoint, float>>, kRememberedEdgeCount * kRememberedSlotsPerEdge> bins;
+    for (const auto &remembered_point : remembered_points)
+    {
+        if (remembered_point.rfe > kRememberedRfeMax)
+            continue;
+
+        const auto slot = classify_remembered_edge_slot(state, remembered_point.local_point);
+        if (!slot.has_value())
+            continue;
+
+        bins[remembered_slot_index(*slot)].emplace_back(remembered_point, remembered_point.rfe);
+    }
+
+    for (const auto &point : observation.points)
+    {
+        const Eigen::Vector2f local_point = to_local_point(state, point);
+        const auto slot = classify_remembered_edge_slot(state, local_point);
+        if (!slot.has_value())
+            continue;
+
+        const RememberedPoint candidate{.local_point = local_point, .rfe = 0.f};
+        bins[remembered_slot_index(*slot)].emplace_back(candidate, slot->distance_to_edge);
+    }
+
+    remembered_points.clear();
+    for (auto &bin : bins)
+    {
+        std::sort(bin.begin(), bin.end(), [](const auto &lhs, const auto &rhs)
+        {
+            return lhs.second < rhs.second;
+        });
+
+        const int keep = std::min<int>(kRememberedPointsPerSlot, bin.size());
+        for (int index = 0; index < keep; ++index)
+            remembered_points.push_back(bin[index].first);
+    }
+}
+
+float ControllerObstacleTracker::size_hardening_evidence(const TemporaryObstacleInstance &instance) const
+{
+    std::array<float, kRememberedEdgeCount * kRememberedSlotsPerEdge> slot_scores{};
+    for (const auto &remembered_point : instance.remembered_points)
+    {
+        const auto slot = classify_remembered_edge_slot(instance.model.state(), remembered_point.local_point);
+        if (!slot.has_value())
+            continue;
+
+        const float score = 1.f - std::clamp(remembered_point.rfe / std::max(1e-4f, kRememberedRfeMax), 0.f, 1.f);
+        slot_scores[remembered_slot_index(*slot)] = std::max(slot_scores[remembered_slot_index(*slot)], score);
+    }
+
+    float slot_score_sum = 0.f;
+    for (float score : slot_scores)
+        slot_score_sum += score;
+
+    return slot_score_sum / static_cast<float>(slot_scores.size());
+}
+
+bool ControllerObstacleTracker::has_compelling_absence_evidence(std::uint64_t timestamp_ms,
+                                                                const ControllerRobotPose &robot_pose,
+                                                                const TemporaryObstacleInstance &instance)
+{
+    if (!params_ || instance.missed_updates < kRemovalEvidenceMinMissedUpdates)
+        return false;
+
+    const auto &state = instance.model.state();
+    const Eigen::Vector2f center_robot = robot_pose.as_transform().inverse() * state.center;
+    // The obstacle must be in front of the body for its absence to mean anything — behind it, "we see no
+    // points there" is a statement about the sensor, not about the world.
+    if (center_robot.y() <= body_.support_radius(0.f, {0.f, 1.f}))
+        return false;
+
+    const auto points_world = read_temporary_obstacle_points(timestamp_ms,
+                                                            robot_pose,
+                                                            state.center,
+                                                            instance.model.association_radius(),
+                                                            false);
+    if (points_world.size() < static_cast<std::size_t>(std::max(3, params_->temporary_obstacle_min_points / 2)))
+        return false;
+
+    const Eigen::Vector2f view_dir_world = state.center - robot_pose.pos;
+    const float view_norm = view_dir_world.norm();
+    if (view_norm < 1e-4f)
+        return false;
+
+    const float visibility_scale = distance_visibility_scale(params_, robot_pose, state);
+    const int required_penetrating_points = std::max(kRemovalEvidenceMinPenetratingPoints,
+                                                     static_cast<int>(std::ceil(static_cast<float>(kRemovalEvidenceMinPenetratingPoints)
+                                                                                 / visibility_scale)));
+
+    const Eigen::Vector2f away_local = Eigen::Rotation2Df(-state.yaw_rad) * (view_dir_world / view_norm);
+    const bool dominant_x = std::abs(away_local.x()) >= std::abs(away_local.y());
+    const float away_sign = dominant_x ? (away_local.x() >= 0.f ? 1.f : -1.f)
+                                      : (away_local.y() >= 0.f ? 1.f : -1.f);
+    const float half_width = state.width_m * 0.5f;
+    const float half_depth = state.depth_m * 0.5f;
+
+    int support_points = 0;
+    int penetrating_points = 0;
+    for (const auto &point_world : points_world)
+    {
+        const Eigen::Vector2f local = to_local_point(state, point_world);
+        const float sdf = obstacle_sdf(state, point_world);
+        if (std::abs(sdf) < kRemovalSupportDistanceThreshold)
+            ++support_points;
+
+        if (dominant_x)
+        {
+            if (std::abs(local.y()) > half_depth + kRemovalCrossAxisMargin)
+                continue;
+            const float near_face = -away_sign * half_width;
+            const float penetration = away_sign * (local.x() - near_face);
+            if (penetration > kRemovalPenetrationMargin)
+                ++penetrating_points;
+        }
+        else
+        {
+            if (std::abs(local.x()) > half_width + kRemovalCrossAxisMargin)
+                continue;
+            const float near_face = -away_sign * half_depth;
+            const float penetration = away_sign * (local.y() - near_face);
+            if (penetration > kRemovalPenetrationMargin)
+                ++penetrating_points;
+        }
+    }
+
+    return support_points <= 1 && penetrating_points >= required_penetrating_points;
+}
+
+namespace
+{
+// Worst-axis position sigma (m) from an object's RT edge covariance, or 0 when unavailable.
+//
+// LAYOUT: 6x6 row-major SE3 [x,y,z,rx,ry,rz] (see RT_COVARIANCE_BLOCK_SIZE in cortex's dsr_rt_api.cpp
+// and the writers in each concept agent), so var_x = [0] and var_y = [1*6+1] = [7]. ★Yaw would be
+// [5*6+5] = [35], NOT [14] — [14] is var_z.
+//
+// EXACT size 36 only. Concept agents write a single block straight onto the edge, but cortex's RT api
+// keeps a RING of blocks on edges it manages; block 0 of a ring is not the newest, and quietly planning
+// against a stale covariance is worse than not using one at all. A ring needs the head index, which is
+// a separate change.
+float object_position_sigma_from_edge(const std::shared_ptr<DSR::DSRGraph> &graph, const DSR::Node &node)
+{
+    if (graph == nullptr) return 0.f;
+    const auto parent = graph->get_attrib_by_name<parent_att>(node);
+    if (not parent.has_value()) return 0.f;
+    const auto edge = graph->get_edge(parent.value(), node.id(), "RT");
+    if (not edge.has_value()) return 0.f;
+    const auto cov = graph->get_attrib_by_name<rt_covariance_att>(edge.value());
+    if (not cov.has_value()) return 0.f;
+    const auto &c = cov.value().get();
+    if (c.size() != 36) return 0.f;
+    return std::sqrt(std::max(0.f, std::max(c[0], c[7])));
+}
+}   // namespace
+
+void ControllerObstacleTracker::prune_expired_temporary_obstacles(std::uint64_t timestamp_ms)
+{
+    Q_UNUSED(timestamp_ms)
+    if (!params_)
+        return;
+
+    auto first_removed = std::remove_if(temporary_obstacles_.begin(),
+                                        temporary_obstacles_.end(),
+                                        [this](const auto &instance)
+                                        {
+                                            return instance.existence_log_odds
+                                                < params_->temporary_obstacle_existence_remove_threshold_log_odds;
+                                        });
+    for (auto it = first_removed; it != temporary_obstacles_.end(); ++it)
+        delete_published_obstacle_node(*it);
+    temporary_obstacles_.erase(first_removed, temporary_obstacles_.end());
+}
+
+std::optional<std::size_t> ControllerObstacleTracker::match_temporary_obstacle(const ControllerObstacleObservation &observation) const
+{
+    std::optional<std::size_t> best_index;
+    float best_distance = std::numeric_limits<float>::max();
+    const float observation_match_radius = 0.5f * std::sqrt(observation.width_m * observation.width_m
+                                                           + observation.depth_m * observation.depth_m);
+
+    for (std::size_t index = 0; index < temporary_obstacles_.size(); ++index)
+    {
+        const auto &instance = temporary_obstacles_[index];
+        const float distance = (instance.model.state().center - observation.centroid).norm();
+        const float max_distance = std::max(instance.model.association_radius(), observation_match_radius + 0.2f);
+        if (distance <= max_distance && distance < best_distance)
+        {
+            best_distance = distance;
+            best_index = index;
+        }
+    }
+
+    return best_index;
+}
+
+ControllerPolygons ControllerObstacleTracker::read_obstacle_polygons(std::uint64_t timestamp_ms)
+{
+    ControllerPolygons obstacles;
+    known_graph_obstacles_.clear();
+    display_obstacle_polygons_.clear();
+    object_label_counts_.clear();   // per-type object tags (t_1/c_1/b_1) restart each rebuild
+    obstacle_label_count_ = 0;      // shared o_N counter spans graph "obstacle" nodes + temporaries
+    std::ostringstream report;
+    std::ostringstream object_report;
+    if (!graph_ || !inner_eigen_api_ || !graph_state_ || graph_state_->world_name.empty())
+    {
+        if (obstacle_debug_report_ != "Obstacle debug: graph or inner api not ready")
+        {
+            obstacle_debug_report_ = "Obstacle debug: graph or inner api not ready";
+            std::print("{}\n", obstacle_debug_report_);
+            std::fflush(stdout);
+        }
+        return obstacles;
+    }
+
+    auto world_node = graph_state_->world_id != 0 ? graph_->get_node(graph_state_->world_id) : std::optional<DSR::Node>{};
+
+    const auto time_query = params_ && params_->interpolate_rt ? DSR::RT_API::TimeQuery::Interpolated
+                                                               : DSR::RT_API::TimeQuery::Nearest;
+    auto is_robot_body_node = [this](const auto &node)
+    {
+        return graph_state_ && (node.id() == graph_state_->robot_id
+            || node.name() == graph_state_->robot_name
+            || node.type() == "robot"
+            || node.type() == "body"
+            || node.name() == "body");
+    };
+
+    // Gather every graph node that represents a real shaped object the robot must avoid AND that can
+    // EXPLAIN/retire a controller-published temporary obstacle. Post graph-schema migration every
+    // concept agent's node is the generic type "object" (class in the object_subtype attribute), so
+    // "object" catches all of them; "obstacle" catches the controller's own published temp obstacles.
+    // (The old per-class entries "table"/"cylinder"/"chair" are dead now — no node carries those types.)
+    // ★`metaconcept` is DELIBERATELY absent: a level-2 arrangement (ring_metaconcept's dining_set) is a
+    // belief about a RELATION among nodes, not a shaped thing. Its published footprint is the ring's
+    // extent — the robot drives through the middle of it — and its members are already here as their own
+    // `object` nodes, so adopting the rig would double-count them behind one huge phantom box.
+    static constexpr std::array<const char *, 2> kObjectTypes = {"object", "obstacle"};
+    std::vector<DSR::Node> obstacle_nodes;
+    std::unordered_set<std::uint64_t> obstacle_node_ids;
+    for (const char *type : kObjectTypes)
+        for (const auto &node : graph_->get_nodes_by_type(type))
+            if (obstacle_node_ids.insert(node.id()).second)
+                obstacle_nodes.push_back(node);
+
+    bool using_fallback_nodes = false;
+    if (obstacle_nodes.empty())
+    {
+        using_fallback_nodes = true;
+        for (const auto &node : graph_->get_nodes())
+        {
+            if (is_robot_body_node(node))
+                continue;
+            // Level-2 arrangements (ring_metaconcept's dining_set) publish width_m/depth_m as the
+            // ring's EXTENT so a viewer can outline it — but nothing occupies that footprint, and
+            // the robot must be free to drive through the middle of a dining set. The typed sweep
+            // above already excludes them by never asking for "metaconcept"; this width/depth
+            // fallback is the one path that could still turn an abstract grouping into an obstacle.
+            if (node.type() == "metaconcept")
+                continue;
+            // Plants and people have their own readers below (plant_discs.h, the person disc). They carry
+            // width_m/depth_m for residual's explainer box, and taking them here made every foliage disc an
+            // obstacle square and every trunk a second one — 128 plants x two timestamped RT queries each
+            // cost ~275 ms a cycle and held the control loop at ~3.5 Hz.
+            if (node.type() == "plant" or node.type() == "person")
+                continue;
+            // ★ THE ROOM IS NOT AN OBSTACLE. The room node carries width_m/depth_m (its extent, for viewers),
+            // so this width/depth sweep happily turns the entire room into one room-sized obstacle box — the
+            // robot is then inside a solid object covering every cell, no target is ever footprint-feasible,
+            // and the 2-D canvas paints the whole floor in the green Object colour instead of leaving it the
+            // near-white room fill. Observed live: 27018/27018 cells occupied with a green floor.
+            // This fallback only runs when NO typed object/obstacle node exists, which is a perfectly normal
+            // state (no concept agent running) — so the failure appears exactly when the world is EMPTIEST,
+            // which is the least likely case to be tested and the worst one to fail in.
+            // Excluded by identity, not by type, because room_concept's node type has changed before.
+            if (graph_state_->world_id != 0 and node.id() == graph_state_->world_id) continue;
+            if (node.name() == graph_state_->world_name or rc::world::is_frame_type(node.type())) continue;
+            // ...and the same for every other node that carries an extent WITHOUT being a thing to avoid.
+            // ★ THE FLOOR IS THE ONE THAT BIT US. room_concept publishes a node named "floor" whose
+            // width_m/depth_m are the WHOLE ROOM's extent (room_scene_graph.cpp:887) purely so a viewer can
+            // scale its display mesh. This sweep turned it into a room-sized obstacle box: every cell
+            // occupied, no target ever footprint-feasible, and the 2-D canvas painted entirely in the green
+            // Object colour — the literal "green floor". Walls are the same story (width_m = wall length).
+            // These carry an extent because something has to DRAW them, which is not the same as something
+            // to drive around: the room boundary is already enforced by the room polygon, and the residual
+            // hulls arrive separately, already shaped.
+            // Matched by type AND name, because these node types have been renamed before in this codebase
+            // and a silent miss here disables navigation completely rather than degrading it.
+            static constexpr std::array<const char *, 7> kNotObstacles = {"floor", "wall", "plane", "grid", "room", "field", "world"};
+            const auto is_infrastructure = [&](const auto &n)
+            {
+                for (const char *t : kNotObstacles)
+                    if (n.type() == t or n.name() == t or n.name().starts_with(std::string(t) + "_"))
+                        return true;
+                return n.name() == "residual";
+            };
+            if (is_infrastructure(node)) continue;
+
+            const auto width_attr = graph_->get_attrib_by_name<width_m_att>(node);
+            const auto depth_attr = graph_->get_attrib_by_name<depth_m_att>(node);
+            if (!width_attr.has_value() || !depth_attr.has_value())
+                continue;
+
+            const auto translation = inner_eigen_api_->transform(graph_state_->world_name,
+                                                                 node.name(),
+                                                                 timestamp_ms,
+                                                                 "RT",
+                                                                 time_query);
+            const auto euler = inner_eigen_api_->get_euler_xyz_angles(graph_state_->world_name,
+                                                                      node.name(),
+                                                                      timestamp_ms,
+                                                                      "RT",
+                                                                      time_query);
+            if (!translation.has_value() || !euler.has_value())
+                continue;
+
+            obstacle_nodes.push_back(node);
+        }
+    }
+
+    report << "Obstacle debug: room='" << graph_state_->world_name << "' nodes=" << obstacle_nodes.size();
+    object_report << "Graph objects debug: room='" << graph_state_->world_name << "'";
+    if (using_fallback_nodes)
+        report << " fallback=width_depth_rt";
+
+    std::vector<bool> adopted_temporary_obstacles(temporary_obstacles_.size(), false);
+    auto adopt_temporary_obstacle_into_object = [this, &world_node, timestamp_ms](DSR::Node &node, const ControllerObstacleState &state)
+    {
+        if (!graph_ || !rt_api_ || !world_node.has_value())
+            return false;
+
+        const auto parent_id = world_node->id();
+
+        graph_->add_or_modify_attrib_local<width_m_att>(node, state.width_m);
+        graph_->add_or_modify_attrib_local<depth_m_att>(node, state.depth_m);
+        graph_->add_or_modify_attrib_local<height_m_att>(node, kPublishedObstacleHeightM);
+        graph_->add_or_modify_attrib_local<level_att>(node, 3);
+        graph_->add_or_modify_attrib_local<parent_att>(node, parent_id);
+        if (!graph_->update_node(node))
+            return false;
+
+        rt_api_->insert_or_assign_edge_RT(world_node.value(),
+                                          node.id(),
+                                          {state.center.x(), state.center.y(), 0.5f * kPublishedObstacleHeightM},
+                                          {0.f, 0.f, state.yaw_rad},
+                                          timestamp_ms);
+        return true;
+    };
+
+    for (const auto &node : obstacle_nodes)
+    {
+        if (is_robot_body_node(node))
+        {
+            report << " | node='" << node.name() << "' type='" << node.type() << "' skipped=self";
+            continue;
+        }
+
+        const bool is_tracker_published_obstacle = node.type() == "obstacle"
+            && std::any_of(temporary_obstacles_.begin(), temporary_obstacles_.end(), [&node](const auto &instance)
+               {
+                   return instance.published_node_id != 0 && instance.published_node_id == node.id();
+               });
+        if (is_tracker_published_obstacle)
+        {
+            report << " | node='" << node.name() << "' type='" << node.type() << "' skipped=local_tmp";
+            continue;
+        }
+
+        report << " | node='" << node.name() << "' type='" << node.type() << "'";
+        const auto translation = inner_eigen_api_->transform(graph_state_->world_name,
+                                                             node.name(),
+                                                             timestamp_ms,
+                                                             "RT",
+                                                             time_query);
+        const auto euler = inner_eigen_api_->get_euler_xyz_angles(graph_state_->world_name,
+                                                                  node.name(),
+                                                                  timestamp_ms,
+                                                                  "RT",
+                                                                  time_query);
+        if (!translation.has_value() || !euler.has_value())
+        {
+            report << " missing_rt";
+            continue;
+        }
+
+        const Eigen::Vector2f center(static_cast<float>(translation->x()), static_cast<float>(translation->y()));
+        const float yaw = static_cast<float>(euler->z());
+        ControllerObstacleState state{.center = center,
+                                      .yaw_rad = yaw,
+                                      .width_m = 0.f,
+                                      .depth_m = 0.f};
+        const auto width_attr = graph_->get_attrib_by_name<width_m_att>(node);
+        const auto depth_attr = graph_->get_attrib_by_name<depth_m_att>(node);
+        const bool has_shape = width_attr.has_value() && depth_attr.has_value()
+            && std::isfinite(width_attr.value()) && std::isfinite(depth_attr.value())
+            && width_attr.value() > 0.f && depth_attr.value() > 0.f;
+        if (has_shape)
+        {
+            state.width_m = width_attr.value();
+            state.depth_m = depth_attr.value();
+            report << " size=(" << state.width_m << "," << state.depth_m << ")";
+        }
+
+        if (node.type() == "object")
+        {
+            std::optional<std::size_t> best_match;
+            float best_metric = std::numeric_limits<float>::max();
+            for (std::size_t index = 0; index < temporary_obstacles_.size(); ++index)
+            {
+                if (adopted_temporary_obstacles[index])
+                    continue;
+
+                const auto &candidate_state = temporary_obstacles_[index].model.state();
+                const bool close_enough = point_explained_by_obstacle(candidate_state, state.center, 0.2f)
+                    || (candidate_state.center - state.center).norm() <= std::max(0.6f, std::hypot(candidate_state.width_m, candidate_state.depth_m));
+                if (!close_enough)
+                    continue;
+
+                const float metric = obstacle_distance_shape_metric(candidate_state, state, has_shape);
+                if (metric < best_metric)
+                {
+                    best_metric = metric;
+                    best_match = index;
+                }
+            }
+
+            if (best_match.has_value() && best_metric <= 1.6f)
+            {
+                const auto &matched_state = temporary_obstacles_[best_match.value()].model.state();
+                auto updated_node = node;
+                if (adopt_temporary_obstacle_into_object(updated_node, matched_state))
+                {
+                    state = matched_state;
+                    adopted_temporary_obstacles[best_match.value()] = true;
+                    std::print("Obstacle adoption trace: object='{}' id={} <- temp='{}' temp_id={} metric={:.3f} center=({:.3f},{:.3f}) size=({:.3f},{:.3f}) yaw={:.3f}\n",
+                               node.name(),
+                               node.id(),
+                               published_obstacle_name(temporary_obstacles_[best_match.value()].id),
+                               temporary_obstacles_[best_match.value()].id,
+                               best_metric,
+                               state.center.x(),
+                               state.center.y(),
+                               state.width_m,
+                               state.depth_m,
+                               state.yaw_rad);
+                    std::fflush(stdout);
+                    report << " adopted_tmp='" << published_obstacle_name(temporary_obstacles_[best_match.value()].id)
+                           << "' metric=" << best_metric;
+                }
+            }
+
+            if (state.width_m <= 0.f || state.depth_m <= 0.f)
+            {
+                report << (has_shape ? " invalid_size" : " missing_attrs");
+                continue;
+            }
+        }
+        else if (!has_shape)
+        {
+            report << " missing_attrs";
+            continue;
+        }
+
+        if (state.width_m <= 0.f || state.depth_m <= 0.f)
+        {
+            report << " invalid_size";
+            continue;
+        }
+
+        // ── Clearance from the object's OWN position uncertainty — PLANNING COPY ONLY ───────────
+        // ★This must NOT touch `state`. state flows into known_graph_obstacles_ (the recorded geometry),
+        // into the display polygon and into round_radius_m, so inflating it in place makes the padded
+        // footprint the object's SIZE everywhere downstream — which is what blocked the robot when this
+        // was first written: the world model started believing tables were metres across.
+        //
+        // rt_covariance is a 6x6 row-major SE3 covariance [x,y,z,rx,ry,rz]; position variances are [0]
+        // and [1*6+1]=[7]. Concept agents write ONE 36-element block directly on the edge, unlike edges
+        // cortex's RT api manages, where it is a RING and block 0 is not the newest — hence the exact
+        // size test rather than a >=.
+        //
+        // ★AND IT MUST BE BOUNDED. A concept agent grows Sigma while it is not measuring the object, by
+        // design, so sigma rises without limit whenever the robot looks away — and an unbounded margin
+        // walls off the room. Past the robot's own radius, more clearance does not make a path safer, it
+        // makes it nonexistent; "I do not know where it is" is an argument to go and LOOK, which is what
+        // the epistemic affordances are for, not an argument to refuse to move.
+        ControllerObstacleState plan_state = state;   // planning-only; `state` stays the fitted truth
+        // Read sigma ALWAYS, even with the inflation disabled: the canvas draws it as a halo, and the
+        // whole point of that display is to watch sigma grow and shrink while the inflation is off.
+        const float sigma_pos = (node.type() != "obstacle")
+                              ? object_position_sigma_from_edge(graph_, node) : 0.f;
+        if (params_ != nullptr and params_->object_sigma_inflation_k > 0.f
+            and node.type() != "obstacle")
+        {
+            if (const float sigma = sigma_pos; sigma > 0.f)
+            {
+                const float want = 2.0f * params_->object_sigma_inflation_k * sigma;   // both sides
+                const float grow = std::min(want, std::max(0.f, params_->object_sigma_inflation_max_m));
+                plan_state.width_m += grow;
+                plan_state.depth_m += grow;
+                report << " sigma_pos=" << sigma << " inflated_by=" << grow
+                       << (grow < want ? " (CAPPED)" : "");
+            }
+        }
+
+        auto polygon = ControllerObstacleModel::polygon_from_state(plan_state);
+        report << " center=(" << state.center.x() << "," << state.center.y() << ") yaw=" << state.yaw_rad;
+        if (!polygon.empty())
+            report << " first_vertex=(" << polygon.front().x() << "," << polygon.front().y() << ")";
+        // Anything a concept agent modelled (object/table/cylinder/chair) is an "object"; only
+        // an explicit graph "obstacle" node counts as an unmodelled obstacle here.
+        const ControllerObstacleKind kind = node.type() == "obstacle"
+            ? ControllerObstacleKind::Obstacle
+            : ControllerObstacleKind::Object;
+        std::string visual_label;
+        bool round_footprint = false;
+        if (kind == ControllerObstacleKind::Object)
+        {
+            // Post-migration the node type is generic "object"; the class label lives in the
+            // object_subtype attribute (cosmetic log label). Fall back to type() for legacy nodes.
+            const auto subtype_attr = graph_->get_attrib_by_name<object_subtype_att>(node);
+            const std::string subtype = subtype_attr.value_or(node.type());
+            const std::string prefix = object_label_prefix(subtype);
+            visual_label = prefix + "_" + std::to_string(++object_label_counts_[prefix]);
+            // ROUND-vs-SQUARE comes off mesh_path, not off a shape attribute, because that IS the
+            // contract: object_subtype carries the CLASS ("table") for every table, and table_concept
+            // publishes its inferred SHAPE by choosing round_table.obj over table.obj (free-energy
+            // model evidence — see TableFitter::evaluate_shape). Sniffing the path is what the
+            // retina's 3D viewer already does; if that contract ever grows a real attribute this is
+            // the one line that has to follow it.
+            if (subtype == "table")
+                if (const auto mesh = graph_->get_attrib_by_name<mesh_path_att>(node); mesh.has_value())
+                    round_footprint = mesh.value().find("round") != std::string::npos;
+        }
+        else
+        {
+            visual_label = "o_" + std::to_string(++obstacle_label_count_);
+        }
+        if (kind == ControllerObstacleKind::Object)
+        {
+            object_report << " | object='" << node.name() << "' id=" << node.id()
+                          << " pos=(" << state.center.x() << "," << state.center.y() << ")"
+                          << " size=(" << state.width_m << "," << state.depth_m << ")"
+                          << " yaw=" << state.yaw_rad;
+        }
+        known_graph_obstacles_.push_back(GraphObstacleRecord{.node_id = node.id(),
+                                                             .node_name = node.name(),
+                                                             .state = state,
+                                                             .kind = kind});
+        display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+            .polygon = polygon,
+            .kind = kind,
+            .label = visual_label,
+            // The identity the canvas colours by — see ControllerObstacleVisual::color_key. The node
+            // name, not visual_label: that one is a per-rebuild counter and would re-hue an object
+            // whenever a sibling of the same type came or went.
+            .color_key = node.name(),
+            .round = round_footprint,
+            // The disc spans the same extent as the box it replaces: a round table whose belief says
+            // 0.90 m across is drawn 0.90 m across. Taking the LARGER of the two is what makes it a
+            // bound rather than a guess — the two are equal for a true disc and differ only while the
+            // fit is still settling, and under-drawing a footprint is the failure that matters.
+            .round_radius_m = round_footprint ? 0.5f * std::max(state.width_m, state.depth_m) : 0.f,
+            .sigma_pos_m = sigma_pos});
+        obstacles.push_back(std::move(polygon));
+    }
+
+    if (!adopted_temporary_obstacles.empty())
+    {
+        std::vector<TemporaryObstacleInstance> surviving_obstacles;
+        surviving_obstacles.reserve(temporary_obstacles_.size());
+        for (std::size_t index = 0; index < temporary_obstacles_.size(); ++index)
+        {
+            if (adopted_temporary_obstacles[index])
+            {
+                delete_published_obstacle_node(temporary_obstacles_[index]);
+                continue;
+            }
+            surviving_obstacles.push_back(std::move(temporary_obstacles_[index]));
+        }
+        temporary_obstacles_ = std::move(surviving_obstacles);
+    }
+
+    // ── PEOPLE: one disc per `person` node (human_concept), Controller.PersonRadiusM ──────────────────
+    // A person is avoided because retina + human_concept SAY there is a person, not only because residual has
+    // occupancy there: residual's cells of a walking person lag behind it, and the torso sits above the LiDAR's
+    // obstacle band. The disc is the body plus the room to leave a human; the planner then adds the robot's own
+    // footprint, exactly as for any other obstacle. Nearest-in-time pose: a person's RT edge is written at the
+    // skeleton rate, and an interpolated query past its newest sample would drop the person altogether.
+    if (params_ != nullptr and params_->person_radius_m > 0.f)
+    {
+        int n_people = 0;
+        for (const auto &person : graph_->get_nodes_by_type("person"))
+        {
+            const auto t = inner_eigen_api_->transform(graph_state_->world_name, person.name(), 0);
+            if (not t.has_value() or not t->allFinite())
+                continue;
+            const Eigen::Vector2f c(static_cast<float>(t->x()), static_cast<float>(t->y()));
+            ControllerPolygon disc;
+            constexpr int kSides = 12;
+            for (int k = 0; k < kSides; ++k)
+            {
+                const float a = 2.f * static_cast<float>(M_PI) * static_cast<float>(k) / kSides;
+                disc.emplace_back(c + params_->person_radius_m * Eigen::Vector2f(std::cos(a), std::sin(a)));
+            }
+            obstacles.push_back(disc);
+            display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                .polygon = disc, .kind = ControllerObstacleKind::Object, .label = "person"});
+            ++n_people;
+        }
+        report << " | people=" << n_people << " @r=" << params_->person_radius_m << "m";
+    }
+
+    // ── ROWS (row_metaconcept) and the TRUNKS not yet in one (trunk_concept) ───────────────────────────────
+    // field -> row -> plant (its trunk is an attribute of it). What the map marks is the ROW: a rectangle (row_<id> metaconcept: centre and heading
+    // on its RT, width_m along it, depth_m across) that grows as trunks join it; the robot may not enter it. A
+    // trunk not yet in any row (fewer than 3 on a line) is still forbidden space, as its own disc, until it joins
+    // one. Only trunks and rows: vegetation_concept's foliage says what can hide things, not where to drive.
+    {
+        std::set<std::uint64_t> in_row;
+        int n_rows = 0;
+        for (const auto &row : graph_->get_nodes_by_type("metaconcept"))
+        {
+            if (not row.name().starts_with("row_"))
+                continue;
+            const float len = graph_->get_attrib_by_name<width_m_att>(row).value_or(0.f);
+            const float wid = graph_->get_attrib_by_name<depth_m_att>(row).value_or(0.f);
+            const auto M = inner_eigen_api_->get_transformation_matrix(graph_state_->world_name, row.name(), 0);
+            if (not (len > 0.f and wid > 0.f) or not M.has_value())
+                continue;
+            // row --group_member--> plant: the plants (and so their trunks) covered by this row's rectangle.
+            for (const auto &[key, edge] : row.fano())
+                if (key.second == "group_member")
+                    in_row.insert(key.first);
+            const Eigen::Vector2f c(static_cast<float>(M.value()(0, 3)), static_cast<float>(M.value()(1, 3)));
+            const Eigen::Vector2f ax(static_cast<float>(M.value()(0, 0)), static_cast<float>(M.value()(1, 0)));
+            const Eigen::Vector2f ay(-ax.y(), ax.x());
+            const ControllerPolygon rect = {c + 0.5f * len * ax + 0.5f * wid * ay, c - 0.5f * len * ax + 0.5f * wid * ay,
+                                            c - 0.5f * len * ax - 0.5f * wid * ay, c + 0.5f * len * ax - 0.5f * wid * ay};
+            obstacles.push_back(rect);
+            display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                .polygon = rect, .kind = ControllerObstacleKind::Plant, .label = row.name()});
+            ++n_rows;
+        }
+        const auto disc_of = [](const Eigen::Vector2f &c, float r)
+        {
+            ControllerPolygon disc;
+            constexpr int kSides = 12;
+            for (int k = 0; k < kSides; ++k)
+            {
+                const float a = 2.f * static_cast<float>(M_PI) * static_cast<float>(k) / kSides;
+                disc.emplace_back(c + r * Eigen::Vector2f(std::cos(a), std::sin(a)));
+            }
+            return disc;
+        };
+        int n_lone = 0, n_no_trunk = 0, n_no_canopy = 0;
+        for (const auto &plant : rc::veg::read_plants(*graph_, *inner_eigen_api_, graph_state_->world_name))
+        {
+            // ── What the planner avoids: the keep-out disc of a trunk that is in no row (a row's rectangle
+            //    already covers its plants' trunks).
+            if (plant.has_trunk and plant.keepout_r > 0.f and not in_row.contains(plant.id))
+            {
+                const auto disc = disc_of(plant.origin, plant.keepout_r);
+                obstacles.push_back(disc);
+                display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                    .polygon = disc, .kind = ControllerObstacleKind::Plant, .label = {}});
+                ++n_lone;
+            }
+            // ── DISPLAY ONLY (the semantic map: never planned against): each plant's canopy and its trunk at the
+            //    measured diameter, and a red mark where a part is still missing — a canopy whose trunk is unseen,
+            //    or a trunk with no canopy seen around it.
+            const auto mark = [&](const Eigen::Vector2f &c, float r, ControllerObstacleKind kind)
+            {
+                display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                    .polygon = disc_of(c, r), .kind = kind, .label = {}, .color_key = plant.name,
+                    .round = true, .round_radius_m = r});
+            };
+            if (plant.has_canopy and plant.canopy_r > 0.f)
+                mark(plant.canopy_c, plant.canopy_r, ControllerObstacleKind::PlantCanopy);
+            else
+            {
+                mark(plant.origin, std::max(plant.keepout_r, 0.3f), ControllerObstacleKind::PlantMissing);
+                ++n_no_canopy;
+            }
+            if (plant.has_trunk)
+                mark(plant.origin, plant.trunk_r > 0.f ? plant.trunk_r : 0.04f, ControllerObstacleKind::PlantTrunk);
+            else
+            {
+                mark(plant.origin, 0.08f, ControllerObstacleKind::PlantMissing);
+                ++n_no_trunk;
+            }
+        }
+        if (n_rows > 0 or n_lone > 0)
+            report << " | rows=" << n_rows << " lone trunks=" << n_lone << " plants w/o trunk=" << n_no_trunk
+                   << " w/o canopy=" << n_no_canopy;
+    }
+
+    // ── residual_concept OCCUPANCY GRID: TAKEN AS CELLS, NOT AS POLYGONS ─────────────────────────
+    // ★★★THE ROUND TRIP IS GONE (2026-08-20). residual used to publish `grid_obstacle_hulls`: each
+    // connected component of its occupancy, C-space inflated by 0.25 m, decomposed into an exact
+    // rectangular cover, which this function decoded back into polygons for the planner to rasterise
+    // into a grid again. Two faults lived in that trip. The inflation was counted TWICE — 0.25 m here
+    // plus the robot's own half-extent applied by GridPlanner at query time — so one 5 cm cell of
+    // residual became a no-go zone close to a metre across; and a cover of tiles is a lossy,
+    // unstable re-encoding of a grid, which churned the planner's world at 20 Hz under a stationary
+    // robot (measured: one (cell,pose) verdict re-decided 33 times in five minutes).
+    // ★So take what residual actually knows: `grid_occupied_cells`, its own resolution, marked
+    // directly. The robot's shape is then applied exactly once, where it belongs.
+    if (const auto g = graph_->get_node("residual"); g.has_value())
+    {
+        residual_cells_.clear();
+        residual_cell_size_m_ = 0.f;
+        if (const auto cs = graph_->get_attrib_by_name<grid_cell_size_att>(g.value()); cs.has_value())
+            residual_cell_size_m_ = cs.value();
+        if (const auto opt = graph_->get_attrib_by_name<grid_occupied_cells_att>(g.value()); opt.has_value())
+        {
+            const auto &f = opt.value().get();
+            residual_cells_.reserve(f.size() / 3);
+            for (std::size_t i = 0; i + 2 < f.size(); i += 3)      // [x,y,z] triplets; z is the cell's top
+                residual_cells_.emplace_back(f[i], f[i + 1]);
+            // Drawn as what they are — one square per occupied cell at residual's own resolution. The
+            // display used to show the inflated hulls, which over-stated the obstacle by a body width
+            // and hid exactly the discrepancy this change exists to remove.
+            if (residual_cell_size_m_ > 0.f)
+            {
+                const float h = 0.5f * residual_cell_size_m_;
+                for (const auto &c : residual_cells_)
+                    display_obstacle_polygons_.push_back(ControllerObstacleVisual{
+                        .polygon = ControllerPolygon{{c.x() - h, c.y() - h}, {c.x() + h, c.y() - h},
+                                                     {c.x() + h, c.y() + h}, {c.x() - h, c.y() + h}},
+                        .kind = ControllerObstacleKind::GridOccupancy, .label = {}});
+            }
+        }
+        report << " | grid_cells=" << residual_cells_.size() << " @" << residual_cell_size_m_ << "m";
+    }
+
+    report << " | drawn=" << obstacles.size();
+    // Per-cycle obstacle/object debug prints removed (they embedded the table's wobbling size/center,
+    // so the dedup reprinted every frame and clogged the console).
+
+    return obstacles;
+}
+
+void ControllerObstacleTracker::update_active_obstacle_polygons(std::uint64_t timestamp_ms,
+                                                                rc::TrajectoryController &path_controller)
+{
+    prune_expired_temporary_obstacles(timestamp_ms);
+    obstacle_polygons_ = read_obstacle_polygons(timestamp_ms);
+    retire_temporary_obstacles_explained_by_graph();
+    std::ostringstream current_obstacles_report;
+    current_obstacles_report << "Current obstacles debug:";
+    for (const auto &record : known_graph_obstacles_)
+    {
+        current_obstacles_report << " | kind="
+                                 << (record.kind == ControllerObstacleKind::Object ? "object" : "obstacle")
+                                 << " name='" << record.node_name << "' id=" << record.node_id
+                                 << " pos=(" << record.state.center.x() << "," << record.state.center.y() << ")"
+                                 << " size=(" << record.state.width_m << "," << record.state.depth_m << ")"
+                                 << " yaw=" << record.state.yaw_rad;
+    }
+    for (const auto &instance : temporary_obstacles_)
+    {
+        const auto &state = instance.model.state();
+        current_obstacles_report << " | kind=temporary"
+                                 << " name='" << published_obstacle_name(instance.id) << "' id=" << instance.id
+                                 << " pos=(" << state.center.x() << "," << state.center.y() << ")"
+                                 << " size=(" << state.width_m << "," << state.depth_m << ")"
+                                 << " yaw=" << state.yaw_rad;
+        const auto polygon = instance.model.polygon();
+        obstacle_polygons_.push_back(polygon);
+        display_obstacle_polygons_.push_back(ControllerObstacleVisual{.polygon = polygon,
+                                                                      .kind = ControllerObstacleKind::Temporary,
+                                                                      .label = "o_" + std::to_string(++obstacle_label_count_)});
+    }
+    // Local-only virtual obstacles (stuck recovery): geometric discs the planner/MPPI must avoid,
+    // aged out on their TTL. Appended to obstacle_polygons_ here but deliberately left OUT of
+    // sync_temporary_obstacles_to_dsr below (that loop only walks temporary_obstacles_), so they
+    // never reach the DSR graph.
+    std::erase_if(virtual_obstacles_, [&](const VirtualObstacle &vo)
+                  { return vo.expires_at_ms != 0 and timestamp_ms >= vo.expires_at_ms; });
+    for (const auto &vo : virtual_obstacles_)
+    {
+        const float side = 2.f * vo.radius_m;
+        const auto polygon = make_obstacle_polygon(vo.center, 0.f, side, side);
+        obstacle_polygons_.push_back(polygon);
+        display_obstacle_polygons_.push_back(ControllerObstacleVisual{.polygon = polygon,
+                                                                      .kind = ControllerObstacleKind::Temporary,
+                                                                      .label = "v_" + std::to_string(++obstacle_label_count_)});
+    }
+    // Per-cycle "Current obstacles debug" print removed (wobbling geometry → reprinted every frame).
+    sync_temporary_obstacles_to_dsr(timestamp_ms);
+    path_controller.set_static_obstacles(obstacle_polygons_);
+}
+
+void ControllerObstacleTracker::add_virtual_obstacle(std::uint64_t now_ms,
+                                                     const Eigen::Vector2f &center,
+                                                     float radius_m)
+{
+    const float radius = std::max(0.05f, radius_m);
+    const std::uint64_t ttl = params_ ? params_->stuck_virtual_obstacle_ttl_ms : 5000;
+    const std::uint64_t expires_at = ttl != 0 ? now_ms + ttl : 0;
+    // Refresh-or-create: if a virtual disc already covers this spot (repeated escapes at the same
+    // wedge), grow it to the larger radius and reset its TTL instead of stacking duplicates.
+    for (auto &vo : virtual_obstacles_)
+        if ((vo.center - center).norm() <= std::max(vo.radius_m, radius))
+        {
+            vo.center = center;
+            vo.radius_m = std::max(vo.radius_m, radius);
+            vo.expires_at_ms = expires_at;
+            return;
+        }
+    virtual_obstacles_.push_back(VirtualObstacle{.center = center, .radius_m = radius, .expires_at_ms = expires_at});
+}
+
+void ControllerObstacleTracker::refresh_temporary_lidar_obstacle(std::uint64_t timestamp_ms,
+                                                                 const ControllerRobotPose &robot_pose,
+                                                                 rc::TrajectoryController &path_controller)
+{
+    if (!params_ || temporary_obstacles_.empty())
+        return;
+
+    prune_expired_temporary_obstacles(timestamp_ms);
+    for (auto &instance : temporary_obstacles_)
+    {
+        const auto observation = build_temporary_obstacle_observation(timestamp_ms,
+                                                                      robot_pose,
+                                                                      instance.model.state().center,
+                                                                      instance.model.association_radius(),
+                                                                      false);
+        if (!observation.has_value()
+            || (observation->centroid - instance.model.state().center).norm() > instance.model.association_radius())
+        {
+            ++instance.missed_updates;
+            const float visibility_scale = distance_visibility_scale(params_, robot_pose, instance.model.state());
+            if (has_compelling_absence_evidence(timestamp_ms, robot_pose, instance))
+                instance.existence_log_odds = std::clamp(instance.existence_log_odds
+                                                             - params_->temporary_obstacle_existence_absence_penalty * visibility_scale,
+                                                         params_->temporary_obstacle_existence_min_log_odds,
+                                                         params_->temporary_obstacle_existence_max_log_odds);
+            else
+                instance.existence_log_odds = std::clamp(instance.existence_log_odds
+                                                             - params_->temporary_obstacle_existence_weak_miss_penalty * visibility_scale,
+                                                         params_->temporary_obstacle_existence_min_log_odds,
+                                                         params_->temporary_obstacle_existence_max_log_odds);
+            continue;
+        }
+
+        const auto augmented_observation = augment_with_remembered_points(*observation, instance);
+        instance.free_energy = instance.model.update(augmented_observation, size_hardening_evidence(instance));
+        update_remembered_points(instance, *observation);
+        int support_points = 0;
+        for (const auto &point : observation->points)
+        {
+            if (std::abs(obstacle_sdf(instance.model.state(), point)) < kRemovalSupportDistanceThreshold)
+                ++support_points;
+        }
+        const float positive_delta = params_->temporary_obstacle_existence_observation_bias
+                       + params_->temporary_obstacle_existence_support_gain * static_cast<float>(support_points)
+                       + params_->temporary_obstacle_existence_remembered_gain * static_cast<float>(instance.remembered_points.size());
+        instance.existence_log_odds = std::clamp(instance.existence_log_odds + positive_delta,
+                             params_->temporary_obstacle_existence_min_log_odds,
+                             params_->temporary_obstacle_existence_max_log_odds);
+        instance.last_seen_ms = timestamp_ms;
+        instance.expires_at_ms = 0;
+        instance.missed_updates = 0;
+    }
+
+    update_active_obstacle_polygons(timestamp_ms, path_controller);
+}
+
+std::vector<Eigen::Vector3f> ControllerObstacleTracker::read_recent_lidar_points_in_world(std::uint64_t timestamp_ms,
+                                                                                          int max_scans)
+{
+    std::vector<Eigen::Vector3f> points;
+    const int scan_count = std::clamp(max_scans, 1, 5);
+    const std::uint64_t anchor_timestamp_ms = last_lidar_timestamp_ms_.value_or(timestamp_ms);
+    const std::uint64_t step_ms = std::clamp(lidar_period_ms_, std::uint64_t{20}, std::uint64_t{250});
+    const std::uint64_t max_diff_ms = std::max<std::uint64_t>(20ULL, step_ms / 2);
+
+    for (int scan_index = 0; scan_index < scan_count; ++scan_index)
+    {
+        const std::uint64_t offset_ms = static_cast<std::uint64_t>(scan_index) * step_ms;
+        const std::uint64_t query_timestamp_ms = anchor_timestamp_ms > offset_ms
+            ? anchor_timestamp_ms - offset_ms
+            : 0ULL;
+
+        const auto [cloud_opt] = lidar_world_buffer_.read(query_timestamp_ms, max_diff_ms);
+        if (!cloud_opt.has_value())
+            continue;
+
+        const auto &[xs_world, ys_world, zs_world] = cloud_opt.value();
+        const std::size_t count = std::min({xs_world.size(), ys_world.size(), zs_world.size()});
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            const float x_world = xs_world[index];
+            const float y_world = ys_world[index];
+            const float z_world = zs_world[index];
+            if (!std::isfinite(x_world) || !std::isfinite(y_world) || !std::isfinite(z_world))
+                continue;
+            points.emplace_back(x_world, y_world, z_world);
+        }
+    }
+
+    return points;
+}
+
+bool ControllerObstacleTracker::create_temporary_lidar_obstacle(std::uint64_t timestamp_ms,
+                                                                const ControllerRobotPose &robot_pose,
+                                                                const Eigen::Vector2f &blockage_center_world,
+                                                                float blockage_radius_m,
+                                                                rc::TrajectoryController &path_controller)
+{
+    if (!params_)
+        return false;
+
+    prune_expired_temporary_obstacles(timestamp_ms);
+
+    const float cluster_margin = std::max(0.f, params_->temporary_obstacle_cluster_margin_m);
+    const auto observation = build_temporary_obstacle_observation(timestamp_ms,
+                                                                  robot_pose,
+                                                                  blockage_center_world,
+                                                                  std::max(blockage_radius_m + cluster_margin, cluster_margin),
+                                                                  true);
+    if (!observation.has_value())
+        return false;
+
+    // Hard invariant: never create an obstacle whose footprint intersects the robot body. Such a box is
+    // either a self/floor phantom or something we are already in contact with; injected into the planner
+    // it just traps every MPPI rollout ("already in collision") and can't be routed around — backing out
+    // is the stuck-recovery escape's job, not a planner obstacle's. Require the fitted box surface to sit
+    // outside the body — worst-case extent, since obstacle_sdf returns a bare distance with no bearing.
+    const ControllerObstacleState candidate{.center = observation->centroid,
+                                            .yaw_rad = observation->yaw_rad,
+                                            .width_m = observation->width_m,
+                                            .depth_m = observation->depth_m};
+    if (obstacle_sdf(candidate, robot_pose.pos) < body_.circumscribed_radius())
+        return false;
+
+    ingest_obstacle_observation(*observation, timestamp_ms);
+
+    update_active_obstacle_polygons(timestamp_ms, path_controller);
+    return true;
+}
+
+// Match-or-create a temporary obstacle from an observation and bump its Bayesian existence filter.
+// Extracted so the reactive blockage path and the proactive scan share one code path.
+void ControllerObstacleTracker::ingest_obstacle_observation(const ControllerObstacleObservation &observation,
+                                                            std::uint64_t timestamp_ms)
+{
+    if (!params_)
+        return;
+
+    if (const auto matched_index = match_temporary_obstacle(observation); matched_index.has_value())
+    {
+        auto &instance = temporary_obstacles_[matched_index.value()];
+        const auto augmented_observation = augment_with_remembered_points(observation, instance);
+        instance.free_energy = instance.model.update(augmented_observation, size_hardening_evidence(instance));
+        update_remembered_points(instance, observation);
+        int support_points = 0;
+        for (const auto &point : observation.points)
+            if (std::abs(obstacle_sdf(instance.model.state(), point)) < kRemovalSupportDistanceThreshold)
+                ++support_points;
+        const float positive_delta = params_->temporary_obstacle_existence_observation_bias
+                       + params_->temporary_obstacle_existence_support_gain * static_cast<float>(support_points)
+                       + params_->temporary_obstacle_existence_remembered_gain * static_cast<float>(instance.remembered_points.size());
+        instance.existence_log_odds = std::clamp(instance.existence_log_odds + positive_delta,
+                             params_->temporary_obstacle_existence_min_log_odds,
+                             params_->temporary_obstacle_existence_max_log_odds);
+        instance.last_seen_ms = timestamp_ms;
+        instance.expires_at_ms = 0;
+        instance.missed_updates = 0;
+    }
+    else
+    {
+        ControllerObstacleState initial_state{.center = estimate_initial_obstacle_center(observation),
+                                              .yaw_rad = observation.yaw_rad,
+                                              .width_m = observation.width_m,
+                                              .depth_m = observation.depth_m};
+        TemporaryObstacleInstance instance;
+        instance.id = next_temporary_obstacle_id_++;
+        instance.model = ControllerObstacleModel(initial_state, make_model_params());
+        instance.free_energy = instance.model.update(observation, 0.f);
+        update_remembered_points(instance, observation);
+        instance.existence_log_odds = params_->temporary_obstacle_existence_init_log_odds;
+        instance.last_seen_ms = timestamp_ms;
+        instance.expires_at_ms = 0;
+        temporary_obstacles_.push_back(std::move(instance));
+    }
+}
+
+namespace
+{
+bool point_in_polygon_2d(const std::vector<Eigen::Vector2f> &poly, const Eigen::Vector2f &p)
+{
+    bool inside = false;
+    const std::size_t n = poly.size();
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+        if (((poly[i].y() > p.y()) != (poly[j].y() > p.y())) &&
+            (p.x() < (poly[j].x() - poly[i].x()) * (p.y() - poly[i].y()) /
+                         (poly[j].y() - poly[i].y() + 1e-12f) + poly[i].x()))
+            inside = !inside;
+    return inside;
+}
+
+float distance_to_polygon_edges(const std::vector<Eigen::Vector2f> &poly, const Eigen::Vector2f &p)
+{
+    float best = std::numeric_limits<float>::max();
+    const std::size_t n = poly.size();
+    for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+    {
+        const Eigen::Vector2f a = poly[j], b = poly[i];
+        const Eigen::Vector2f ab = b - a;
+        const float t = std::clamp((p - a).dot(ab) / std::max(ab.squaredNorm(), 1e-9f), 0.0f, 1.0f);
+        best = std::min(best, (p - (a + t * ab)).norm());
+    }
+    return best;
+}
+}  // namespace
+
+ControllerObstacleTracker::ObstacleProximityDiag
+ControllerObstacleTracker::obstacle_proximity_diag(const Eigen::Vector2f &query_world,
+                                                   std::uint64_t now_ms) const
+{
+    ObstacleProximityDiag diag;
+    diag.n_temp = static_cast<int>(temporary_obstacles_.size());
+    diag.n_virtual = static_cast<int>(virtual_obstacles_.size());
+
+    float best_temp = std::numeric_limits<float>::infinity();
+    for (const auto &instance : temporary_obstacles_)
+    {
+        const auto polygon = instance.model.polygon();
+        if (polygon.size() < 2)
+            continue;
+        float d = distance_to_polygon_edges(polygon, query_world);
+        if (point_in_polygon_2d(polygon, query_world))
+            d = -d;   // robot centre INSIDE the obstacle ⇒ hard self-collision trap (negative distance)
+        if (d < best_temp)
+        {
+            best_temp = d;
+            diag.near_temp_m = d;
+            diag.near_temp_log_odds = instance.existence_log_odds;
+            diag.near_temp_missed = instance.missed_updates;
+            diag.near_temp_age_ms = now_ms >= instance.last_seen_ms ? now_ms - instance.last_seen_ms : 0;
+        }
+    }
+
+    float best_virt = std::numeric_limits<float>::infinity();
+    for (const auto &vo : virtual_obstacles_)
+        best_virt = std::min(best_virt, (query_world - vo.center).norm() - vo.radius_m);  // <0 ⇒ inside disc
+    if (std::isfinite(best_virt))
+        diag.near_virtual_m = best_virt;
+
+    return diag;
+}
+
+ControllerObstacleTracker::NearestObstacleInfo
+ControllerObstacleTracker::nearest_obstacle_info(const Eigen::Vector2f &query_world, float robot_theta) const
+{
+    NearestObstacleInfo info;
+    float best = std::numeric_limits<float>::infinity();
+    Eigen::Vector2f best_point = Eigen::Vector2f::Zero();
+
+    for (const auto &visual : display_obstacle_polygons_)
+    {
+        if (is_display_only(visual.kind))
+            continue;   // the plants' semantic-map marks are not obstacles
+        const auto &poly = visual.polygon;
+        const std::size_t n = poly.size();
+        if (n < 2)
+            continue;
+        for (std::size_t i = 0; i < n; ++i)   // min point-to-edge distance, same metric as nearest_obst_m
+        {
+            const Eigen::Vector2f &a = poly[i];
+            const Eigen::Vector2f &b = poly[(i + 1) % n];
+            const Eigen::Vector2f ab = b - a;
+            const float len2 = ab.squaredNorm();
+            const float t = len2 > 1e-9f ? std::clamp((query_world - a).dot(ab) / len2, 0.f, 1.f) : 0.f;
+            const Eigen::Vector2f closest = a + t * ab;
+            const float d = (query_world - closest).norm();
+            if (d < best)
+            {
+                best = d;
+                best_point = closest;
+                info.kind = visual.kind;
+                info.label = visual.label;
+                info.inside = point_in_polygon_2d(poly, query_world);
+            }
+        }
+    }
+
+    if (!std::isfinite(best))
+        return {};
+    info.distance_m = best;
+    // Bearing of the offending edge in the ROBOT frame (x right, y forward), so the CSV says which way
+    // to look in the viewer rather than just how close it is.
+    const Eigen::Vector2f d_world = best_point - query_world;
+    const Eigen::Vector2f d_robot = Eigen::Rotation2Df(-robot_theta) * d_world;
+    info.bearing_deg = std::atan2(d_robot.x(), d_robot.y()) * 180.f / static_cast<float>(M_PI);
+    return info;
+}
+
+std::vector<Eigen::Vector2f> ControllerObstacleTracker::read_world_polygon_world_frame() const
+{
+    std::vector<Eigen::Vector2f> poly;
+    if (!graph_ || !graph_state_ || graph_state_->world_id == 0)
+        return poly;
+    const auto world = graph_->get_node(graph_state_->world_id);
+    if (!world.has_value())
+        return poly;
+    const auto px = graph_->get_attrib_by_name<delimiting_polygon_x_att>(world.value());
+    const auto py = graph_->get_attrib_by_name<delimiting_polygon_y_att>(world.value());
+    if (!px.has_value() || !py.has_value())
+        return poly;
+    const auto &xs = px->get();
+    const auto &ys = py->get();
+    const std::size_t n = std::min(xs.size(), ys.size());
+    poly.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+        poly.emplace_back(xs[i], ys[i]);
+    return poly;
+}
+
+void ControllerObstacleTracker::scan_for_unmodelled_obstacles(std::uint64_t timestamp_ms,
+                                                              const ControllerRobotPose &robot_pose,
+                                                              rc::TrajectoryController &path_controller)
+{
+    if (!params_)
+        return;
+
+    // Throttle: the full-scene cluster pass is heavier than the per-instance refresh, so run it at a
+    // few Hz, not every control cycle.
+    constexpr std::uint64_t kScanPeriodMs = 700;
+    if (last_scan_ms_ != 0 && timestamp_ms >= last_scan_ms_ && timestamp_ms - last_scan_ms_ < kScanPeriodMs)
+        return;
+    last_scan_ms_ = timestamp_ms;
+
+    // Cold start: ensure the known-object set is populated before filtering (otherwise a real table
+    // would be re-detected as an obstacle); in steady state it is refreshed every cycle elsewhere.
+    if (known_graph_obstacles_.empty())
+        (void)read_obstacle_polygons(timestamp_ms);
+    prune_expired_temporary_obstacles(timestamp_ms);
+
+    const auto points_world = read_recent_lidar_points_in_world(timestamp_ms, 2);
+    if (points_world.empty())
+        return;
+
+    // Tunables (local for now; promote to ControllerParams if they need field tuning).
+    const float kZMin = params_->unmodelled_scan_min_z_m;   // ignore floor returns
+    const float kZMax = params_->unmodelled_scan_max_z_m;   // ignore high ceiling/overhead returns
+    constexpr float kWallMarginM = 0.30f;   // drop returns near/beyond the room boundary (walls)
+    constexpr float kRobotRadiusM = 0.40f;  // drop the robot's own returns
+    constexpr float kCellM = 0.20f;         // grid-cluster cell size
+    constexpr std::size_t kMaxObstacles = 24;
+    const float explain_margin = std::max(0.08f, 0.5f * std::max(0.0f, params_->temporary_obstacle_padding_m));
+    const int   min_cluster_pts = std::max(4, params_->temporary_obstacle_min_points);
+
+    const auto world_poly = read_world_polygon_world_frame();
+    const bool have_world = world_poly.size() >= 3;
+
+    // ── Keep only LiDAR returns that NOTHING explains: not floor/ceiling, not the robot, inside the
+    //    room and clear of the walls, and not inside any modelled object (table/chair/cylinder/…). ──
+    std::vector<Eigen::Vector2f> unexplained;
+    unexplained.reserve(points_world.size());
+    for (const auto &p : points_world)
+    {
+        if (p.z() < kZMin || p.z() > kZMax)
+            continue;
+        const Eigen::Vector2f q(p.x(), p.y());
+        if ((q - robot_pose.pos).norm() < kRobotRadiusM)
+            continue;
+        if (have_world && (!point_in_polygon_2d(world_poly, q) || distance_to_polygon_edges(world_poly, q) < kWallMarginM))
+            continue;
+        bool explained = false;
+        for (const auto &known : known_graph_obstacles_)
+            if (point_explained_by_obstacle(known.state, q, explain_margin)) { explained = true; break; }
+        if (explained)
+            continue;
+        unexplained.push_back(q);
+    }
+    if (static_cast<int>(unexplained.size()) < min_cluster_pts)
+        return;
+
+    // ── Grid clustering: bin to cells, connect 8-neighbour occupied cells, gather per cluster. ──
+    auto pack = [](std::int32_t ix, std::int32_t iy) -> std::int64_t
+    { return (static_cast<std::int64_t>(ix) << 32) | static_cast<std::int64_t>(static_cast<std::uint32_t>(iy)); };
+    auto cell_of = [&](const Eigen::Vector2f &q) -> std::int64_t
+    { return pack(static_cast<std::int32_t>(std::floor(q.x() / kCellM)), static_cast<std::int32_t>(std::floor(q.y() / kCellM))); };
+
+    std::unordered_map<std::int64_t, std::vector<std::size_t>> cells;
+    for (std::size_t i = 0; i < unexplained.size(); ++i)
+        cells[cell_of(unexplained[i])].push_back(i);
+
+    std::unordered_set<std::int64_t> visited;
+    std::vector<std::vector<Eigen::Vector2f>> clusters;
+    for (const auto &[key, idxs] : cells)
+    {
+        (void)idxs;
+        if (visited.count(key))
+            continue;
+        std::vector<std::int64_t> stack{key};
+        visited.insert(key);
+        std::vector<Eigen::Vector2f> cluster;
+        while (!stack.empty())
+        {
+            const std::int64_t k = stack.back();
+            stack.pop_back();
+            const std::int32_t ix = static_cast<std::int32_t>(k >> 32);
+            const std::int32_t iy = static_cast<std::int32_t>(static_cast<std::uint32_t>(k & 0xffffffffLL));
+            for (const std::size_t pi : cells[k])
+                cluster.push_back(unexplained[pi]);
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    const std::int64_t nk = pack(ix + dx, iy + dy);
+                    if (cells.count(nk) && !visited.count(nk)) { visited.insert(nk); stack.push_back(nk); }
+                }
+        }
+        if (static_cast<int>(cluster.size()) >= min_cluster_pts)
+            clusters.push_back(std::move(cluster));
+    }
+
+    // ── Each cluster → an obstacle (match-or-create), capped. ──
+    for (auto &cluster : clusters)
+    {
+        const auto observation = ControllerObstacleModel::make_observation(
+            cluster, robot_pose.pos,
+            std::max(0.0f, params_->temporary_obstacle_padding_m),
+            std::max(0.0f, params_->temporary_obstacle_occlusion_depth_m));
+        if (!observation.has_value())
+            continue;
+        const bool matched = match_temporary_obstacle(*observation).has_value();
+        if (!matched && temporary_obstacles_.size() >= kMaxObstacles)
+            continue;   // cap NEW obstacles; existing ones still refresh
+        ingest_obstacle_observation(*observation, timestamp_ms);
+    }
+
+    update_active_obstacle_polygons(timestamp_ms, path_controller);
+}
+
+ControllerPolygon ControllerObstacleTracker::make_obstacle_polygon(const Eigen::Vector2f &center,
+                                                                   float yaw,
+                                                                   float width_m,
+                                                                   float depth_m) const
+{
+    const float half_width = width_m * 0.5f;
+    const float half_depth = depth_m * 0.5f;
+    const Eigen::Rotation2Df rotation(yaw);
+
+    ControllerPolygon polygon;
+    polygon.reserve(4);
+    for (const Eigen::Vector2f &corner : {Eigen::Vector2f(-half_width, -half_depth),
+                                          Eigen::Vector2f(half_width, -half_depth),
+                                          Eigen::Vector2f(half_width, half_depth),
+                                          Eigen::Vector2f(-half_width, half_depth)})
+        polygon.push_back(center + rotation * corner);
+
+    return polygon;
+}
+
+// Is there a room←robot pose NEWER than the scan we are about to register?
+//
+// This is the question `RTdelta_m` in the overlay CSV could never answer. That probe compares the
+// pose the tree returns at "now" with the one at the scan stamp, and reports 0 both when the ring
+// is bracketing perfectly (the newest block IS the scan's block) and when it has nothing newer to
+// offer and clamps — opposite situations with the same reading. The RT ring is only
+// RT_API::HISTORY_SIZE blocks deep and never extrapolates, so the sign of this lead is what
+// ★NOT 5 ON THIS ROBOT: room_concept sets rt_api_->HISTORY_SIZE = 25 (specificworker.cpp:169), and
+// HISTORY_SIZE is a plain data member, not a constant — so the ring is as deep as whoever WROTE the
+// edge made it, and reading the header's default to reason about it gives the wrong answer.
+// decides which case you are in:
+//   lead > 0  the pose feed is ahead of the scan; InterpolatedRT can bracket it → registration exact.
+//   lead ≈ 0  the newest block IS this scan's pose; correct, but nothing to interpolate against.
+//   lead < 0  the pose feed is BEHIND the scan; every query clamps to a stale block and the whole
+//             cloud is registered with a pose |lead| ms too old → a bulk ω·|lead| rotation error
+//             that grows with turn rate and vanishes at rest.
+// Reads the ring directly rather than inferring it from returned poses. Diagnostic only.
+void ControllerObstacleTracker::update_rt_block_lead(std::uint64_t scan_ts)
+{
+    rt_block_lead_ms_.reset();
+    if (!graph_ || !graph_state_ || !graph_state_->ready() || scan_ts == 0)
+        return;
+
+    // room_concept writes the edge parent→child, and which of the two is the parent depends on
+    // whether the room is anchored to the robot or the other way round — so try both directions.
+    auto edge = graph_->get_edge(graph_state_->world_id, graph_state_->robot_id, "RT");
+    if (!edge.has_value())
+        edge = graph_->get_edge(graph_state_->robot_id, graph_state_->world_id, "RT");
+    if (!edge.has_value())
+        return;
+
+    const auto stamps = graph_->get_attrib_by_name<rt_timestamps_att>(edge.value());
+    if (!stamps.has_value())
+        return;
+    const std::vector<std::uint64_t> &ring = stamps->get();
+    std::uint64_t newest = 0, oldest = std::numeric_limits<std::uint64_t>::max();
+    for (const auto ts : ring)          // min/max over the ring, so head-index semantics don't matter
+    {
+        if (ts == 0) continue;          // unused slot
+        newest = std::max(newest, ts);
+        oldest = std::min(oldest, ts);
+    }
+    if (newest == 0)
+        return;                          // untimestamped edge: InterpolatedRT is a no-op entirely
+
+    rt_block_newest_ts_ = newest;
+    rt_block_oldest_ts_ = oldest;
+    rt_block_lead_ms_ = static_cast<std::int64_t>(newest) - static_cast<std::int64_t>(scan_ts);
+
+    // The body twist room_concept publishes on this same edge, written there expressly so consumers
+    // reconstruct motion between blocks instead of differentiating pose. [adv(+x fwd), side(+y), _]
+    // and [_, _, rot] in the ROBOT frame — the writer does not invert them when the edge runs
+    // robot→room, so they are the robot's own twist in either direction.
+    rt_twist_valid_ = false;
+    const auto lin = graph_->get_attrib_by_name<rt_translation_velocity_att>(edge.value());
+    const auto ang = graph_->get_attrib_by_name<rt_rotation_euler_xyz_velocity_att>(edge.value());
+    if (lin.has_value() and ang.has_value() and lin->get().size() >= 2 and ang->get().size() >= 3)
+    {
+        rt_twist_adv_  = lin->get()[0];
+        rt_twist_side_ = lin->get()[1];
+        rt_twist_rot_  = ang->get()[2];
+        rt_twist_valid_ = std::isfinite(rt_twist_adv_) and std::isfinite(rt_twist_side_)
+                          and std::isfinite(rt_twist_rot_);
+    }
+}
+
+// (twist_corrected() lived here. It composed a clamped room<-robot pose with the published body twist
+// to land it on the scan instant, and it was ONE OF FOUR copies of that SE(2) step in this fleet.
+// Removed 2026-09-09: RT_API::TimeQuery::Extrapolated does it, once, inside the transform query — see
+// the note at the query site in handle_lidar_points.)
+//
+// Exp(xi*dt) for the cached body twist — the robot's own motion over dt, in the robot frame it started
+// in. dt may be negative (walk back).
+// ★★★THIS IS NOW A DELIBERATE SECOND IMPLEMENTATION, AND THAT IS THE POINT. It used to be shared with
+// twist_corrected() so the probe below "exercised the same arithmetic the correction relies on". That
+// reasoning inverted the moment the correction moved into RT_API: a probe that calls the code under
+// test cannot detect that code being wrong. So this stays here, reading the LEGACY [adv, side] array
+// pair, while production reads the AXIS-order ring through cortex — two implementations, two attribute
+// layouts, one expected answer. If they diverge, twist_pred_err_m says so per cycle.
+// ⚠It follows that this must NOT be "simplified" by calling the API. Its value is that it does not.
+Eigen::Matrix4d ControllerObstacleTracker::twist_delta(std::int64_t dt_ms) const
+{
+    const double dt = static_cast<double>(dt_ms) * 1e-3;
+    const double phi = static_cast<double>(rt_twist_rot_) * dt;       // yaw swept in the interval
+    // ★ AXIS ASSIGNMENT — this robot's frame is +Y FORWARD, +X lateral. The twist ARRAY is ordered
+    // [adv, side, _], so index 0 is the FORWARD rate and belongs on the frame's y axis, not its x.
+    // Getting this backwards is not a small error: it rotates the predicted displacement by 90°, so
+    // the prediction lands √2·|motion| away from the truth — WORSE than assuming the robot never
+    // moved. Measured 2026-08-04 against 421 logged forward-driving cycles, predicting the next pose
+    // from the true body twist: adv→x gives p50 25.86 mm, adv→y gives p50 0.07 mm.
+    // (The frame is stated by the safety gate's own integrator, `x += adv*sin(th); y += adv*cos(th)`,
+    // and by the carrot bearing being atan2(x, y) rather than atan2(y, x).)
+    const double vx = static_cast<double>(rt_twist_side_) * dt;
+    const double vy = static_cast<double>(rt_twist_adv_) * dt;
+
+    // SE(2) exponential. The left Jacobian V turns the body velocity into the CHORD of the arc the
+    // robot actually drove; using v·dt straight would cut the corner, and at ω·dt ≈ 0.1 rad that
+    // error is already ~0.2% of the displacement — small, but free to do right.
+    double dx = vx, dy = vy;
+    if (std::abs(phi) > 1e-6)
+    {
+        const double s = std::sin(phi), c = std::cos(phi);
+        dx = ( s * vx - (1.0 - c) * vy) / phi;
+        dy = ((1.0 - c) * vx +  s   * vy) / phi;
+    }
+
+    Eigen::Matrix4d delta = Eigen::Matrix4d::Identity();
+    delta(0, 0) =  std::cos(phi); delta(0, 1) = -std::sin(phi);
+    delta(1, 0) =  std::sin(phi); delta(1, 1) =  std::cos(phi);
+    delta(0, 3) = dx;             delta(1, 3) = dy;
+    return delta;
+}
+
+// How much can the twist actually be TRUSTED over one lidar period?
+//
+// This is the number the one-frame buffer decision turns on. Keeping the buffer means registering an
+// exact pose 78 ms late; dropping it means registering a fresh scan whose pose was walked forward by
+// the RT query's own extrapolation over ~one period. Which is better is not a matter of opinion — it is whether the
+// twist predicts that interval to better than the ω·Δt error the buffer exists to avoid. Nobody had
+// measured it, in either simulation or the robot, so the flag was being argued from assumption.
+//
+// Method: take two instants one lidar period apart that are BOTH strictly inside the RT ring, so both
+// poses are genuine interpolations rather than clamped end blocks. Predict the later from the earlier
+// with the same Exp(ξ·Δt) the correction uses, and compare against what the tree reports. The residual
+// is exactly the error dropping the buffer would introduce.
+//
+// Standing still it is trivially ~0, so read it filtered by motion — that is an analysis choice, not
+// a gate here: this logs what it measures and never suppresses a sample.
+void ControllerObstacleTracker::update_twist_prediction_error(std::uint64_t scan_ts)
+{
+    twist_pred_err_m_.reset();
+    twist_pred_err_deg_.reset();
+    twist_pred_dt_ms_ = 0;
+    if (!params_ || !inner_eigen_api_ || !graph_state_ || !rt_twist_valid_
+        || !rt_block_newest_ts_.has_value() || !rt_block_oldest_ts_.has_value())
+        return;
+
+    const std::int64_t dt_ms = static_cast<std::int64_t>(lidar_period_ms_);
+    if (dt_ms <= 0)
+        return;
+    // Anchor at the scan when the ring reaches it, else at the newest block; both ends must sit
+    // inside the ring or we would be comparing against a clamp and measuring nothing.
+    const std::uint64_t t_late = std::min<std::uint64_t>(scan_ts, *rt_block_newest_ts_);
+    if (t_late < *rt_block_oldest_ts_ + static_cast<std::uint64_t>(dt_ms))
+        return;
+    const std::uint64_t t_early = t_late - static_cast<std::uint64_t>(dt_ms);
+
+    const auto interp = params_->interpolate_rt ? DSR::RT_API::TimeQuery::Interpolated
+                                                : DSR::RT_API::TimeQuery::Nearest;
+    const auto early = inner_eigen_api_->get_transformation_matrix(graph_state_->world_name,
+                                                                   graph_state_->robot_name,
+                                                                   t_early, "RT", interp);
+    const auto late  = inner_eigen_api_->get_transformation_matrix(graph_state_->world_name,
+                                                                   graph_state_->robot_name,
+                                                                   t_late, "RT", interp);
+    if (!early.has_value() || !late.has_value())
+        return;
+
+    const Eigen::Matrix4d predicted = early->matrix() * twist_delta(dt_ms);
+    const Eigen::Matrix4d actual    = late->matrix();
+
+    const double dx = predicted(0, 3) - actual(0, 3);
+    const double dy = predicted(1, 3) - actual(1, 3);
+    const double yaw_pred = std::atan2(predicted(1, 0), predicted(0, 0));
+    const double yaw_act  = std::atan2(actual(1, 0), actual(0, 0));
+    double dyaw = yaw_pred - yaw_act;
+    while (dyaw >  M_PI) dyaw -= 2.0 * M_PI;          // shortest signed angle
+    while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
+
+    twist_pred_dt_ms_ = dt_ms;
+    twist_pred_err_m_ = static_cast<float>(std::hypot(dx, dy));
+    twist_pred_err_deg_ = static_cast<float>(std::abs(dyaw) * 180.0 / M_PI);
+}
+
+// ── SETTLE: ANSWER AN OLD QUESTION WITH MEASUREMENT INSTEAD OF PREDICTION ───────────────────────
+// For each parked pose, re-ask for the SAME instant with plain interpolation. Once the ring holds real
+// blocks either side of that instant, the answer is measured rather than predicted, and the difference
+// from what we guessed at the time is the error of the guess. Reported per cycle; at most one settles
+// per call, so this costs one extra transform query and never loops on a backlog.
+//
+// ★A "NO" FROM THE RE-QUERY IS AMBIGUOUS AND IS TREATED AS SUCH. It can mean the ring has not reached
+// the instant yet (wait) or that it has already scrolled past it (give up). The outcome of the
+// re-query distinguishes them, which is why this checks it instead of trusting elapsed time: an entry
+// is settled ONLY if the re-query itself reports Exact or Interpolated. Anything else -- a walk, a
+// clamp, a stale verdict -- means the answer would be another prediction, and grading a prediction
+// against a prediction measures nothing.
+void ControllerObstacleTracker::settle_extrapolation_checks(const std::string &lidar_node_name,
+                                                            std::uint64_t now_ts)
+{
+    extrap_check_err_m_.reset();
+    extrap_check_err_deg_.reset();
+    extrap_check_dt_ms_.reset();
+    if (inner_eigen_api_ == nullptr or graph_state_ == nullptr)
+        return;
+
+    while (not pending_extrap_checks_.empty())
+    {
+        const auto pending = pending_extrap_checks_.front();
+        // Too old to ever be bracketed again: the ring is finite and has scrolled past it.
+        if (now_ts > pending.ask_ts + 3000)
+        {
+            pending_extrap_checks_.pop_front();
+            continue;
+        }
+
+        DSR::RT_API::TimeQueryInfo info;
+        const auto measured = inner_eigen_api_->get_transformation_matrix(graph_state_->world_name,
+                                                                          lidar_node_name,
+                                                                          pending.ask_ts, "RT",
+                                                                          DSR::RT_API::TimeQuery::Interpolated,
+                                                                          &info);
+        const bool answered_by_measurement =
+            measured.has_value()
+            and (info.outcome == DSR::RT_API::TimeQueryInfo::Outcome::Interpolated
+                 or info.outcome == DSR::RT_API::TimeQueryInfo::Outcome::Exact);
+        if (not answered_by_measurement)
+            return;   // the ring has not reached this instant yet; entries are in time order
+
+        const auto &truth = measured->matrix();
+        const double dx = pending.x - truth(0, 3);
+        const double dy = pending.y - truth(1, 3);
+        double dyaw = pending.yaw - std::atan2(truth(1, 0), truth(0, 0));
+        while (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
+        while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
+
+        extrap_check_err_m_   = static_cast<float>(std::hypot(dx, dy));
+        extrap_check_err_deg_ = static_cast<float>(std::abs(dyaw) * 180.0 / M_PI);
+        extrap_check_dt_ms_   = pending.applied_dt_ms;
+        pending_extrap_checks_.pop_front();
+        return;
+    }
+}
+
+bool ControllerObstacleTracker::handle_lidar_points(const std::string &lidar_node_name,
+                                                    std::vector<float> xs,
+                                                    std::vector<float> ys,
+                                                    std::vector<float> zs,
+                                                    std::uint64_t timestamp_ms,
+                                                    std::vector<std::uint8_t> plane_ids,
+                                                    std::vector<std::int64_t> plane_stamps)
+{
+    if (!params_ || !inner_eigen_api_ || !graph_state_ || !graph_state_->ready())
+        return false;
+
+    // Dedup + period tracking against the newest RAW source stamp: when the laser node is polled
+    // (DSR fallback), the same scan would otherwise be reprocessed every cycle. A 0 stamp can't be
+    // deduped, so it always passes.
+    if (timestamp_ms != 0 && newest_raw_lidar_ts_.has_value()
+        && timestamp_ms <= newest_raw_lidar_ts_.value())
+        return false;
+
+    if (timestamp_ms > 0 && newest_raw_lidar_ts_.has_value() && timestamp_ms > newest_raw_lidar_ts_.value())
+    {
+        const std::uint64_t diff_ms = timestamp_ms - newest_raw_lidar_ts_.value();
+        if (diff_ms >= 20 && diff_ms <= 500)
+        {
+            const double blended_period_ms = 0.7 * static_cast<double>(lidar_period_ms_)
+                                           + 0.3 * static_cast<double>(diff_ms);
+            lidar_period_ms_ = static_cast<std::uint64_t>(std::clamp(blended_period_ms, 20.0, 500.0));
+        }
+    }
+    newest_raw_lidar_ts_ = timestamp_ms;
+
+    // ── THE RATE THE UI SHOWS, COUNTED WHERE A SCAN IS ACTUALLY ACCEPTED ─────────────────────────
+    // ★★★MEASURED IN WALL TIME, NOT FROM THE STAMPS. `lidar_period_ms_` above is an EMA of the
+    // difference between successive SOURCE STAMPS, which answers "how fast does the sensor say it is
+    // sampling" — it stays at the nominal period even when we drop every other frame, because the
+    // frames we do get are still stamped one period apart. The question a human asks looking at a
+    // lagging overlay is the other one: how many scans per second is this process actually turning
+    // into a cloud. Those two differ by exactly the drop rate, which is the interesting quantity.
+    // ★This codebase has been bitten by rate displays before — four of them once disagreed, each
+    // measuring a different stage and none saying which. So: counted HERE, after the dedup gate and
+    // before any work, one place, and the label says what it counts.
+    // A sliding window of arrival instants: rate = (n-1) / (newest - oldest). Robust to a burst and
+    // self-clearing after a stall, with no EMA constant to explain.
+    {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        lidar_accept_wall_ms_.push_back(now_ms);
+        while (lidar_accept_wall_ms_.size() > 32) lidar_accept_wall_ms_.pop_front();
+        // Drop anything older than 2 s so a stall decays the reading toward 0 instead of freezing it
+        // at the last healthy value — a rate display that keeps showing 20 Hz through a stall is worse
+        // than none, because it is the display you would consult to notice the stall.
+        while (lidar_accept_wall_ms_.size() > 2 and now_ms - lidar_accept_wall_ms_.front() > 2000)
+            lidar_accept_wall_ms_.pop_front();
+        if (lidar_accept_wall_ms_.size() >= 2)
+        {
+            const auto span = lidar_accept_wall_ms_.back() - lidar_accept_wall_ms_.front();
+            lidar_processed_hz_ = span > 0
+                ? 1000.f * static_cast<float>(lidar_accept_wall_ms_.size() - 1) / static_cast<float>(span)
+                : 0.f;
+        }
+    }
+
+    // ── THE NEWEST SCAN IS REGISTERED DIRECTLY (the one-frame hold was removed 2026-09-09) ────────
+    // What the hold was for, and why neither reason survives:
+    //  1. REGISTRATION. Waiting a frame let room_concept publish that scan's room←robot pose, so
+    //     InterpolatedRT bracketed it instead of clamping at the leading edge. The extrapolating RT
+    //     query below does that job directly, reproducing the pose at the scan instant to 0.22 cm p50
+    //     against the 2.8 cm of obstacle lag the wait cost. Superseded, and measured.
+    //  2. SMOOTHING. The stated beneficiary was the MPPI safety gate, which fired in 1-cycle pulses
+    //     and had no temporal state of its own: dropping the hold took safety_guard_cycles to 124
+    //     against a 16-61 baseline, lin_jerk_effort to 92.6 against 17.5-55.0, rot_reversals to 54
+    //     against 17-28 (2026-08-04, n=1, Webots). ★THAT GATE NO LONGER EXISTS. ControlMode became
+    //     "plain" one day after that A/B, and the MPPI sampler is now deleted outright. The live
+    //     consumers of this buffer are detect_path_blockage → replan, which already debounces with
+    //     blockage_streak_/blockage_confirm_cycles + a cooldown; the temporary-obstacle tracker,
+    //     which fuses temporary_obstacle_history_scans (5) frames; and the footprint predicate along
+    //     the carrot chord. None of them turns a single transient scan into a command pulse.
+    // ★So the hold was paying ~48 ms of reaction latency to protect a consumer that had been retired.
+    // ★WHAT TO WATCH on the first runs, and what to score it on: the August numbers CANNOT be the
+    // baseline — safety_guard_cycles is structurally 0 in plain mode, so a run comparing it against
+    // 16-61 is comparing against a tracker that no longer runs. Score this on `replans`,
+    // blockage_streak behaviour and clearance instead, and expect gap_ms to fall ~78 → ~30.
+    std::vector<float> proc_xs = std::move(xs);
+    std::vector<float> proc_ys = std::move(ys);
+    std::vector<float> proc_zs = std::move(zs);
+    const std::uint64_t proc_ts = timestamp_ms;
+    std::vector<std::uint8_t> proc_plane_ids = std::move(plane_ids);
+    std::vector<std::int64_t> proc_plane_stamps = std::move(plane_stamps);
+    last_lidar_timestamp_ms_ = proc_ts;
+    update_rt_block_lead(proc_ts);            // caches the ring bounds + twist the two calls below use
+    update_twist_prediction_error(proc_ts);
+
+    // ── THE RT QUERY DOES THE EXTRAPOLATION NOW (2026-09-09) ─────────────────────────────────
+    // TimeQuery::Extrapolated is Interpolated inside the ring and, past its ends, walks the pose along
+    // the twist room_concept publishes in that same ring slot. This used to be twist_corrected() here,
+    // one of FOUR copies of the same SE(2) step across this fleet — retina, viewer3d and
+    // media_transport carried the others, and the axis-assignment bug had to be fixed in three of them
+    // on 2026-09-04. Now there is one implementation, in RT_API, and it reads the twist in AXIS order
+    // so no consumer re-encodes a body-frame convention.
+    // ★rt_twist_compensation still selects it, so the A/B against plain interpolation is unchanged.
+    const auto interp = params_->rt_twist_compensation ? DSR::RT_API::TimeQuery::Extrapolated
+                      : params_->interpolate_rt        ? DSR::RT_API::TimeQuery::Interpolated
+                                                       : DSR::RT_API::TimeQuery::Nearest;
+    // ★AND IT NOW SAYS WHETHER IT CLAMPED. A timestamped RT query that falls outside the ring used
+    // to return the end block and look exactly like a success, so a whole cloud could be registered
+    // against a pose from another instant with nothing to show for it. rt_query_clamped_ is that
+    // admission, logged per cycle beside the fix dt.
+    DSR::RT_API::TimeQueryInfo rt_info;
+    const auto world_from_lidar = inner_eigen_api_->get_transformation_matrix(graph_state_->world_name,
+                                                                             lidar_node_name,
+                                                                             proc_ts,
+                                                                             "RT",
+                                                                             interp,
+                                                                             &rt_info);
+    rt_twist_fix_dt_ms_ = rt_info.applied_dt_ms;
+    rt_query_outcome_ = static_cast<int>(rt_info.outcome);
+    rt_query_gap_ms_ = rt_info.gap_ms;
+    rt_query_stale_edges_ = rt_info.stale_edges;
+
+    // Settle any earlier forward-nudged pose whose instant the ring has now caught up with, THEN park
+    // this one. In that order, so a pose is never graded against itself.
+    settle_extrapolation_checks(lidar_node_name, proc_ts);
+    if (rt_info.outcome == DSR::RT_API::TimeQueryInfo::Outcome::Extrapolated
+        and rt_info.applied_dt_ms != 0 and world_from_lidar.has_value())
+    {
+        const auto &nudged = world_from_lidar->matrix();
+        pending_extrap_checks_.push_back(PendingExtrapCheck{
+            .ask_ts        = proc_ts,
+            .x             = nudged(0, 3),
+            .y             = nudged(1, 3),
+            .yaw           = std::atan2(nudged(1, 0), nudged(0, 0)),
+            .applied_dt_ms = rt_info.applied_dt_ms});
+        // Bounded: the settle step drops anything the ring has already run past, but a producer that
+        // stops publishing would otherwise let this grow for the life of the run.
+        while (pending_extrap_checks_.size() > 128)
+            pending_extrap_checks_.pop_front();
+    }
+    const auto robot_from_lidar = inner_eigen_api_->get_transformation_matrix(graph_state_->robot_name,
+                                                                               lidar_node_name,
+                                                                               proc_ts,
+                                                                               "RT",
+                                                                               interp);
+    // ── THE POSE THIS CLOUD IS ACTUALLY REGISTERED WITH ─────────────────────────────────────────
+    // Recorded so it can be compared against the pose the ICON is drawn at. The two are supposed to be
+    // the same instant — both are pinned to proc_ts — but "supposed to" is what an instrument is for.
+    // room←robot = room←lidar · (robot←lidar)^-1, i.e. the mount divided out, so this is directly
+    // comparable with the robot pose the display uses. ★A CONSTANT offset between them is expected
+    // (this is a room YAW, the display carries the footprint's theta convention); the VARIATION with
+    // rotation is the quantity that would explain a cloud swinging off and snapping back.
+    if (world_from_lidar.has_value() and robot_from_lidar.has_value())
+    {
+        const Eigen::Matrix4d world_T_robot =
+            world_from_lidar->matrix() * robot_from_lidar->matrix().inverse();
+        last_cloud_yaw_ = static_cast<float>(std::atan2(world_T_robot(1, 0), world_T_robot(0, 0)));
+        last_cloud_ts_ = proc_ts;
+    }
+
+    if (!world_from_lidar.has_value() || !robot_from_lidar.has_value())
+        return false;
+
+    const std::size_t raw_count = std::min({proc_xs.size(), proc_ys.size(), proc_zs.size()});
+    if (raw_count == 0)
+        return false;
+
+    // The leading-edge clamp is already repaired: the freshest scan is normally NEWER than the
+    // freshest pose block (the pose is computed FROM a scan, so it can only arrive after one), which
+    // is precisely when a plain interpolated query silently returns the newest block instead — and
+    // rt_twist_fix_dt_ms_, set by the query above, is how far it had to walk to fix that.
+    const Eigen::Matrix4d world_from_lidar_matrix = world_from_lidar->matrix();
+    const auto robot_from_lidar_matrix = robot_from_lidar->matrix();
+
+    // ── PER-PLANE REGISTRATION ────────────────────────────────────────────────────────────────────
+    // `proc_ts` is the MAX of the merged planes' capture stamps, so registering the whole cloud with
+    // the pose at that one instant misplaces every plane that fired earlier by ω·(proc_ts − its own
+    // stamp) — up to a full LiDAR period between helios and bpearl. Invisible standing still, and
+    // exactly the term that grows with turn rate. So resolve room←lidar once PER PLANE, at that
+    // plane's own stamp. A plane whose query fails, or whose stamp matches proc_ts, falls back to the
+    // single matrix above, which is also what a one-plane sweep and any caller without per-plane
+    // information get — i.e. the previous behaviour, unchanged.
+    std::vector<Eigen::Matrix4d> world_from_plane;
+    if (not proc_plane_stamps.empty() and not proc_plane_ids.empty())
+    {
+        world_from_plane.assign(proc_plane_stamps.size(), world_from_lidar_matrix);
+        for (std::size_t k = 0; k < proc_plane_stamps.size(); ++k)
+        {
+            const std::int64_t stamp = proc_plane_stamps[k];
+            if (stamp <= 0 or static_cast<std::uint64_t>(stamp) == proc_ts)
+                continue;
+            if (const auto plane_T = inner_eigen_api_->get_transformation_matrix(
+                    graph_state_->world_name, lidar_node_name,
+                    static_cast<std::uint64_t>(stamp), "RT", interp);
+                plane_T.has_value())
+                world_from_plane[k] = plane_T->matrix();
+        }
+    }
+    // NOTE: the RoboComp Lidar3D source already returns points in the robot/base frame (floor ≈ z=0),
+    // so the robot→lidar RT edge is deliberately identity; robot_z below is therefore height above the
+    // floor. If someone ever moves the lidar node to its true mount height in shadow.json this shortcut
+    // double-counts — keep the edge identity for this data convention.
+    const bool robot_from_lidar_is_identity = robot_from_lidar_matrix.isApprox(Eigen::Matrix4d::Identity(), 1e-5);
+
+    const float min_h = params_->temporary_obstacle_min_height_m;
+    const float max_h = params_->temporary_obstacle_max_height_m;
+
+    // ── RAW-cloud proximity, measured BEFORE the z-band cut below ──
+    // Everything else here reads the already-filtered buffer, so every controller diagnostic has been
+    // blind to returns under min_h — yet those returns DO feed residual_concept's grid. A low obstacle
+    // residual legitimately sees would therefore look like an unsupported phantom from this side. Take
+    // the measurement now, while the unfiltered sweep is still in hand.
+    {
+        raw_cloud_proximity_ = RawCloudProximity{};
+        float best = std::numeric_limits<float>::infinity();
+        for (std::size_t i = 0; i < raw_count; ++i)
+        {
+            const float x = proc_xs[i], y = proc_ys[i], z = proc_zs[i];
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                continue;
+            const float rz = robot_from_lidar_is_identity
+                ? z
+                : static_cast<float>(robot_from_lidar_matrix(2, 0) * x + robot_from_lidar_matrix(2, 1) * y
+                                     + robot_from_lidar_matrix(2, 2) * z + robot_from_lidar_matrix(2, 3));
+            const float rx = robot_from_lidar_is_identity
+                ? x
+                : static_cast<float>(robot_from_lidar_matrix(0, 0) * x + robot_from_lidar_matrix(0, 1) * y
+                                     + robot_from_lidar_matrix(0, 2) * z + robot_from_lidar_matrix(0, 3));
+            const float ry = robot_from_lidar_is_identity
+                ? y
+                : static_cast<float>(robot_from_lidar_matrix(1, 0) * x + robot_from_lidar_matrix(1, 1) * y
+                                     + robot_from_lidar_matrix(1, 2) * z + robot_from_lidar_matrix(1, 3));
+            const float d = std::hypot(rx, ry);
+            if (rz < min_h && d <= 1.0f)
+                ++raw_cloud_proximity_.below_band_within_1m;   // what the band is discarding near the robot
+            if (d < best)
+            {
+                best = d;
+                raw_cloud_proximity_.z_m = rz;
+                raw_cloud_proximity_.bearing_deg = std::atan2(rx, ry) * 180.f / static_cast<float>(M_PI);
+            }
+        }
+        if (std::isfinite(best))
+            raw_cloud_proximity_.distance_m = best;
+    }
+
+    // Flatten each plane's room←lidar into the 12 coefficients the hot loop actually uses, indexed by
+    // plane id. One entry ⇒ every point takes it, which is the single-matrix path this replaced.
+    std::vector<std::array<double, 12>> plane_coeffs;
+    {
+        const auto flatten = [](const Eigen::Matrix4d &m)
+        {
+            return std::array<double, 12>{m(0,0), m(0,1), m(0,2), m(0,3),
+                                          m(1,0), m(1,1), m(1,2), m(1,3),
+                                          m(2,0), m(2,1), m(2,2), m(2,3)};
+        };
+        if (world_from_plane.empty())
+            plane_coeffs.push_back(flatten(world_from_lidar_matrix));
+        else
+            for (const auto &m : world_from_plane)
+                plane_coeffs.push_back(flatten(m));
+    }
+
+    lidar_world_buffer_.put<0>(
+        rc::RawLidarPointVectors{
+            .xs = std::move(proc_xs),
+            .ys = std::move(proc_ys),
+            .zs = std::move(proc_zs)},
+        proc_ts,
+        [plane_coeffs = std::move(plane_coeffs), plane_sel = std::move(proc_plane_ids),
+         robot_from_lidar_matrix, robot_from_lidar_is_identity, raw_count, min_h, max_h](rc::RawLidarPointVectors &&raw_points, rc::LidarPointVectors &world_points)
+        {
+            auto &[world_xs, world_ys, world_zs] = world_points;
+            const auto &xs_in = raw_points.xs;
+            const auto &ys_in = raw_points.ys;
+            const auto &zs_in = raw_points.zs;
+            const std::size_t count = std::min({raw_count, xs_in.size(), ys_in.size(), zs_in.size()});
+            if (count == 0)
+                return;
+
+            const bool per_plane = plane_coeffs.size() > 1 and plane_sel.size() >= count;
+            const auto &m0 = plane_coeffs.front();
+            const double r20 = robot_from_lidar_matrix(2, 0);
+            const double r21 = robot_from_lidar_matrix(2, 1);
+            const double r22 = robot_from_lidar_matrix(2, 2);
+            const double r23 = robot_from_lidar_matrix(2, 3);
+
+            world_xs.reserve(count);
+            world_ys.reserve(count);
+            world_zs.reserve(count);
+
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                const float x = xs_in[index];
+                const float y = ys_in[index];
+                const float z = zs_in[index];
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                    continue;
+
+                const float robot_z = robot_from_lidar_is_identity
+                    ? z
+                    : static_cast<float>(r20 * x + r21 * y + r22 * z + r23);
+                if (robot_z < min_h || robot_z > max_h)
+                    continue;
+
+                // Each point is placed with ITS OWN plane's pose (see PER-PLANE REGISTRATION above).
+                const auto &m = per_plane
+                    ? plane_coeffs[std::min<std::size_t>(plane_sel[index], plane_coeffs.size() - 1)]
+                    : m0;
+                const float world_x = static_cast<float>(m[0] * x + m[1] * y + m[2]  * z + m[3]);
+                const float world_y = static_cast<float>(m[4] * x + m[5] * y + m[6]  * z + m[7]);
+                const float world_z = static_cast<float>(m[8] * x + m[9] * y + m[10] * z + m[11]);
+
+                world_xs.push_back(world_x);
+                world_ys.push_back(world_y);
+                world_zs.push_back(world_z);
+            }
+        });
+
+    // ── ONE BUFFER, BOTH CONSUMERS (the display buffer was removed 2026-09-09) ───────────────────
+    // This used to fill a SECOND buffer with the newest scan for the viewer, because the control path
+    // was holding its own scan back a frame and the overlay should not pay that frame of visible lag
+    // (4-6 deg of cloud swing at 0.9 rad/s). With the hold gone the two buffers would carry the SAME
+    // scan, and the display copy was the worse of the two: it registered the whole sweep with one
+    // transform where the room buffer resolves room←lidar PER PLANE, which is the term that grows with
+    // turn rate. So the viewer now reads lidar_buffer() directly and a full cloud transform + copy per
+    // cycle goes away with it.
+
+    return true;
+}

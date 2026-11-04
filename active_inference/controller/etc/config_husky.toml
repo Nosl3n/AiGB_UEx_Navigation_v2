@@ -1,0 +1,959 @@
+# controller for the Husky A300 in the open field (webots-agri). Derived from config.toml: waits for
+# openfield_concept (the `field` world frame) instead of room_concept, and the Husky mesh needs no yaw.
+[Proxies]
+# Proxies for required interfaces
+OmniRobot = "omnirobot:tcp -h localhost -p 10004"
+
+# --- Common Agent Data ---
+[Agent]
+id = 8 
+name = "controller"
+
+# --- Single Instance Configuration ---
+# Use this if you only have one graph.
+configFile = ""
+domain = 0
+tree = false
+graph = false   # DSR graph viewer optional: the planner GUI is its own top-level window (ControllerDisplay)
+2d = false
+3d = false
+
+# --- Multiple Instance Template ---
+# If you define multiple instances, the single instance config above will be ignored.
+# [Agent.instance_name]
+# configFile = ""
+# domain = 1
+# tree = true
+# graph = true
+# 2d = true
+# 3d = true
+
+[Period]
+# ★2026-08-03 100 -> 50. The PIPELINE no longer waits on this (ControlDataDriven runs it on the scan),
+# so this no longer sets the control rate. It still paces the presence GRAFCET step and the Qt event
+# loop — and the observed pose-refresh stalls come in an almost exact ~100 ms quantum (measured: runs of
+# 3 cycles at 99/95/99/99/101/100 ms while the control loop ticked normally at 46 ms). If DSR update
+# delivery is marshalled onto that thread, halving this should halve the stall quantum. If the quantum
+# stays at 100 ms, the pacing is NOT here and the cause is upstream.
+Compute = 50
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"
+
+[Presence]
+required_agent_names = ["robot_concept", "openfield_concept"]
+config_dir = "etc"
+monitor_period_ms = 500
+# Controller is the heaviest compute agent (MPPI/torch runs on the Qt main thread, which also
+# drives the presence monitor). Its own compute bursts were observed freezing the monitor for up
+# to 14 s, so a 3 s timeout caused constant false Ready<->Stale churn against perfectly-alive
+# peers. 15 s tolerates those bursts + normal 3-4 s heartbeat jitter. No safety cost: Stale never
+# triggers node deletion (only DSR-node removal / Missing does), so a longer timeout is harmless.
+heartbeat_timeout_ms = 15000
+rejoin_grace_ms = 1500
+stale_grace_ms = 120000  # 2 min grace: covers peer restart time before declaring lost
+agent_info_period_ms = 1000
+
+[Owns]
+nodes = ["controller 8"]
+
+[Mission]
+# Recorded missions: a replayable tour used to validate controller changes. Record one by checking
+# "Record" in the GUI and left-clicking the route in the 2D view; right-click undoes the last point.
+LibraryPath = "etc/missions.toml"
+# Per-leg metrics appended when a run ends (duration, driven length, detour ratio, min body clearance,
+# turning effort, replans, escapes, and lap-to-lap repeatability). Compare runs, not absolutes.
+MetricsCsvPath = "mission_metrics.csv"
+# One JSON record per completed run, at <RunDir>/<mission>/<YYYYmmdd-HHMMSS>.json — mission name, date,
+# laps, the config it ran under, every per-leg metric and the roll-up. One file per run on purpose: an
+# appending log cannot survive a schema change (see the header guard on the CSV). Empty disables.
+RunDir = "etc/runs"
+
+[Planner]
+# A* planning grid. Collision is the robot's real footprint tested against this grid, so the ONLY thing
+# this controls is planning resolution/cost — nothing here inflates obstacles.
+CellSize = 0.06
+# ── THE MESH'S FRAME, WHICH IS NOT ALWAYS THE ROBOT'S ─────────────────────────────────────────────
+# Degrees to rotate the robot's mesh (the `path` attribute on the robot node) into the ROBOT frame:
+# x right, y FORWARD. This is a property of the ASSET, not of the robot.
+# P3Bot needs +90: webots-p3bot/protos/P3Bot.proto:430 wraps the whole machine in
+# `Pose { rotation 0 0 1 1.5708 }` so the mesh's native forward is +x, and every sensor RT in
+# p3bot.json is the proto value rotated by exactly that (helios (-0.0535264,0.00230873) ->
+# (-0.002309,-0.053526); zed (0.088,0) -> (0,0.088); ricoh (-0.05,0) -> (0,-0.05) — all exact).
+# ★THE SIGN MATTERS MORE THAN THE VALUE. At +90 the body comes out 22 mm WIDER than the compiled
+# Shadow hull it replaces, which is correct; at 0 the same file yields a body 45 mm NARROWER — the
+# error moves onto the axis along which a corridor closes. Read the [body] block at startup: it
+# prints the extents and the delta, so this is checkable in one line rather than trusted.
+# ★Shadow keeps its compiled hull regardless (shadow.obj has no wheels — ROBOT_GEOMETRY.md).
+RobotMeshYawDeg = 0.0     # husky_a300.obj is authored in the robot frame (+Y forward); Shadow's needs 90
+# ── CLEARANCE PREFERENCE INSIDE THE A* COST ──
+# The search cost was distance + a small turn penalty and NOTHING ELSE, with the footprint test
+# (+ Controller.FootprintSafetyMarginM) as the only thing keeping it off obstacles. So it returned the
+# shortest ADMISSIBLE path — which hugs every corner and wall it legally can — and the route optimiser
+# downstream spent its clearance term undoing that, while RouteSpline's feasibility pass pulled anything
+# it could not fix back TOWARD the same hugging polyline. Reported live as "it moves too close to
+# furniture and thin walls" with the safety slider already at maximum: the slider reweights the
+# OPTIMISER, which is the wrong end of the pipeline.
+# Cost per step is now  step * (1 + Weight * max(0, Pref - d)/Pref),  d = the planner's exact EDT.
+# ★A PREFERENCE, NOT A CONSTRAINT. It never makes a passable gap unplannable — that is what
+# FootprintSafetyMarginM does, and inflating THAT is how a stack ends up demanding 0.95 m of gap for a
+# robot that fits through 0.461 m. A corridor with no alternative is still planned, just at a cost
+# nothing competes with. Weight = 0 restores pure shortest path.
+# ★Measured offline (tools/route_bench, recorded world): on the RAW A* path min clearance 0.494 -> 0.607
+# and p05 0.527 -> 0.664, at no cost in length (10.90 -> 10.86 m). On that particular route the route
+# optimiser already reached the same place, so the post-optimiser numbers barely moved — the gain is
+# expected where the optimiser CANNOT help: tight passages where its clearance term saturates.
+ClearanceWeight = 1.5
+ClearancePref = 0.6   # HUSKY: 0.9 (indoors) cannot be met in a 2.5 m orchard corridor with 0.5 m trunk discs (0.75 m from
+                      # the centre line), so the planner went AROUND the orchard; 0.6 is a preference a corridor satisfies
+
+[Controller]
+# true = behave as if Run were pressed at startup (headless runs, goals from utils/send_goal.py).
+# false (normal use) = press Run or click a goal in the 2D view.
+ArmOnStart = true   # armed at start: goals from utils/send_goal.py / utils/run_route.py are followed without pressing Run
+# People (human_concept `person` nodes) as discs of this radius: body (~0.3 m) + room to leave a person.
+# In a 1.3 m palm corridor a person standing in it blocks it, and the robot waits or takes another one.
+PersonRadiusM = 0.8
+# Preferred standoff BEYOND the robot's real extent (MPPI d_safe). Comfort only: raising it makes the robot
+# keep its distance, and can never make a reachable goal unreachable — the footprint test decides that.
+# 2026-08-01: 0.50 -> 0.60, once the room boundary was injected into the MPPI's ESDF and walls stopped
+# disappearing at close range. The cost is ((d_safe - esdf) / (d_safe - body))^2, so this both extends the
+# reach of the push and steepens it: at the 0.44 m ESDF reading the tour used to hold near walls, the
+# penalty goes from 0.12 to 0.30. Measured body clearance was 0.117 min / 0.128 p05 against a 0.175 m
+# target; expect roughly 0.19 against the new 0.275 m target. Verify with p05_clearance_m, not min.
+# (ControlDataDriven lived here. FLAG REMOVED 2026-08-04 after it settled ON: the pipeline now always
+# runs on a FRESH SCAN, so the rate is the sensor's 20 Hz and the decision is aligned to the data it is
+# made from. The GUI-timer alternative measured p50 103 ms of lidar age at the decision, sd 17 ms — a
+# full extra scan period of dead time in a delay-limited loop. See specificworker.cpp control_loop().)
+# ★2026-08-02 20 -> 10. Measured with 20 ms: the control period came out BIMODAL — p05 25 / p50 48 /
+# p90 66 ms — because a scan landing just after a poll waits a full interval while one landing just
+# before is taken immediately. That is poll granularity, not sensor jitter, and it is the cheapest
+# remaining delay: halving it halves the worst-case notice latency and should tighten the spread.
+ControlPollMs = 10
+# ── ACTUATION OUTPUT PERIOD ──
+# Was never in this file — it ran on the 50 ms built-in default. ★2026-08-03 set to 25 explicitly, now
+# that it is achievable: the synchronous setSpeedBase RPC used to be a HARD FLOOR on this loop (measured
+# ice p50 12.9 / p99 58.9 / MAX 78.4 ms, so a 25 ms period would simply have overrun every cycle). After
+# the bridge+Ice fix ice is p50 0.1 / p99 2.6 / MAX 6.5 ms and the loop holds its period exactly
+# (out_period p50 50.1, MAX 54.7).
+# At 25 ms the output oversamples a 20 Hz controller 2:1 again, which is what bounds cmd_age_max — that
+# stayed at p90 49 / MAX 87 ms through the Ice fix because it is set by the wait for the next output
+# tick, not by the RPC.
+VelocityOutputPeriodMs = 25        # how often to look for a new scan; an upper bound on notice latency, not the rate
+ComfortStandoff = 0.6
+# ── MODEL-vs-MEASUREMENT MERGE IN THE MPPI's ESDF ──
+# That grid mixes two sources with different frames of truth. Lidar points are EGOCENTRIC — already in
+# the robot frame, and no pose error can move them. Furniture and the room polygon are room-frame MODEL,
+# transformed in with robot_pose.inverse(), so a pose error moves them and a pose JUMP slides them
+# sideways relative to the lidar returns of the SAME walls.
+# ★Measured 2026-08-02: the localiser snaps laterally by ~75 mm on ~7% of pose updates (peak 173 mm),
+# with NO rise in reported sigma. Taking the union of two disagreeing wall sets paints a PHANTOM wall
+# beside the real one, narrowing the apparent corridor and moving it on every jump — and everything
+# downstream reads that field: clip_carrot_to_reachable, the safety gate, the PD bumper's side probes,
+# the band's live field, min_esdf.
+# The model is there to fill what the lidar CANNOT see (walls vanish at grazing incidence and close
+# range), not to restate what it already reports — so a model point within this radius of a lidar return
+# is dropped. 0 restores the old union behaviour.
+ModelMergeRadius = 0.12
+# ── Cross-cycle control continuity (the smoothness term the objective was missing) ──
+# Penalises how far a rollout's first control sits from the command ACTUALLY EXECUTED last cycle,
+# normalised by the kinematic limits — so a full-scale reversal costs exactly LambdaContinuity per
+# channel, whatever units the base uses. The measured defect is a ~5 Hz cross-cycle reversal
+# (+0.456 -> -0.457 rad/s in 100 ms) and nothing in the MPPI objective could see it.
+# 0 = OFF = the pre-existing behaviour, so a baseline recorded without it stays comparable.
+# Raise it and watch rot_reversals / SPARC_w fall; watch for sluggishness, which is what it buys with.
+# How many waypoints BEYOND the current one the follower's path extends. 1 = the old behaviour: the
+# path ends at the next waypoint, so the speed terms treat every waypoint as an arrival and decelerate
+# into it (nominal seed scales down inside 1.0 m, straight-speed override off inside 1.5 m). With 1.28 m
+# legs that is the whole tour. 3 gives the speed terms a far horizon; arrival is still judged at the
+# near waypoint. Costs one extra A* per extra waypoint (~0.5 ms each).
+PathHorizonWaypoints = 1
+# ── Continuous-route mode ──
+# true: the whole mission is planned once and fitted to a curvature-continuous (C2) curve, then driven
+# in arc-length coordinates. No per-waypoint target, no arrival radius, no per-waypoint replan — the
+# three mechanisms that made the robot decelerate into every waypoint and never reach cruise.
+# Waypoints still DEFINE the route and still delimit legs for the metrics; they just stop being goals.
+# RouteSmoothing is the corner-rounding scale; measured on this tour it has an interior optimum near
+# 0.40 m (smoother AND shorter than either 0.25 or 0.60).
+RouteContinuous = true
+# Fit the same C2 curve to EVERY planned path, not just missions — a clicked target gets the smooth
+# route a tour gets, and it is drawn on the canvas the same way. Independent of RouteContinuous, which
+# only governs how a MISSION is driven.
+SmoothPlannedPath = true
+RouteSpacing = 0.05
+RouteSmoothing = 0.40
+# Variationally optimise the route's control polygon before driving it (see route_optimizer.h): bending
+# prior + one-sided clearance + waypoint fidelity, with the authored waypoints as the likelihood.
+# ENABLED on offline evidence, measured on this exact tour with tools/route_bench against the world
+# snapshot the controller writes (route_world.txt). It removes 3 of the 4 places where the route demands a
+# turn radius below the robot's 0.23 m inscribed — all three are planner artefacts clustered around
+# (0,-1.9) — and raises min clearance 0.334 -> 0.431 m, at a cost of 0.06 m of waypoint fidelity and no
+# change in the route's own traversal time. The 4th is AUTHORED (wp21/wp22 are 0.35 m apart with a 104°
+# turn between them) and no optimiser can remove it without abandoning the waypoints; that is a question
+# about the tour, not about this switch.
+# ★An optimised route CHANGES THE STIMULUS: a run under this flag measures the route, not the controller.
+RouteOptimize = true
+# ── ONE DIAL: SPEED (0) <-> SAFETY (1) for the route optimiser ──
+# In a quadratic objective the weights ARE precisions, so trading precision between the clearance
+# PREFERENCE and the curvature PRIOR is one meaningful scalar: w_clear *= g, w_kappa /= g. 0.5 leaves
+# both exactly as written (it was the built-in default and this key was previously ABSENT from the file,
+# so the dial had never actually been moved). Toward 0: smoother, wider corners, the route hugs
+# obstacles to get them. Toward 1: the route climbs onto the medial axis and accepts winding to stay there.
+# ★2026-08-05 0.5 -> 0.75, on measurement, not feel. tools/route_bench over the recorded world:
+#   bias        0      0.25     0.5     0.75      1.0
+#   clr_min   0.332   0.332   0.376   0.432    0.473   <- route's own minimum clearance
+#   clr_p05   0.473   0.456   0.480   0.520    0.546
+#   len_m    110.8   112.6   113.4   114.4    115.5
+#   pivots      13       9       5       8       11    <- points where R < inscribed, i.e. point turns
+#   (0 is REJECTED and 0.25 INFEASIBLE, so the low end is not even available.)
+# Body circumscribed radius is 0.325, so the TIGHTEST BODY MARGIN goes 0.051 -> 0.107 m: it roughly
+# DOUBLES the pinch the robot must squeeze through, for +0.9% length and +1.2% ideal traversal time.
+# ★WHY, from the robot and not from theory: at 0.5 the plain tracker's last-resort halt fired 296 times
+# in 32 episodes (median 2 cycles) on the 18:47 lap, because at 0.69 m/s its threshold is 0.103 m while
+# the tour's actual body margin there is ~0.10 m — the operating point sat exactly ON the threshold, and
+# body_extent_here() is taken along the noisy ESDF GRADIENT, so it chattered across it. That cost jerk/m
+# 1.07 -> 2.34. The cure is MARGIN, not a different threshold: move the operating point, not the test.
+# ★COST TO WATCH: pivots 5 -> 8. Each point turn observed on the robot took ~4.3 s, so expect roughly
+# +12 s on a 145 s lap. That currency only became payable once the tracker could pivot at all (2026-08-05);
+# before that, extra cusps were what made it diverge.
+RouteSafetyBias = 0.75
+
+# ── SMOOTHNESS OF THE TURN, ATTACKED IN THE GEOMETRY ──────────────────────────────────────────────
+# Penalises dkappa/ds (the clothoid criterion) in the route objective. The robot must deliver
+# omega = v*kappa, so omega_dot = v_dot*kappa + v^2*(dkappa/ds): with speed roughly held, the roughness
+# of the TURN RATE is the curvature RATE. This is the cause; the tracker's gains are the symptom, and
+# they fight it through a clamp that saturates (|cmd_rot| sat on its rail for 53% of cycles on a bad lap)
+# where the gradient with respect to any gain is exactly zero.
+# ★0.5 was swept, not guessed — tools/tracker_sim route_world.txt w_jerk=0,0.5,2,8 (it now drives the
+# OPTIMISED route). It is the only setting that improves every measure at once:
+#     w_jerk    TV(w)/m   TV(v)/m   rms      max
+#     0         1.341     0.411     29.9 mm  70.4 mm
+#     0.5       1.234     0.389     29.4 mm  68.7 mm   <- here
+#     2         1.115     0.364     32.1 mm  76.0 mm
+#     8         0.944     0.287     32.4 mm  86.4 mm
+# Higher keeps buying smoothness and starts paying in accuracy and in the AUTHORED waypoints: at 8 the
+# anchor energy triples (0.070 -> 0.221 on route_bench) and corr(e,kappa) collapses 0.55 -> 0.40 with the
+# lag peak at +1000 ms — the error stops being explained by curvature. Raise it for a long smooth tour;
+# do not raise it when hitting the waypoints is the point.
+# ⚠Measured on the 37 m tour with NO obstacles in the bench, so no safety gate: on the robot the gate
+# contributes most of the command roughness, and these TV figures are a floor, not a prediction.
+RouteJerkWeight = 0.5
+
+# ── WHICH CONTROLLER DRIVES ──
+# ★"mppi" WAS THE THIRD VALUE AND IS GONE (sampler deleted 2026-09-09; it had been unreachable since
+#  this key became "plain" on 2026-08-05). A config still asking for it now WARNS and gets "plain" —
+#  it is not silently accepted, because being handed a different control law without being told is
+#  exactly how a mislabelled lap happens.
+# "pd"    = geometric carrot tracker (PD on carrot bearing + cos-shaped speed) plus a triggered safety
+#           gate. Avoidance is the BAND's. This is the best-measured controller on the robot so far.
+# "plain" = THE PLAIN TRACKER (src/trackers/plain_tracker.cpp). Curvature feedforward previewed by the
+#           identified actuator lag + critically damped Frenet feedback on (e_y, e_psi). It performs NO
+#           avoidance and queries no obstacle field: the premise is that the PATH IS SELF-ADJUSTING AND
+#           SAFE, which the planner's footprint predicate, the band, and repair->replan are what make
+#           true. Its constructor takes a PathWorld and not a FieldWorld, so that premise is enforced by
+#           the compiler rather than by this comment.
+# ★"pd" and "plain" both REQUIRE BandEnabled = true — neither does avoidance, so with the band off
+#  nothing does. The agent warns at startup for "pd"; the same applies to "plain".
+#
+# ── WHY "plain" REPLACED THE "route" TRACKER (deleted 2026-08-05) ──
+# "route" was the same steering law plus its own CLEARANCE BOUND, and every one of its four failures came
+# from that bound — never from the steering:
+#   lap 1  omega was proportional to v, so a zero bound took the steering to zero too. Deadlock: 568 of
+#          1187 cycles frozen with 0.50 m of clearance at the robot.
+#   lap 2  a 0.10 m standoff forbade a route whose tightest CERTIFIED margin is 0.011 m. The planner
+#          promises FIT, not comfort — a standoff above the route's own margin makes it undrivable.
+#   lap 4  the bound scanned a FIXED 1 m at any speed, so one bad far-field sample stopped the robot dead
+#          and, stopped, it could not change the geometry stopping it: 178 stop episodes of MEDIAN LENGTH
+#          1 CYCLE, 24% of cycles at zero, cross-track +144% and jerk +173% vs the pd path.
+#   lap 5  the bound was repaired to scan only the braking distance. The repair WORKED — stops fell to 19
+#          episodes (2.1%, pd is 2.5%) — and the lap was WORSE: unbraked, mean commanded speed rose
+#          0.35 -> 0.53, pose sigma DOUBLED to 0.204 m, measured speed went non-physical on 27 cycles and
+#          the robot left the route by 4.3 m, forcing 9 replans and a manual stop.
+# ★THE LESSON, and it is why the bound is gone rather than tuned: the broken bound had been holding the
+# system together BY ACCIDENT, as a speed limiter nobody designed. The binding constraint on this robot
+# is not obstacles — it is how fast it can go and still know where it is. That belongs to the
+# pose-confidence ramp in controller_motion_commander (PoseXYStdSlow/Stop), which is DOWNSTREAM of every
+# mode. A tracker carrying its own copy duplicates the band, which is the same NULL stage 1 measured when
+# the old sampler and the band shadowed each other.
+# ★ALSO SETTLED, so it is not re-derived: the ESDF is NOT at fault. pd reads the same field with the same
+# pose jumps and stops 10 times in three laps. tools/tracker_sim against the recorded grid gives d_min
+# worst +0.009 m, zero of 148 scan points at v_clear==0 — the STATIC field never goes negative. The
+# difference was always how much of the field each controller consulted (pd: adv*0.30 = 0.104 m ahead;
+# route: a fixed 1.0 m), which is a property of the tracker, not of the field.
+ControlMode = "plain"
+# Cross-track feedback for the PD tracker, in Stanley's form: the steering error becomes
+#   carrot_bearing + atan(gain * cross_track / max(soft, speed))
+# 0 = pure pursuit, which steers at the carrot ONLY and therefore converges to the carrot's DIRECTION
+# rather than to the path — it cuts every corner and wanders off the route the band just optimised.
+# Higher = sticks harder to the route; too high oscillates. Soft is the standstill softening constant.
+# ★2026-08-02 1.0 -> 2.0. Raised on evidence, not feel: tools/tune_cross_track.py over laps 143347 and
+# 143910 gives signed bias +0.003/-0.008 m, sign changes 0.20-0.36 Hz and autocorrelation at 0.5 s of
+# +0.85/+0.89 — the error is slowly varying and PERSISTENT, not oscillating. Over-gain would show as
+# oscillation about zero with NEGATIVE autocorrelation at half a period. So 1.0 was at worst too low and
+# could not have been too high. Expect cross_track_rms to fall from ~0.10; if it instead starts
+# oscillating, that autocorrelation goes negative and the tool will say so.
+# ── THE PLAIN TRACKER (ControlMode = "plain") — src/trackers/plain_tracker.cpp ──
+# omega = g_dc * [ v*kappa_bar(s + v*T_lag) - v_steer*( (2/L)*e_psi + (1/L^2)*e_y ) ]
+# Replaces the carrot, Stanley term, bumper, Kd, EMA and Gaussian brake with one law. The curvature
+# term is the ONLY one reading the route, so feedback cannot double-count the nominal turn — the
+# failure mode that killed the 2026-08-04 attempt to ADD a feedforward to pure pursuit.
+# T_lag and g_dc are the ROBOT (identified from logged cmd_rot/meas_rot, r^2 0.94-0.95): re-identify
+# them per mission to close a sim2real gap. L is the CONTROLLER and is deliberately NOT adapted —
+# measured in tools/tracker_sim to be the same 0.60 on the identified plant AND on a deliberately
+# different one (tau 0.35, delay 0.30, gain 0.75), where the margin rule's prescription of 1.37 was
+# 3.8x worse. RotHeadroom is the fraction of omega_max the feedforward may claim; without it the
+# feedforward saturates the clamp and the feedback loop is open on curves (rms 154 -> 94 mm at 0.70).
+# ★2026-08-06 0.60 -> 0.50, proposed by tools/adapt_L.py from the run history. The policy is
+# "minimise cross_track_rms subject to rot_effort/distance <= 0.87 rad/m" — a hard constraint rather
+# than a weighted sum, because rms(L) has NO interior minimum (it falls monotonically as L shrinks, so
+# minimising it alone drives 2/L and 1/L^2 up until the loop rings). The budget came from measurement:
+# the robot's own runs sat at 0.850 / 0.863 / 0.818, so 0.87 means "never rougher than it already is".
+# Evidence at 0.60: two 3-lap runs, rms 0.1196 / 0.1107, rot/m 0.851 / 0.810 — feasible with margin.
+# tools/tracker_sim on the pinned world predicts 0.60 -> 0.50 gives rms 64.9 -> 59.0 mm (-9%) for
+# rot/m 0.776 -> 0.823 (+6%). The robot runs ~7% above the sim on rot/m, so expect ~0.88 — right on the
+# budget line, which makes this a genuinely informative run rather than a foregone one.
+# ★0.45 is predicted OVER budget (0.874) and no better on rms (64.1), so the search should stop at 0.50.
+# The budget and the loop-margin floor independently agree on that, which is the reassuring part.
+PlainTrackerL = 0.50
+PlainTrackerTLag = 0.42
+PlainTrackerGdc = 1.124
+PlainTrackerW = 0.40
+PlainTrackerRotHeadroom = 0.70
+# ── THE HAIRPIN PAIR — neither works without the other (see controller_types.h) ──
+# This tour turns 178 deg at s=24.18. BrakeK is an exponential brake on advance vs the DEMANDED turn
+# rate, v *= exp(-k*(omega_ccw/max_rot)^2)  [omega_ccw = CLAMPED; the exponent was the unbounded
+# demand when k=0.25 was measured — see plain_tracker.cpp]. The ratio coupling alone braked only on SATURATION, so just
+# under the cap the robot drove flat out while turning flat out. ProjWindow is how far forward in ARC
+# LENGTH the projection may search: at 2 m the hairpin's fold sat inside it, the search snapped to the
+# returning leg, and the robot turned around where the two legs touch instead of driving to the tip.
+# ★MEASURED together (tools/tracker_sim, pinned world, window 0.60), route is 73.85 m:
+#   BrakeK    0.0    0.5    1.0    2.0    3.0    5.0
+#   reached  24.2   24.2   61.0  73.70  73.70  73.70
+#   rms mm   1543   1584   1930   74.0   80.6   86.0
+# Below 2.0 it STALLS at the hairpin. PD's equivalent (gauss_k 0.5) is not enough here — PD's carrot
+# cuts the corner, this tracker has to turn.
+# ⚠Tightening ProjWindow WITHOUT BrakeK stalls the robot at the hairpin; BrakeK without tightening
+# ProjWindow changes nothing, because the search still leaps the fold.
+# ★★2026-08-06, THE GAIN WAS WRONG, NOT THE IDEA. Shipped at 2.0 with a tightened window, both were
+# backed out when the robot measured rms 0.0962 -> 0.1579. Then the brake was tested ALONE, at the
+# shipped window, which is the comparison that should have been run first (L=0.50, pinned world):
+#     k       0.00   0.25   0.50   1.00   2.00   3.00
+#     rms mm  59.0   32.8   40.7   52.4   63.5   67.2
+#     max mm 294.2   93.6  130.5  149.8  152.9  184.1
+#     rot/m  0.823  0.805  0.803  0.873  0.947  0.976
+# ★k=0.25 is the optimum and it is a LARGE win: rms -44%, worst-case error -68%, and rot/m slightly
+# BETTER, for 4% more lap time. Unlike L, this parameter has a clear interior optimum.
+# ★k=2.0 is WORSE THAN NO BRAKE (63.5 vs 59.0) and busts the 0.87 budget at 0.947 — which explains the
+# robot regression far better than the window does. 2.0 came from a different question entirely ("can
+# it get through a 178 deg reversal with a tight projection window"), and applying it to ordinary
+# corners just makes the robot crawl through all of them.
+# ★PD's long-standing gauss_k = 0.5 sits right next to the optimum (40.7 mm).
+# ⚠AND THE DIAGNOSIS THAT MOTIVATED THEM WAS BUILT ON THE WRONG SIGNAL. Every "projection jump" number
+# quoted for this work — including the 2.52 m at s=24.2 — came from route_s_m, which is
+# RouteFollower::progress(), the SESSION's projection. PlainTrackerProjWindow governs only
+# PlainTracker::s_hint_. The two are different projections with different windows, so the measurement
+# could never have evaluated the change. The tracker's own s_hint_ has never been instrumented.
+# ⚠The hairpin problem is REAL and still open (the robot turns around where the outbound and inbound
+# legs touch instead of driving to the tip). Four fixes have been tried and all measured worse:
+# a projection rate limit, a first-local-minimum search, a heading gate, and this pair. Do not attempt
+# a fifth until PlainTracker::s_hint_ is logged per cycle and the jump is confirmed to happen THERE.
+PlainTrackerBrakeK = 0.25
+PlainTrackerProjWindow = 2.00
+# ★2026-08-05 THREE KEYS REMOVED HERE — PlainTrackerAlignPower, PlainTrackerOffsetGateRef and
+# PlainTrackerFfDenomMin — together with a hidden 0.15 m/s steering floor in the tracker. They were added
+# one per lap across a single session, and they were four approximations of ONE statement that the
+# tracker now writes directly and without any new parameter:
+#     k_eff = k_path/(1 - k_path*e_y);  k_cmd = k_eff - (2/L)e_psi - (1/L^2)e_y
+#     v = min(v_profile, max_rot/|k_cmd|);  omega = g_dc*v*k_cmd
+# At a cusp |k_cmd| is large, so v collapses and omega saturates at max_rot — that is the point turn,
+# with no cos power and no mode. Off the path, k_eff grows as k_path*e_y approaches 1, so v collapses —
+# that was the offset gate.
+# ⚠CORRECTION (2026-08-06): the third claim — "omega = v*k_cmd cannot die at a standstill, so the
+# steering floor went too" — is WRONG on both counts. The shipped law is not omega = v*k_cmd but
+# omega = g_dc*(v*k_ff + v_steer*k_fb), and kSteerFloorMps = 0.15 is STILL IN plain_tracker.cpp,
+# committed and live. It is also BINDING, in exactly two places: at the s=23.9 cusp, where
+# route_speed_limit deliberately returns ~0.07 m/s via clamp(v, min(0.15, v_rot_min), v_cap), and
+# through the end-of-route taper, where v_stop -> 0 by construction. Every plain lap measured to date
+# ran WITH it. Left in place: removing it is a change to the control law and needs its own lap.
+# ★The tracker is back to five parameters, three of them (TLag, Gdc, W) IDENTIFIED constants rather than
+# choices. If a knob looks necessary here, the law is probably wrong somewhere else.
+PdCrossTrackGain = 1.4
+PdCrossTrackSoft = 0.30
+# ── LATERAL BUMPER (PD mode only) ──
+# The deleted sampler had a LambdaLateralBumper term that pushed the body off whatever it was passing
+# too close to. Neither remaining tracker has one: the band shapes the ROUTE and the safety gate only
+# BRAKES, so nothing pushes sideways. Measured p05 body clearance ~0.08 m against a mean tracking error of ~0.08 m — the robot
+# rides the margin with no way to recover, which is what "still too close to thin walls" is. The route
+# cannot fix it, because the error is the tracker's and not the route's.
+# ONE-SIDED, like the route optimiser's clearance term:  push = (deficit_L - deficit_R)/Dist, with
+# deficit = max(0, Dist - gap). Both sides clear ⇒ exactly zero push and zero gradient; there is no
+# "if too close" switch, the term simply has no value where there is room.
+# Gain 0 disables. Dist is the gap FROM THE BODY at which a side starts pushing back.
+# ★Watch bump_push / gap_l / gap_r in tracker_diag.csv: "it still clips" and "the bumper never engaged"
+# are indistinguishable without them.
+# (A fast-attack / slow-release hysteresis on the gate lived here as GateReleaseTauS. BUILT, RUN TWICE
+# AND REVERTED 2026-08-04. It did reduce jerk — -18% per second, -12% per metre against the preceding
+# lap — but the per-metre figure sits INSIDE the archived spread (2.58-3.55), while genuine gate
+# DETECTIONS rose to 4.34 and 4.45 per metre against an archived max of 3.55, in both laps, and speed
+# and clearance drifted down with them. Bought little, cost consistently.
+# ★Two things learned that outlive the change: (a) safety_guard_cycles counts risk.trigger, i.e. real
+# detections, not cycles-with-scale-below-1, so that rise was not an artefact of the ramp; (b) the
+# gate's horizon is computed from the PRE-gate speed, so slowing the robot canNOT shrink its own
+# foresight — a coupling I hypothesised and the code disproves. See TRACKER_REVIEW.md R2: the jerk is
+# structural, and the fix is moving the safety cut INSIDE the speed profile, not damping its output.)
+PdBumperGain = 1.0
+PdBumperDist = 0.25
+# ── CARROT RATE LIMIT ──
+# How far the STEERING TARGET may move in the room frame per cycle, as a multiple of the distance the
+# robot itself could have driven (MaxAdvSpeed * dt). The route does not move and the carrot slides
+# along it at about the robot's own speed, so a much larger step is the PROJECTION jumping because the
+# POSE jumped — not the carrot advancing.
+# ★Measured 2026-08-02: room_concept fails its odometry prediction and snaps to a scan match. 3.0% of
+# cycles show a pose-differenced speed ABOVE the commanded limit (max 1.02 rad/s against MaxRotSpeed
+# 0.8), and around those cycles the carrot moved ~3x its baseline — up to 1.79 m in ONE cycle, bearing
+# swinging +-58 deg (1 sd), correlating +0.78 with cmd_rot which it LEADS by 0.2 s. Both control modes
+# steer at this carrot, which is why the weave survived replacing MPPI with the PD tracker entirely.
+# ★This bounds the CARROT's amplification. It cannot undo a pose jump's direct effect on the geometry;
+# the real fix is that the localiser should not jump. 0 disables.
+CarrotRateLimitFactor = 3.0
+# ── CARROT LOOKAHEAD ──
+# How far ahead on the route the steering target sits. NOT previously exposed — it ran on the 2.0 m
+# built-in default. ★Measured 2026-08-02 on this apartment: clip_carrot_to_reachable binds on 75% of
+# cycles and the ACHIEVED carrot distance has p50 1.06 m, collapsing under 0.5 m on 16%. So the clip,
+# not this number, was setting the lookahead — every cycle, via a test that flips as route curvature
+# and the live ESDF shift underneath it, bouncing the target between clipped-short and released-long.
+# Both control modes steer at that target, which is why the weave survived replacing MPPI with the PD
+# tracker. Asking for a lookahead the geometry can actually supply leaves the clip rarely binding.
+# ★Pure pursuit's standing offset on a curve grows with the SQUARE of this, so shortening it also
+# reduces corner-cutting — at the cost of a twitchier, less anticipatory line. Watch cross_track_rms.
+# ★TRIED AND REVERTED 2026-08-02: 2.0 -> 1.1 on the hypothesis that the clip was setting the lookahead
+# and chattering. It did what it says — carrot_dist p50 2.0->1.05, step max 1.767->0.890 — and the
+# WEAVE DID NOT MOVE: carrot_bear sd 1.035->1.003, cmd_rot sd 0.618->0.595. Hypothesis falsified; back
+# to the value every run today used. Left exposed because it should have been configurable anyway.
+CarrotLookahead = 2.0
+
+# ── LOCAL ELASTIC BAND (stage 1: the route deforms, the MPPI still follows it) ──
+# RouteOptimize above runs ONCE at install against GridPlanner's STATIC room-frame EDT (polygons only).
+# The band re-runs the SAME objective every cycle on a window of control points ahead of the robot,
+# against the MPPI's LIVE robot-frame ESDF, so unexpected obstacles reshape the geometry instead of
+# being fought by the follower. Quinlan/Brock-Khatib, with the B-spline control polygon as the decision
+# variable — which is what route_optimizer already was.
+# ★OFF by default: it deforms the route the robot is driving. Turn on for an A/B, not by habit.
+# ★BandLead is the safety-critical one. Everything behind the robot is frozen (arc length is measured
+# from s=0, so a curve that moves behind the robot changes what progress() means), and BandLead extends
+# that freeze AHEAD so the geometry cannot shift inside the follower's own lookahead.
+# ★2026-08-02 A/B IN PROGRESS — ALTERNATING, currently on the OFF arm (lap 3 of 4).
+#   1. OFF  20260802-133550  104.5 s  0.349 m/s  78 rev (2.14/m)  p05 0.1009
+#   2. ON   20260802-135128  105.4 s  0.347 m/s  66 rev (1.80/m)  p05 0.0784
+#   3. OFF  20260802-135917  103.2 s  0.355 m/s  65 rev (1.77/m)  p05 0.1016
+#   4. ON   <- this lap
+# ★Alternating rather than two more of the same: everything else in this system drifts between laps
+# (localiser state, the room's furniture, what the residual grid has accumulated), and ON,ON,OFF,OFF
+# cannot separate the flag from the drift. Order matters more than count at n=2.
+# ★★READ AFTER LAP 3: the REVERSAL effect did not survive. OFF gave 2.14 then 1.77 rev/m — an OFF-to-OFF
+# spread of 0.37 against an ON-vs-OFF difference of 0.15. n=1 was noise.
+# ★★What DID emerge: the two OFF laps agree on p05 clearance to 0.0007 m (0.1009, 0.1016) while ON gave
+# 0.0784 — a 0.023 m reduction, 33x the OFF-to-OFF spread. Lap 4 is testing THAT, not the reversals.
+# ── BLOCKAGE -> REPLAN TRIGGER ──
+# A gradient elastic band CANNOT escape an obstacle sitting on the route: the distance field's gradient
+# there is axial, so the band is pushed along the route rather than off it (Zhou 2020 Fig. 2, reproduced
+# in RouteSpline::self_test). A* owns homotopy, the band owns geometry, and this is the handover.
+# ★Under ControlMode="pd" this is the ONLY thing that notices the route has become undrivable — the
+# sampler that used to find every rollout colliding is not running.
+# Threshold 0.20 m is measured from the ROTATION CENTRE against an inscribed radius of 0.2299 m, i.e. it
+# fires only where the body cannot fit AT ANY HEADING — a hard infeasibility test, not a comfort one.
+# MinWaypoints 4 x RouteSpacing 0.05 = 0.20 m of continuously blocked route.
+# ConfirmCycles 15 at 10 Hz = 1.5 s = 0.56 m of travel at 0.375 m/s; with a 1.5 m lookahead that leaves
+# ~0.9 m in hand. Cooldown 100 cycles = 10 s between triggers.
+BlockageEsdfThreshold = 0.20
+BlockageMinWaypoints = 4
+BlockageLookahead = 1.5
+BlockageConfirmCycles = 15
+BlockageCooldownCycles = 100
+
+BandEnabled = true
+BandIterations = 4        # warm-started incremental solve; 30 (the build value) would re-solve from scratch at 10 Hz
+# ★2026-08-05 1.0 -> 0.5. This is the BLIND ZONE: the band cannot deform the route inside it, so a
+# locally-detected obstacle nearer than this gets no path response at all — and since the plain tracker
+# carries no avoidance, nothing else responds either. At 0.7 m/s a 1 m lead was 1.4 s of travel the band
+# could not touch.
+# ★0.5 IS THE FLOOR, and it is set by the tracker's own lookahead rather than by preference. The lead
+# must stay outside what the tracker READS, or the band deforms curvature the tracker is actively using
+# and the deformation arrives as a step in its error signal. The tracker reads the curvature preview
+# v*T_lag +- W/2 = 0.42*v +- 0.20, which reaches 0.37 m at a typical 0.40 m/s and 0.49 m at max_adv 0.7.
+# ★★REVERTED to 1.0 the same evening, on measurement. 0.5 was justified as "clears the tracker's 0.49 m
+# preview by 1 cm", and a 1 cm margin is not a margin. Worse, the preview is not the only exposure: the
+# deformed section ADVANCES INTO THE PROJECTION over the next few cycles, so e_y itself steps as the
+# robot reaches route the band has just moved. The lead must stay clear of where the robot will be
+# MEASURED, not merely of where the preview samples this cycle.
+# Measured, single variable (3-lap trial 20260805-224716 vs the four laps before it): cross-track rms
+# 0.108 -> 0.735, dev_norm 1.80 -> 12.25, J 4.77 -> 18.58, lap_repeat max 0.226 -> 0.511, replans 0 -> 4.
+# ★omega saturation was UNCHANGED at 19.3% vs 18.9%, which is what identifies this as a band effect and
+# not a tracker one — the v/omega coupling kept working throughout.
+# If the blind zone needs shrinking, step it 1.0 -> 0.85 -> 0.75 and watch dev_norm, rather than jumping
+# to the arithmetic floor.
+# ★2026-08-05 1.0 -> 0.6. Shrinks the blind zone the band cannot deform. 0.5 was tried and its effect
+# was never actually observed — the controller process predated the edit and config is read ONCE AT
+# STARTUP, so that run used 1.0 like every other. ⚠THIS NEEDS A CONTROLLER RESTART TO TAKE EFFECT, and
+# it must be verified against `ps -o lstart` before any result is attributed to it.
+# 0.6 leaves ~0.11 m over the tracker's own curvature preview, which reaches 0.42*v + W/2 = 0.49 m at
+# max_adv. The earlier "0.5 clears it by 1 cm" reasoning was wrong twice: 1 cm is not a margin, and the
+# preview is not the only exposure — the deformed section then ADVANCES INTO THE PROJECTION, so e_y
+# steps as the robot reaches route the band has just moved.
+BandLead = 0.6            # m of route ahead of the robot left frozen  ★NEEDS A RESTART
+BandWindow = 4.0          # m of deformable window beyond the lead
+BandPeriodCycles = 1      # run every N cycles
+
+# (The MPPI scoring regime lived here: MppiBoundedCosts / MppiLambdaFixed / MppiLambda /
+# MppiInjectionSeeds, plus ~25 lines recording that the offline bench predicted 11 -> 2 rotation sign
+# flips and the robot delivered 79 -> 140. KEYS AND CODE REMOVED 2026-09-09 with the sampler. The
+# finding worth keeping is not about MPPI at all: an offline closed-loop bench disagreed with the robot
+# in the SIGN, not merely the size, and the 1.72 Hz bench vs 0.69 Hz robot gap was never explained —
+# so no --loop result was ever transferable. tools/tracker_sim inherits that warning.)
+LambdaContinuity = 0.0
+ContinuityRotFactor = 1.0
+AffordanceLambdaCost = 0.2    # grounded EFE selection nav-cost weight (nats per metre): G = λ·dist − ΔH
+AffordanceSwitchMargin = 0.5  # commitment hysteresis (nats): held affordance must be beaten by this much to switch
+# ── ROOM-vs-OBJECT ARBITRATION ──────────────────────────────────────────────────────────────────────
+# Scale on a ROOM affordance's epistemic gain WHILE at least one OBJECT affordance is also Offered or
+# Executing. Both are quoted in nats and the selector treats them as one currency, but they are not
+# equally spendable: re-localising is a standing background need that recovers on its own and can be
+# paid at any time, whereas an object's look is opportunistic — the robot is beside it NOW and the
+# chance is gone once it drives away. Without this the room wins nearly every contest and the objects
+# are never visited. A PREFERENCE, not a gate: the room still wins on a large enough gain, which is
+# what should happen when the pose belief has genuinely degraded. Inert when no object is competing,
+# so a lost robot in an empty room is unaffected. 1.0 restores the old behaviour.
+AffordanceExplorationGainScale = 0.35
+MaxAdvSpeed = 0.7
+# Lateral-acceleration budget, m/s^2. Sets BOTH the curvature speed ceiling (v = sqrt(a_lat/kappa), so the
+# robot arrives at a corner already slow enough to follow it) and the route optimiser's curvature
+# normaliser. Lower = gentler corners and slower laps; it does not affect straight-line speed at all.
+MaxLateralAccel = 1.0
+# ★2026-08-30 0.8 -> 1.0. A POLICY, raised toward the CAPABILITY the robot node publishes
+# (robot_max_rot_speed = 2.0 rad/s for this Shadow, from SVD48VBase/etc/config_diferential).
+# WHY, measured rather than guessed: the speed law is v = min(v_profile, max_rot/|k_cmd|), so in
+# every turn the speed is DIRECTLY PROPORTIONAL to this number — and 38% of moving time is capped
+# by that rotation limit rather than by MaxAdvSpeed, with cmd_rot sitting on the 0.8 rail for
+# 11.8% of every lap. Re-timing the logged run against the same law:
+#     MaxRotSpeed  0.80 -> 100.0 s/lap (as measured)   1.00 -> 86.1 s (-13.9%)
+#                  1.20 ->  83.1 s (-16.9%)            1.50 -> 80.6 s (-19.4%)
+# Most of the gain is in the first step, which is why this is 1.0 and not 1.5: one variable, the
+# smallest move that should show, and 50% of capability still left in hand.
+# ★THE COUPLING THAT USED TO MAKE THIS UNSAFE IS GONE. room_concept's POSE_CLAMP_W_MAX was a COPY
+# of this number, so raising it here used to let the robot turn faster than the PUBLISHED pose was
+# allowed to change — the localiser rate-limited the robot. Since ffbf8e0 that clamp reads
+# robot_max_rot_speed off the graph, so it is bounded by the machine and not by this preference.
+# ⚠room_concept must be running that build for this to be safe.
+# ★EXPECTED: lap time down, deviation flat or slightly better (less rotation saturation means more
+# authority left for the feedback). If deviation rises instead, this is the variable to put back.
+MaxRotSpeed = 1.0
+# ── HOW MUCH HARDER TO SLOW FOR A REALLY SHARP TURN ──────────────────────────────────────────────
+# MEASURED FIRST, and the measurement is why this key exists rather than a re-tune of an existing one
+# (tools/tracker_sim route_world.txt --brake, 30-waypoint tour):
+#   |kappa| 1/m      n    v_lat    v_rot   v_entry   binding
+#   0.3 - 1.0      313    1.329    1.020     2.039   rot
+#   1.0 - 2.0      117    0.878    0.435     1.372   rot
+#   2.0 - 4.0       52    0.596    0.201     0.967   rot
+#   >= 4.0          24    0.450    0.114     2.494   rot
+# From kappa = 0.3 upward the ROTATION limit h*w_max/kappa_avg is the ONLY thing setting the speed: the
+# comfort limit sqrt(a_lat/kappa) never binds again (so lowering MaxLateralAccel slows the GENTLE bends
+# and leaves the sharp ones untouched — exactly backwards), and the rotational-ACCELERATION limit
+# sqrt(alpha/|dkappa/ds|) never binds anywhere, so it was NOT built.
+# But h is a constant, so v = h*w_max/kappa scales a hairpin the robot can barely fit through by the
+# same 1/kappa as a gentle bend. This makes the budget itself know how sharp the turn is:
+#     h_eff = h / (1 + q * (kappa_avg * R_circumscribed)^2)
+# The covariate is dimensionless BECAUSE it is measured against the ROBOT: kappa*R = 1 is a turn whose
+# radius equals the body's own circumscribed circle (0.325 m), which is where driving becomes pivoting.
+# Not a cutoff — a continuous reweighting by a physical covariate, inert on a straight.
+# ★q = 0 is EXACTLY the previous law, so any baseline recorded before today stays comparable.
+#     q        0.00   0.10   0.25   0.50   1.00   2.00
+#     rms mm   30.8   31.1   30.8   30.6   27.4   24.8   <- tracking never degrades, and improves at 1+
+#     lap s      93     97    103    112    133    173   <- the whole cost is TIME
+#     rot/m   0.827  0.827  0.828  0.825  0.821  0.822   <- the L policy's 0.87 budget is UNTOUCHED
+#   At 0.25 the slowdown is 3% at a 1 m radius, 20% at the body radius, 61% at the route's tightest
+#   (0.13 m). That shape — nothing on ordinary corners, a lot on genuinely sharp ones — is the point.
+# ★DO NOT reach for PlainTrackerBrakeK for this. Re-swept on the shipped (clamped-exponent) law it costs
+# tracking monotonically — rms 30.3 at k=0, 47.2 at k=1.0, 68.6 at k=4.0 — and k=2.0 busts the rot/m
+# budget at 0.947. It brakes on the turn RATE, which is speed-dependent and self-releasing as it works;
+# this brakes on CURVATURE, which is a property of the route. Sharpness is geometry, not rate.
+# ★UNRUN ON THE ROBOT. The bench has no pose error and no ESDF, so it measures the speed law, not a lap.
+SharpTurnSlowdown = 0.25
+PosGain = 1.2
+RotGain = 1.5
+# ★★2026-08-02 MEASURED, was 0.03. The knee sat BELOW the localiser's achievable floor: over lap
+# 20260802-131205 the best sigma_xy anywhere was 0.0429 m (median 0.060, p90 0.072), so 0.0% of the lap
+# was under the old knee and the ramp NEVER released — it had degenerated into a constant 0.83x tax on
+# forward speed, throttling 89% of output samples and accounting for the whole 17% gap between the MPPI's
+# cmd_adv (0.353 mean) and the commanded adv_mps (0.293). 0.08 sits just above the observed p90, so the
+# ramp releases in normal operation and re-engages only when localisation genuinely degrades.
+# ★The growth-rate cap (PosePredictionHorizon/PoseXYStdGrowthPerMps) is untouched and still guards the
+# real constraint — do not outrun the rate localisation can correct. It bound only 6.4% of the lap; the
+# absolute ramp was doing 93% of the throttling. Restore 0.03 to get the old behaviour back.
+# ★★2026-08-16 RE-DERIVED, was 0.08. Same rule as the 08-02 fix, applied to the CURRENT localiser:
+# the knee must sit at ~p90 of sigma while MOVING, or the ramp never releases and becomes a constant
+# tax. Measured over 9679 moving frames: sigma_xy med 0.0586, p75 0.0792, p90 0.0962, p95 0.1207 —
+# against 0.0524 / 0.0744 on the 08-13 run that felt quick. The knees did not move; SIGMA did, by
+# ~12% at the median and ~29% at p90, so a quarter of moving frames are now over a knee that used to
+# be clear. On a rotation-heavy tour the coupling then multiplies the xy and theta cuts together.
+# ⚠ This re-tracks the throttle to what the localiser delivers; it does NOT explain why sigma rose.
+# Measured, that rise is in the LAPLACE curvature, not the innovations (innovations are at their
+# LOWEST while sigma is at its highest) — i.e. a flatter minimum, which is geometry, not odometry.
+PoseXYStdSlow = 0.10
+PoseXYStdStop = 0.14   # ramp width held at 0.04, as before
+# ★★2026-08-16 RE-DERIVED, was 0.04. sigma_th med 0.0318, p75 0.0421, p90 0.0526 while moving (08-13:
+# 0.0242 / 0.0383). At 0.04 the theta ramp now bites on >25% of moving frames, and because adv is
+# coupled to it as rot_scale^(0.5*turning_ratio), a turning tour pays that cut on FORWARD speed too.
+# 0.055 restores the "theta is never the binding term" property the 08-02 measurement relied on.
+PoseThetaStdSlow = 0.055
+PoseThetaStdStop = 0.20
+# ── A/B LEVER OVER THE WHOLE POSE-COVARIANCE LIMITER ─────────────────────────────────────────────
+# 1.0 = the limiter exactly as configured below. 0.0 = it still computes and still REPORTS, but never
+# restrains the base. 0.5 = half the restraint. It multiplies the RESULT rather than any of the knees,
+# so it cannot silently re-tune one term against another, and the reported scale is what was applied.
+# WHY: "is the pose covariance what is slowing the robot" is not answerable by reading the code. Drive
+# the same route at 1.0 and at 0.0 and compare mean_speed_mps in the run JSON.
+# ⚠NOT A CURE. At 0 the robot drives fast on a pose it has less reason to trust; clearance comes from
+# live LiDAR in the ROBOT frame, so this is not immediately unsafe, but a run at 0 is a MEASUREMENT and
+# not a setting to leave behind. If the 0 run is the good one, fix whatever inflated sigma.
+# ⚠⚠ SET TO 0.0 ON 2026-08-16 AS A MEASUREMENT, NOT A SETTING. This is the experiment the note above
+# prescribes. Reason: in room_concept's logs the published sigma_xy is LOWER while the robot moves than
+# while it is parked — corr(sigma_xy, |v|) = -0.147, corr(sigma_xy, |omega|) = -0.174, and by |omega|
+# band the median runs 0.0634 (<0.05) -> 0.0589 -> 0.0546 (0.3-0.6 rad/s), i.e. TIGHTEST while turning.
+# Rotation gives the SDF views of different walls, so the Hessian is better conditioned; a parked robot
+# stares at one geometry and the minimum is flatter.
+# ★ That inverts the usual assumption and gives a sigma-keyed throttle a self-reinforcing direction:
+# low confidence -> slow down -> less motion -> sigma RISES -> slower still. A latch rather than a
+# regulator. On the observed run the correlation is only +0.155 (speed) / +0.208 (rotation), so if a
+# latch exists it is not dominating — which is exactly why this needs the A/B rather than an argument.
+# READ THE RESULT AS: if confidence still tracks speed at 0.0, the estimator is responding to motion and
+# the governor is innocent. If the tracking vanishes, the governor was driving it and the latch is real.
+# RESTORE TO 1.0 AFTER THE RUN.
+# RESTORED to 1.0 on 2026-08-16: the throttle is live again, but now against RE-DERIVED knees (above).
+# The 0.0 measurement did its job -- it showed the throttle was costing >50% of speed (median while
+# moving 0.286 -> 0.631 m/s) and buying nothing: sigma_xy was IDENTICAL across the two arms, 0.0680 vs
+# 0.0681, and confidence 0.679 vs 0.677. Driving twice as fast did not degrade localisation at all.
+# 2026-08-16: 1.0 -> 0.8 for the next run. This is the BLEND GAIN on the whole uncertainty limiter:
+# scale = 1 - k*(1 - raw_ramp), so 0.8 keeps the ramp's shape and applies 80% of whatever cut it asks
+# for. On the last completed tour the raw ramp averaged 0.761 and hit its 0.15 floor on 10% of samples;
+# at k = 0.8 those become ~0.809 and ~0.32, so the brake still responds to sigma but can no longer take
+# the robot to a sixth of commanded speed.
+PoseUncertaintyCoupling = 0.8
+MinAdvSpeedScale = 0.15
+MinRotSpeedScale = 0.05
+PosePredictionHorizon = 0.4
+# ★★2026-08-02 MEASURED, was 0.5. This asserts sigma grows 0.5 m per metre driven, so the predictive cap
+# (v <= (sigma_stop - sigma)/(horizon*growth)) allowed only 0.30 m/s at sigma=0.06 — below what the MPPI
+# asks for, which is why it became the binding term (21.2% of the lap) once the absolute ramp was fixed.
+# ★Measured over 839 sigma-update intervals across laps 20260802-131205 and -132535: d(sigma)/dt during
+# RISING intervals is FLAT at 0.010-0.016 m/s across every speed bin, against a model predicting
+# 0.032 -> 0.306. Ratio measured/model falls 0.49 -> 0.03 as speed rises, i.e. the linear-in-v FORM is
+# wrong, not just the coefficient. Cross-check, independently in both laps: mean sigma by speed bin is
+# 0.067 at 0-0.1 m/s and 0.057-0.059 at 0.6-1.0 m/s — driving FASTER goes with LOWER sigma. Net dsigma/dt
+# over all intervals is +0.001 m/s (steady state). Sigma here is set by the localiser's convergence
+# (~0.06 m), not by motion.
+# ★0.1 is still 3-10x more pessimistic than measured, so the margin is real: at sigma=0.06 the cap permits
+# 1.5 m/s (inert), at sigma=0.11 it permits 0.25 m/s (full authority as sigma approaches the 0.12 stop).
+# RECALIBRATED, NOT DELETED: the measurement covers 0-1 m/s in a mapped room with a converged filter and
+# says nothing about a feature-poor corridor or a localisation loss, which is what this term guards.
+PoseXYStdGrowthPerMps = 0.1
+PoseThetaStdGrowthPerRps = 1.0
+AdvRotationCouplingExponent = 0.5
+TemporaryObstacleHistoryScans = 5
+TemporaryObstacleOcclusionDepth = 0.35
+
+# Min lidar points for a cluster to be admitted as a temporary obstacle (both the total-unexplained
+# early-bail and the per-cluster gate). 12 was too high — a thin chair at range sits right on it, so
+# obstacle creation was intermittent/late and it drove through on a miss (proximity CSV: n_obst stayed
+# 0 through the approach, obstacle only appeared at 0.73 m). 6 makes small objects cluster reliably and
+# earlier; the tracker's existence log-odds filter prunes transient false positives.
+TemporaryObstacleMinPoints = 6
+
+# LiDAR height band (m, ≈ height above floor). Min is a floor-plane reject cutoff: the lowest beam
+# grazes the floor into a dense ring at ~0.11-0.18 m, so this MUST stay above it (0.20 known-good).
+# Going lower (e.g. 0.10) floods the controller with phantom floor obstacles. See the [LidarZ] histogram.
+# Controller-side LiDAR obstacle CREATION. false ⇒ the dedicated `residual_concept` agent is the SOLE
+# obstacle source: the controller only CONSUMES graph "obstacle" nodes (residual_* + any others) via
+# read_obstacle_polygons and no longer creates its own temp obstacles from LiDAR blockages. The
+# physical-STUCK recovery (wedged on something invisible to the LiDAR) is separate and stays active.
+# Set TRUE when residual_concept is NOT running, else the controller has no obstacle source at all and
+# creeps straight into blockers (the fast in-loop reactive reflex is gated by this flag too).
+#
+# TURNED OFF 2026-07-29 — the controller was creating local obstacles everywhere. Now covers ALL
+# controller-side creation, including the stuck-recovery virtual disc that used to escape this flag and was
+# the main offender: every wedge dropped a fresh 0.30 m disc ~0.85 m ahead, and because the "no route to
+# target" branch counts as a wedge, an unreachable target alone littered discs along the entire approach.
+# The escape maneuver (reverse + turn out) still runs; only the map pollution is gone.
+# residual_concept is now the sole obstacle source. Set back to true if it is down — with both off the
+# controller has NO unmodelled-obstacle awareness and will drive into anything the concept agents don't model.
+ObstacleCreationEnabled = false
+TemporaryObstacleMinHeight = 0.20
+TemporaryObstacleMaxHeight = 1.8
+
+# Same band for the proactive unmodelled-obstacle scan (room frame).
+UnmodelledScanMinZ = 0.10
+UnmodelledScanMaxZ = 1.50
+TemporaryObstacleRobustLoss = "huber"
+TemporaryObstacleRobustLossScale = 0.08
+TemporaryObstacleExistenceInitLogOdds = 1.6
+TemporaryObstacleExistenceMinLogOdds = -4.0
+TemporaryObstacleExistenceMaxLogOdds = 4.0
+TemporaryObstacleExistenceRemoveThresholdLogOdds = -2.2
+TemporaryObstacleExistenceObservationBias = 0.30
+TemporaryObstacleExistenceSupportGain = 0.06
+TemporaryObstacleExistenceRememberedGain = 0.02
+TemporaryObstacleExistenceWeakMissPenalty = 0.04
+TemporaryObstacleExistenceAbsencePenalty = 0.65
+# (GoalClearanceRelaxDist / GoalObstacleMargin / GoalClearanceMinRatio /
+# StraightSpeedHeadingThreshold / StraightSpeedClearanceMargin / StraightSpeedMinGoalDist
+# were here. REMOVED 2026-09-09: all six loaded into TrackerParams and were read only by the
+# MPPI sampler, so since 2026-08-05 they were knobs that looked live everywhere except in
+# the robot. Deleted rather than left as no-ops.)
+
+# Rotate in place at the goal until facing the affordance's commanded yaw before reporting arrival.
+# false ⇒ arrival is judged on POSITION alone and the robot never orients at the target. Off for
+# navigation validation runs: the terminal rotation is wasted motion there, and it is one more way to
+# hang at a goal. Turn back on when object affordances need the robot to actually look at the object.
+# ★ON since 2026-08-07: the object affordances need the robot to actually look at the object.
+# CONSEQUENCE, and it is why nearest_rotatable exists: with this on, the robot performs a TERMINAL
+# ROTATION IN PLACE at the standpoint — and that rotation runs with no obstacle check of any kind
+# (TrajectoryController's align branch returns ahead of every safety stage). A standpoint verified
+# "footprint fits" is verified at ONE heading; for a 0.46 x 0.65 body the width swept peaks at the
+# DIAGONAL (0.796 m), so a spot you can stand in is not necessarily one you can turn in. The affordance
+# target repair therefore now asks for a spot that is rotatable THROUGH EVERY HEADING, preferring more
+# clearance, instead of merely free.
+GoalFacingYawEnabled = true
+
+# ── Per-object position uncertainty as clearance ──────────────────────────────────────────────────────
+# Nine concept agents publish an rt_covariance on each object's RT edge (6x6 row-major SE3
+# [x,y,z,rx,ry,rz]) and the controller read NONE of them until 2026-08-09 — it consumed only the ROBOT's
+# own pose covariance, for the speed throttle. A freshly-born table with 30 cm of position sigma was
+# therefore planned around with exactly the same clearance as one that had been fixated for minutes.
+#
+# Each object's footprint is now grown by k*sigma_pos on every side, sigma_pos being the worse of the two
+# position axes: the planner should avoid where the object PLAUSIBLY is, and the direction it might have
+# moved is not something the planner gets to choose. k = 2 is ~95%, and mirrors the producer side of the
+# same argument — residual_concept already grows what it PUBLISHES by PublishExtentSigmaK = 2.0.
+#
+# 0 restores the previous behaviour (mean footprint only). Objects whose agent publishes no covariance,
+# or whose edge carries a covariance RING rather than a single block, are left at their mean — reading
+# block 0 of a ring would plan against a stale covariance, which is worse than not using one.
+# ★TURNED OFF 2026-08-09 after a live regression, pending the real fix. Two things went wrong:
+#   1. the inflation was applied to the object's STATE, not just to the polygon handed to the planner, so
+#      the padded footprint became the object's recorded SIZE everywhere downstream and blocked the robot.
+#      Fixed (planning-only copy), and a hard ceiling added below.
+#   2. more fundamentally, sigma GROWS whenever the robot is not looking at an object frontally, so the
+#      margin grows without limit while the robot looks away. Capping that is a band-aid: the belief should
+#      not be growing in the first place, because the RICOH still sees the object. A peripheral bearing is
+#      real evidence — tight ACROSS the ray, loose along it — and folding it in is what should bound sigma.
+#      Until that lands, an uncertainty-derived margin is measuring the absence of a fix, not the world.
+# Set to 2.0 to re-enable once peripheral evidence bounds sigma; watch the sigma_pos= values the tracker
+# now reports per object before trusting it.
+ObjectSigmaInflationK = 0.0
+# Hard ceiling on the growth (m). Robot radius is the natural scale: beyond it, more clearance cannot make
+# a path safer, only impossible.
+ObjectSigmaInflationMaxM = 0.30
+
+
+# Affordance servo ("lock-on") executor — HOW (gains/caps/timing). The WHAT/WHEN (which feedback
+# attributes, completion predicate, scalar target, timeout) is per-affordance and declared by the
+# producing agent via the affordance_protocol Contract. Room affordances are policy=Reach (this is
+# inert for them); the table affordance is policy=Servo and uses this loop.
+LockOnEnabled = true
+# ★SLOWED 2026-08-07. The search moves in order to CHANGE THE VIEW, but every centimetre of that
+# motion costs mask quality — the retina's own ego-motion channel (mask_motion_var/motion_dotd)
+# grows with base speed, so a brisk sweep degrades the evidence it is sweeping to collect. Symptom:
+# a mask plainly visible to the eye that the loop never captured. Speeds halved, and the still window
+# more than doubled while each nudge got shorter — the loop now spends most of its time LOOKING.
+LockOnSweepSpeedMps = 0.06   # PRIMARY: distance-sweep advance speed (detectability ~ distance)
+LockOnSweepRangeM = 0.45     # oscillate ± this far (m) from the arrival pose
+LockOnOffsetTol = 0.15       # |normalized centre offset| deadband for yaw centring (secondary)
+LockOnKYaw = 0.8             # rps per unit centre error
+LockOnMaxYawRps = 0.06       # tiny caps: micro-search, not navigation
+LockOnDitherYawRps = 0.05
+LockOnSettleMs = 900.0       # MINIMUM still window before a measurement is taken
+LockOnStepMs = 300.0         # duration of one sweep step (18 mm at the speed above)
+# WAIT FOR THE EVIDENCE INSTEAD OF GUESSING THE LATENCY. A fixed dwell was a guess at how long
+# camera → YOLO → mask node → concept agent → feedback attribute takes, and when the guess was short
+# the predicate sampled at the end of the dwell still described a frame captured during the previous
+# NUDGE — blurred, and rejected — while a good detection arriving moments later was never sampled,
+# because the robot had already moved on. The still window now ends only once the mask producer has
+# published this many frames SINCE THE BASE STOPPED, so the measurement is taken on looks the robot
+# actually held still for. Counted in frames, not milliseconds: a frame counter needs no clock
+# agreement between two agents. Bounded by LockOnSettleMaxMs so a dead producer degrades to the plain
+# dwell rather than freezing the search. 0 restores the old fixed-dwell behaviour.
+LockOnSettleNewFrames = 2
+LockOnSettleMaxMs = 2500.0
+LockOnMaxAttempts = 30
+
+# ── DWELL AFTER AN AFFORDANCE ────────────────────────────────────────────────────────────────────────
+# Stand still for this long after finishing an affordance before the next one may be SELECTED (not just
+# before driving to it: selection claims the affordance in the shared graph). An affordance is taken in
+# order to LOOK at something, and its result — the YOLO masks acquired at the final pose and whatever
+# the concept agents make of them — used to be gone before it could be seen, because the next selection
+# turned the robot away at the next control cycle. The affordance window's camera view is what this time
+# is for. 0 restores the old back-to-back behaviour.
+AffordanceDwellMs = 3000.0
+# ★AND WAIT FOR THE ACQUISITION, NOT JUST FOR THE CLOCK. When the affordance went to look at a named
+# object, the dwell also holds until that object's mask has come back in this many SEPARATE producer
+# frames. One sighting proves nothing — an intermittent detector produces single frames by accident —
+# so the count is what turns a sighting into evidence. Counted off the "masks" node directly, so it
+# does not depend on the affordance window being open. 0 = the dwell is the clock alone.
+AffordanceDwellMaskHits = 5
+# BOUND on the whole wait (clock + acquisition). A mask that is never coming must not park the robot:
+# past this the dwell ends anyway and the log says the acquisition failed, which is itself a result.
+AffordanceDwellMaxMs = 12000.0
+# ── RE-ASK THE STANDPOINT IN THE LAST METRES, WITH EVIDENCE THAT HAS NOT FADED ────────────────────
+# The affordance standpoint is already re-tested every control cycle — but only against the planner
+# grid, and the grid's occupancy is rasterised from beliefs that DECAY. When residual_concept's hull
+# over a real object fades, the cells under it read FREE, the test answers "fine" and goes on answering
+# "fine" however often it is asked, and the robot drives at a standpoint sitting inside something the
+# map has forgotten. Asking a stale question faster does not help; asking with fresher evidence does.
+# Inside this radius of the standpoint the LIVE LiDAR return cloud is admitted as evidence about the
+# standpoint itself, and one that the body would touch is moved to the nearest pose free under BOTH the
+# grid and the cloud. MEASUREMENT SUPPORT, not a behaviour threshold: further out those cells are
+# usually occluded by the very thing being approached, so the cloud says nothing about them. The same
+# number bounds the displacement — a viewpoint dragged further than the distance at which its problem
+# was noticed is no longer that affordance's viewpoint, so instead the run says it cannot repair it.
+# 0 disables it and only the grid test remains.
+AffordanceApproachRecheckM = 1.5
+# The camera node whose rgb media descriptor backs that view. DISPLAY ONLY: if the node or its stream is
+# absent the panel draws the mask silhouettes on a plain ground and says the picture is missing.
+CameraNodeName = "zed"
+
+# Physical-WEDGE detection + reverse-and-turn escape. Fires when the robot commands translation but the
+# base doesn't achieve it (a PREDICTION ERROR: measured base speed < StuckSlipRatio × commanded), or
+# there is no route at all. A robot moving as commanded — detour, slow nav, arrival rotation, a still-
+# sliding creep — is NOT wedged, so none false-fire (earlier goal-distance / waypoint-index signals did,
+# dropping discs mid-nav). A VISIBLE blockage is handled separately by modelling+replan (path_blocked).
+# Escape = reverse with a slight turn toward
+# the side with more clearance, drop a LOCAL-ONLY virtual obstacle at the stuck spot (visible to
+# the planner/MPPI, never uploaded to DSR), then replan around it. StuckRecoveryEnabled=false disables.
+StuckRecoveryEnabled = true
+StuckCmdLinEps = 0.05    # m/s — LEGACY (no longer gates detection; kept for config back-compat)
+StuckCmdRotEps = 0.15    # rad/s — LEGACY (see above)
+StuckMeasLinEps = 0.02   # m/s — LEGACY (base-speed gate removed; detection now uses commanded-vs-measured motion)
+StuckMeasRotEps = 0.08   # rad/s — LEGACY (see above)
+# ★RELAXED 2026-08-19 — the detector was firing on marginal cases. Measured wedges were achieving
+# 23% of commanded travel against a 25% bar: right on the edge, which is what a false-alarm-prone
+# threshold looks like. An escape is expensive (it reverses, drops a virtual obstacle and replans), so
+# the cost of a false positive is much higher than of a late true positive: the robot leaves a good
+# path and poisons the local map for a wedge that was not there. Ratio 0.25 -> 0.12 (only call it
+# wedged when it achieves almost nothing) and window 1500 -> 3000 ms (a full second of real driving
+# cannot be mistaken for a wedge). Both were 0.25/1500 before; revert here if escapes stop firing on
+# genuine wedges.
+StuckSlipRatio = 0.12    # wedge = measured base speed < this × commanded speed (prediction error)
+StuckConfirmMs = 3000    # sustained command-without-motion (ms) before escape fires
+EscapeAdvSpeedMps = 0.15 # reverse speed (issued negative)
+EscapeRotSpeedRps = 0.35 # slight turn rate during escape
+EscapeDistanceM = 0.30   # back up at most this far …
+EscapeMaxMs = 1500       # … or this long, whichever first
+EscapeSideProbeM = 0.50  # lateral ESDF probe for turn-direction choice
+EscapeRearProbeM = 0.45  # rear ESDF probe distance
+EscapeRearMinM = 0.30    # rear clearance below this → rotate-in-place, no reverse
+
+# Virtual obstacle dropped at the wedge spot on stuck (local-only, planner-visible, NOT in DSR).
+StuckVirtualObstacleRadiusM = 0.30   # half-extent of the virtual disc
+StuckVirtualObstacleForwardM = 0.40  # placed this far ahead of the robot
+StuckVirtualObstacleTTLms = 5000     # lifetime before it ages out
+
+# Near-obstacle "black box": append a CSV row whenever the robot is within ProximityLogDistance of a
+# tracked obstacle OR the trajectory ESDF drops that low. Lets a collision be explained afterwards
+# (nearest_obst_m small but min_esdf large ⇒ the controller never saw it — e.g. self-occlusion).
+ProximityLogEnabled = false   # diagnostic: enable when measuring obstacle proximity
+ProximityCsvPath = "proximity_obstacles.csv"
+ProximityLogDistance = 0.8   # m; gate distance for logging a row (raw lidar / tracked obstacle / ESDF)
+
+# ★★ SECTION HEADERS ARE LOAD-BEARING. These used to be written as bare `Target.x` / `x`
+# lines down here, i.e. INSIDE the [Controller] section that starts far above — so TOML namespaced
+# them as `Controller.x`, the code's load_optional("x") found nothing, and every
+# one of them silently kept its built-in default. Discovered 2026-08-04 when setting
+# overlay_draw_one_frame_old = false had no effect whatsoever on a lap. A dotted key only means what
+# you think when it sits ABOVE the first [section] header. Check with:
+#   ConfigLoader::exists("foo")   (or the key sweep in the session notes)
+[Target]
+# "target" is NOT a registered cortex edge type, so no producer could ever insert one; goto_action is.
+# A goal = a node placed by an RT edge under the field, linked robot -goto_action-> node.
+EdgeType = "goto_action"
+
+[Transforms]
+interpolate_rt = true
+# ── PER-CONSUMER POSE: the control law gets the FRESHEST pose, not the scan-aligned one ──────────
+# true  = the tracker (and the ESDF built inside the same call) reads the newest room<-robot RT block.
+# false = the previous behaviour: one pose for everything, pinned to the last LiDAR stamp.
+# WHY: measured over 6000 cycles, the newest block already led the scan the loop was pinning to by
+# 33 ms (p50) / 68 ms (p90) and that lead was simply declined. Nothing is extrapolated — it is a real
+# block, one query later — so this costs no accuracy and introduces no model. At 0.35 m/s it removes
+# 12-24 mm of cross-track error the feedback was correcting on stale evidence, against a gain worth
+# 2.78 rad/s per metre. See HANDOFF_delay_and_feedforward.md, Issue 1.
+# ⚠A fresher pose is a LESS SMOOTHED pose. If the newest block is jumpy this appears as e_y noise and
+# therefore rot chatter: compare cross_track_rms_m and rot_reversals against a run with this false.
+TrackerUsesLatestPose = true
+
+# (Display-side dead-reckoning of the cloud/icon to "now" lived here. REMOVED 2026-08-04: it only ever
+# applied when overlay_draw_one_frame_old was OFF, and that A/B settled ON — the cloud is registered
+# exactly at its scan stamp, so pushing it forward would undo the exactness it was compensating for.)
+
+# (The one-frame registration hold lived here as `overlay_draw_one_frame_old`. It registered the PRIOR
+# scan, buying exact registration by WAITING rather than correcting, at the price of reaction latency
+# in the control path — the delayed cloud fed the ESDF and the obstacle set too. FLAG REMOVED
+# 2026-08-04 when its A/B settled it ON; the BEHAVIOUR was removed 2026-09-09. Its surviving
+# justification was the MPPI safety gate's sensitivity to transient returns, and that gate is gone:
+# ControlMode has been "plain" since 2026-08-05 and the sampler is now deleted. Registration is
+# handled by the twist repair below, measured at 0.22 cm p50 against the 2.8 cm of obstacle lag the
+# wait cost. See controller_obstacle_tracker.cpp::handle_lidar_points.)
+
+# ── RT LEADING-EDGE CLAMP REPAIR (registration, NOT display) ──
+# The freshest scan is normally NEWER than the freshest room←robot block — the pose is computed FROM
+# a scan, so it can only arrive after one — and DSR's 5-block ring never extrapolates: it silently
+# returns the newest block instead. The whole cloud then lands with a pose Δt ms off, which is
+# invisible standing still and turns into a bulk ω·Δt rotation the moment the robot turns (and
+# "comes back" when it stops). This composes the clamped pose with the body twist room_concept
+# publishes on that same edge, which is exact rather than merely patient.
+# ★UNRUN on the robot as of 2026-08-04. New CSV columns rt_lead_ms (signed lead of the newest block
+# over the registered scan; NEGATIVE = the feed is behind and every query clamps) and rt_fix_dt_ms
+# (signed ms this correction actually walked; |rt_fix_dt_ms|·omega is the rotation it removed).
+# Set false to A/B against the buffered-only behaviour.
+rt_twist_compensation = true
+
+# Append per-cycle overlay-lag diagnostics to this CSV (empty = off). Columns:
+# t_ms,lidar_ts,gap_ms,vx,vy,omega,extrap_dt_s,disp_m,dtheta_rad,RTdelta_m
+overlay_csv_path = ""   # diagnostic, off by default: "overlay_lag_eval.csv" to measure
+
+# NOTE: the zero-copy media plane (LiDAR) needs NO config here. The DDS domain +
+# topic are read from the media descriptor JSON attribute the producer
+# (robot_concept) writes on the helios node, so the consumer always uses the
+# producer's dedicated media domain (isolated from Agent.domain = 0). The
+# subscriber is created lazily, only once that node + descriptor exist.
+
+[Lidar]
+# Stream watchdog. No fresh sweep for this long while operating => LOCAL EMERGENCY HOLD: the robot is
+# stopped, Fsm=Emergency is published (a red agent node, visible without reading this process's
+# stdout), and it is logged on entry, every 5 s while stalled, and once on recovery.
+# ★ The watchdog's members, its param and its documentation had all been here for a long time with
+# NOTHING reading them, so a stalled consumer was completely silent. Measured 2026-08-18: 65 s of a
+# motionless robot with the affordance Offered and the PRODUCER reporting `media fresh=100 served=100`
+# on the same topic. The only hint was a throttled [ctrl-idle] line whose `fresh_lidar=false` also
+# fires on about half of all HEALTHY cycles (20 Hz control loop against a ~9.4 Hz sensor).
+# Loader key is Lidar.StallTimeoutMs — it was absent from every config, so the 2000 ms default was in
+# force and undiscoverable. Stated here so it can be found and changed.
+# ★2026-08-31 2000 -> 500, and this is the first time the number has been set against MEASURED data
+# rather than inherited as a default. Over 534 s / 10594 cycles of a healthy stream on this robot:
+#     p50 50.0 ms   p90 51.0   p99 56.0   MAX 1600.0
+# So 500 ms is NINE TIMES the worst healthy gap — a wide margin against a false positive — while 2000
+# was thirty times it and left a blind spot that this run walked straight into: a single 1600 ms
+# dropout, 32 consecutive missed scans, which froze the canvas and drove the robot 1.1 m at 0.70 m/s on
+# perception that had stopped arriving, and tripped NOTHING. It exceeded the [canvas] staleness warning
+# (1 s) and not this, so no halt, no Fsm=Emergency, no banner, no media recovery, no trace.
+# ★WHAT IT COSTS IF IT IS STILL TOO TIGHT: a false stall halts the robot and publishes Emergency, which
+# is loud and recoverable — the watchdog clears itself on the next fresh sweep and logs
+# "[LidarStall] RECOVERED after N s". The failure it replaces was silent. Judge it on how often
+# [LidarStall] fires: at p99 = 56 ms it should be never, and if it fires on a healthy stream then the
+# gap distribution has changed and THAT is the finding, not this number.
+StallTimeoutMs = 500

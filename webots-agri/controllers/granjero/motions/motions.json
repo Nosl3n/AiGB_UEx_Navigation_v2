@@ -1,0 +1,100 @@
+{
+  "idle": {
+    "file": "idle.bvh",
+    "mode": "loop",
+    "root": "vertical",
+    "frame_time": 0.0083333,
+    "frames": 1861,
+    "ref_frame": 1,
+    "heading_removed_deg": -95.80188436639332,
+    "loop": [
+      269,
+      886
+    ],
+    "loop_mismatch": 881.3
+  },
+  "walk": {
+    "file": "walk.bvh",
+    "mode": "loop",
+    "root": "locomotion",
+    "frame_time": 0.0083333,
+    "frames": 327,
+    "ref_frame": 97,
+    "heading_removed_deg": 1.3511539068080085,
+    "speed": 1.1715597080095879,
+    "loop": [
+      133,
+      266
+    ],
+    "loop_mismatch": 250.9
+  },
+  "turn_left": {
+    "file": "turn_left.bvh",
+    "mode": "loop",
+    "root": "turn",
+    "frame_time": 0.0083333,
+    "frames": 781,
+    "ref_frame": 1,
+    "yaw_rate": 0.8251003424931032,
+    "loop": [
+      412,
+      639
+    ],
+    "loop_mismatch": 93.4
+  },
+  "turn_right": {
+    "file": "turn_right.bvh",
+    "mode": "loop",
+    "root": "turn",
+    "frame_time": 0.0083333,
+    "frames": 741,
+    "ref_frame": 1,
+    "yaw_rate": -0.9793242339250843,
+    "loop": [
+      364,
+      735
+    ],
+    "loop_mismatch": 59.4
+  },
+  "pick": {
+    "file": "pick.bvh",
+    "mode": "once",
+    "root": "full",
+    "frame_time": 0.0083333,
+    "frames": 420,
+    "ref_frame": 1,
+    "heading_removed_deg": -168.6983589532622
+  },
+  "harvest": {
+    "file": "harvest.bvh",
+    "mode": "loop",
+    "root": "vertical",
+    "frame_time": 0.0083333,
+    "frames": 861,
+    "ref_frame": 1,
+    "heading_removed_deg": 0.5434899728488396,
+    "loop": [
+      510,
+      806
+    ],
+    "loop_mismatch": 257.5
+  },
+  "stand_up": {
+    "file": "stand_up.bvh",
+    "mode": "once",
+    "root": "full",
+    "frame_time": 0.0083333,
+    "frames": 621,
+    "ref_frame": 523,
+    "heading_removed_deg": -73.88485399788212
+  },
+  "sit_down": {
+    "file": "sit_down.bvh",
+    "mode": "once",
+    "root": "full",
+    "frame_time": 0.0083333,
+    "frames": 621,
+    "ref_frame": 99,
+    "heading_removed_deg": -73.88485399788212
+  }
+}

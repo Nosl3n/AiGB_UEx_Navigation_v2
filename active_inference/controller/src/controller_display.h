@@ -1,0 +1,279 @@
+#pragma once
+
+#include <atomic>
+
+#include <genericworker.h>
+
+#include <functional>
+#include <memory>
+#include <fstream>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <QString>
+
+#include "controller_runtime_types.h"
+#include "controller_mission_panel.h"
+#include "controller_affordance_panel.h"
+#include "controller_camera_masks.h"
+#include "custom_widget.h"
+#include "viewer_2d.h"
+
+class ControllerDisplay
+{
+public:
+    // Everything the GUI can ask the worker to do. Bundled rather than passed positionally: the list grew
+    // past the point where a caller could get the order right by reading the call site.
+    struct Callbacks
+    {
+        std::function<void(const QPointF &)> on_manual_target;   // left click in the 2D view
+        std::function<void()>                on_clear_target;    // Ctrl+right click
+        // A mission waypoint was dragged to a new place (index, room x, room y).
+        std::function<void(int, float, float)> on_waypoint_moved;
+        // Right CLICK on empty canvas: insert a waypoint here, into whichever leg of the tour passes
+        // nearest. The model picks the index; the view only says where.
+        std::function<void(float, float)>      on_waypoint_inserted;
+        // Ctrl + right click ON a waypoint: drop it.
+        std::function<void(int)>               on_waypoint_removed;
+        // Skip pressed in the affordance window: abandon the running affordance, take the next.
+        std::function<void()>                on_skip_affordance;
+        // Everything mission-shaped is the panel's own vocabulary; the display just forwards it.
+        rc::MissionPanel::Callbacks          mission;
+    };
+
+    // Creates the planner GUI as its OWN top-level window (not docked into the DSR graph viewer),
+    // so the agent runs with Agent.graph=false. Mirrors room_concept's RoomViewer.
+    void initialize(rc::LidarPointBuffer *lidar_buffer, Callbacks callbacks);
+
+    // Repopulate the mission dropdown (after load, or after a recording is saved). Thread-safe: STAGED,
+     // then applied on the GUI thread in present(). It is called from the control thread (a save finishing),
+     // and touching a QComboBox from there is undefined behaviour, not merely untidy.
+    void set_mission_list(const std::vector<std::string> &names, const std::string &selected);
+    // Stage the mission readout + waypoint overlay. Thread-safe, like update().
+    /// Control-loop rate, shown in the window title. Written from the CONTROL thread once a second and
+    /// read on the GUI thread when the title is composed — two independent scalars, so plain atomics are
+    /// enough and no snapshot plumbing is needed. worst_ms is the tail, which is what a stall feels like;
+    /// the mean alone hid a loop whose median was healthy while its tail ran past a second.
+    void set_control_rate(float hz, float worst_ms)
+    {
+        control_hz_.store(hz, std::memory_order_relaxed);
+        control_worst_ms_.store(worst_ms, std::memory_order_relaxed);
+    }
+
+    void set_mission_state(const rc::MissionPanel::View &view,
+                           const std::vector<Eigen::Vector2f> &waypoints,
+                           int current_index);
+    // Adopt the plain tracker's L into the Stick <-> Loose slider. GUI thread, call once after the
+    // config is loaded so the control never shows a value the robot is not using.
+    void set_plain_l(float metres);
+
+    // GUI thread. True if a mission is running, so a click can ask before cancelling it.
+    bool mission_running() const;
+    bool mission_recording() const;
+    bool confirm_mission_supersede();
+
+    // Persist the standalone window's geometry (call on shutdown, GUI thread).
+    void save_window_geometry() const;
+
+    Custom_widget *widget() const { return custom_widget_.get(); }
+
+    // Staging API — safe to call from any thread. These only copy data into an
+    // internal snapshot; no Qt objects are touched here.
+    void update(const std::optional<ControllerRobotPose> &robot_pose,
+                const ControllerPolygon &world_polygon,
+                const std::optional<ControllerPathPlan> &current_plan,
+                const ControllerObstacleVisuals &obstacle_polys,
+                const ControllerPolygons &obstacle_rfe_points,
+                const std::optional<Eigen::Vector2f> &current_target_world,
+                int last_display_wp_index,
+                int max_lidar_draw_points,
+                const std::optional<Eigen::Affine2f> &lidar_correction = std::nullopt);
+
+    void set_command_values(float adv_mm_s, float side_mm_s, float rot_rps);
+    void set_command_text(const QString &text);   // alerts only (LiDAR stall / recovery)
+    void set_selected_affordance(const QString &current, const QString &previous);
+    // Stage the stuck-recovery indicator state (thread-safe; applied on the GUI thread in present()).
+    void set_stuck_active(bool active);
+    // Push the live arrival state to the toolbar readout. Called every cycle; the widget dedups.
+    void set_goal_distance(std::optional<float> dist_m, std::optional<float> yaw_err_rad, bool aligning);
+    void set_session_totals(float metres, float seconds);   // top row: metres and time since startup
+    void set_affordance_execution(const rc::AffordanceExecution &v);   // the affordance-program window
+    // Stage the Orient bearing overlay for the 2D view (thread-safe; applied in present()).
+    // Pass visible=false whenever the running affordance is not an Orient, so a finished turn cannot
+    // leave a ray pointing at a bearing nobody is asking for any more.
+    void set_orient_overlay(float x, float y, float target_yaw, float current_yaw, bool visible);
+    // One sample per evaluated affordance for the EFE panel below the 2D view. Plots TWO lines per
+    // affordance: the selection score (gain − λ·dist, solid) and the raw gain (ΔH, lighter) — so the
+    // vertical gap between them is λ·dist. Thread-safe (the plot buffers under its own mutex).
+    // `eligible` is the protocol state's verdict: is this affordance actually IN the contest (Offered or
+    // Executing) or merely present in the graph? The plot draws neg_efe, the exact quantity selection
+    // maximises, so among eligible candidates the highest line ALWAYS wins — which means a line that
+    // stays highest and is never chosen is not losing, it is not competing. Plotting the two alike made
+    // that indistinguishable, and a viewer that cannot tell "lost" from "not entered" is worse than none.
+    struct AffordanceEfeSample
+    {
+        std::string name;
+        float gain = 0.f;
+        float score = 0.f;
+        bool  eligible = true;
+        std::string state;   // Offered / Executing / Completed / Missing / Invalid
+    };
+    void update_affordance_efe(const std::vector<AffordanceEfeSample> &samples);
+    // The commanded velocities, for the smoothness trace. Fed from the motion commander's OUTPUT loop
+    // (every command actually emitted, ~40 Hz), not from the GUI tick: smoothness is a property of the
+    // signal the base receives, and sampling it at the redraw rate would alias the jitter worth seeing.
+    // adv in m/s, rot in rad/s. Thread-safe; the plot buffers under its own mutex and the series are
+    // registered on the GUI thread at construction.
+    void update_velocity_trace(float adv_mps, float rot_rps);
+    // ── THE UNCERTAINTY THAT IS SLOWING THE ROBOT, ON THE SAME AXES ──────────────────────────────
+    // sigma_xy is metres and the plot's axis is m/s, so it is handed over ALREADY MAPPED onto that axis
+    // by the control thread (which is where the knees live): the STOP knee maps to max_adv, so the line
+    // touching the top of the velocity band means "at or past PoseXYStdStop, throttle floored". Clamped
+    // there, because TimeSeriesPlot auto-scales Y and an out-of-range series would squash the velocity
+    // traces it exists to be compared against.
+    // NEGATIVE = the limiter saw no covariance at all. That is genuinely UNDEFINED rather than zero, so
+    // the trace breaks (add_point treats non-finite as a gap marker) instead of drawing a confident 0.
+    void set_uncertainty_trace_value(float sigma_on_speed_axis);
+    // Scans/second the controller actually processed (wall time). -1 = not measured yet, shown as
+    // "---" rather than 0, because "no reading" and "stalled" are different states.
+    void set_lidar_rate_hz(float hz);
+    // ── THE SAME TRACE, WHEN SOMEONE ELSE IS DRIVING ─────────────────────────────────────────────
+    // update_velocity_trace above is fed from OUR motion commander's output loop, so the panel went
+    // blank whenever anything else commanded the base — a joystick with this controller halted, most
+    // obviously. The shared graph's robot_ref_* IS the agreed channel for that ("the reference written
+    // by whoever commands (controller / joystick path)"), in the same m/s and rad/s, so it is read per
+    // control cycle and drawn HERE — but only when our own output loop is silent, because that one runs
+    // at ~40 Hz against the control loop's ~10-20 and replacing it would alias the jitter the panel
+    // exists to show. `fresh` false ⇒ the reference is a leftover from a commander that has stopped,
+    // which is not a command: the line breaks rather than flat-lining at whatever was left behind.
+    // ★MEASURED FALLBACK, ON ITS OWN SERIES. robot_ref_* turned out to be written by THIS CONTROLLER
+    // ONLY — the comment calling it "the reference written by whoever commands (controller / joystick
+    // path)" describes an intent the joystick component does not honour. Measured 2026-08-18: the robot
+    // drove at 0.640 m/s with the reference sitting at exactly 0.000, so a panel fed from the reference
+    // alone is blank for the whole of a manual drive, which is what was reported.
+    // robot_current_* IS written whoever drives (robot_concept, from the FullPose estimator), so it is
+    // the only universally available witness — but it is MEASURED, not commanded, and quietly drawing it
+    // in the commanded series would change what the panel means without saying so. It gets its own two
+    // series, which are gaps whenever a command IS available and therefore cost nothing the rest of the
+    // time.
+    void update_velocity_trace_external(float ref_adv_mps, float ref_rot_rps, bool ref_fresh,
+                                        float meas_adv_mps, float meas_rot_rps);
+    // The camera frame with the YOLO silhouettes on it, for the affordance panel. Composed on the
+    // control thread and handed over whole (see controller_camera_masks.h) — the QImage inside is
+    // already private to this snapshot, so nothing shares a pixel buffer across the thread boundary.
+    void set_camera_masks(const rc::CameraMasksView &view);
+    // Is the affordance window open? Read from the CONTROL thread to decide whether composing a camera
+    // frame is worth anything, so it is an atomic mirror written on the GUI thread — never the widget's
+    // own isVisible(), which may not be queried off the GUI thread.
+    [[nodiscard]] bool affordance_panel_visible() const
+    { return affordance_panel_visible_.load(std::memory_order_relaxed); }
+    void clear_robot_trajectory();
+    // Published by the worker's LiDAR watchdog, which runs OUTSIDE the data-driven pipeline gate —
+    // so it still reaches the canvas on exactly the cycles where the pipeline does not.
+    void set_lidar_stall(bool stalled, float seconds);
+
+    // Presentation — MUST be called on the GUI thread only. Reads the latest
+    // staged snapshot and performs all Qt scene drawing.
+    void present();
+
+private:
+    std::atomic<bool>  affordance_panel_visible_{false};
+    std::atomic<float> control_hz_{0.f};
+    std::atomic<float> control_worst_ms_{0.f};
+    // Written by the control thread, read by the output thread that feeds the velocity plot. An atomic
+    // rather than a plain float because those are two different threads and the profile path next door
+    // already made exactly this handoff atomic for the same reason.
+    std::atomic<float> unc_trace_{-1.f};
+    std::atomic<float> lidar_hz_{-1.f};
+    // Set by the output-thread feed, cleared by the per-cycle external feed: "did our own commander
+    // speak since the last control cycle". An own-source-wins arbitration with no tuned time constant —
+    // the window IS one control cycle, so it scales with whatever rate the loop happens to run at.
+    std::atomic<bool> vel_local_fed_{false};
+
+    struct DisplaySnapshot
+    {
+        std::optional<ControllerRobotPose> robot_pose;
+        ControllerPolygon world_polygon;
+        std::optional<ControllerPathPlan> current_plan;
+        ControllerObstacleVisuals obstacle_polys;
+        ControllerPolygons obstacle_rfe_points;
+        std::optional<Eigen::Vector2f> current_target_world;
+        int last_display_wp_index = 0;
+        int max_lidar_draw_points = 0;
+        std::optional<Eigen::Affine2f> lidar_correction;   // room(now)←room(scan) overlay dead-reckoning
+        bool valid = false;
+        bool  lidar_stalled = false;   // see set_lidar_stall
+        float lidar_stall_s = 0.f;
+        // When the canvas snapshot was last STAGED by the control pipeline. present() reports on it —
+        // see the note there. 0 = never staged.
+        std::uint64_t stamp_ms = 0;
+
+        QString command_text;
+        bool command_text_pending = false;
+        float cmd_adv_mm_s = 0.f, cmd_side_mm_s = 0.f, cmd_rot_rps = 0.f;
+        bool cmd_values_pending = false;
+        QString affordance_current, affordance_previous;
+        bool selected_affordance_text_pending = false;
+        bool clear_trajectory_pending = false;
+        bool stuck_active = false;   // stuck-recovery indicator (pushed every cycle; widget dedups)
+        // Remaining distance to target, shown in the toolbar. nullopt = no active plan.
+        // goal_yaw_err_rad is nullopt when the target carries no commanded facing yaw.
+        std::optional<float> goal_dist_m;
+        std::optional<float> goal_yaw_err_rad;
+        bool goal_aligning = false;
+        float session_distance_m = 0.f;
+        float session_elapsed_s = 0.f;
+        rc::AffordanceExecution affordance;
+        // The Orient overlay: where the body is, the bearing asked for, and where it points now.
+        float orient_x = 0.f, orient_y = 0.f, orient_target_yaw = 0.f, orient_current_yaw = 0.f;
+        bool  orient_visible = false;
+        rc::CameraMasksView camera_masks;
+        bool camera_masks_pending = false;
+        // Mission overlay + readout.
+        rc::MissionPanel::View mission_view;
+        std::vector<Eigen::Vector2f> mission_waypoints;
+        int mission_index = -1;
+        std::vector<std::string> mission_names;
+        std::string mission_selected;
+        bool mission_list_pending = false;
+    };
+
+    void restore_window_geometry();
+
+    std::unique_ptr<Custom_widget> custom_widget_;
+    std::unique_ptr<rc::MissionPanel> mission_panel_;
+    std::unique_ptr<rc::AffordancePanel> affordance_panel_;
+    std::unique_ptr<rc::Viewer2D> viewer_2d_;
+    bool world_view_fitted_ = false;
+    std::unordered_set<std::string> efe_series_known_;   // plot series already registered
+    std::size_t efe_color_next_ = 0;                     // next palette colour for a new affordance
+
+    mutable std::mutex snapshot_mutex_;
+    // ── THE CANVAS HEARTBEAT ─────────────────────────────────────────────────────────────────────
+    // ★A DIAGNOSTIC THAT ONLY SPEAKS ON FAILURE CANNOT CONFIRM HEALTH, and that is the case we kept
+    // landing in: the pipeline was staging frames, present() was running, and the canvas still looked
+    // frozen — so the stale/never-staged warning stayed silent and proved nothing. Two rates settle it
+    // outright: FED is how often the control pipeline stages a frame, DRAWN is how often present()
+    // consumes one. Both healthy and a frozen view means the fault is in the DRAWING, not upstream;
+    // drawn ~0 means present() is not running; fed ~0 means the pipeline is not triggering.
+    std::uint64_t last_stale_canvas_log_ms_ = 0;   // throttle for the [canvas] line
+    // ★TO A FILE, NOT ONLY TO STDOUT. Every diagnosis this session has come from a file; a line on
+    // the terminal needs someone watching at the instant it fires, and a canvas that stops changing
+    // is noticed minutes later. Three columns settle which of the three causes it is without anyone
+    // having to be present: fed (the pipeline staging frames), drawn (present consuming them), and
+    // the snapshot age.
+    std::ofstream canvas_csv_;
+    bool          canvas_csv_open_ = false;
+    std::uint64_t canvas_hb_ms_ = 0;               // window start for the heartbeat
+    int           canvas_drawn_ = 0;               // present() calls in the window
+    std::uint64_t canvas_last_stamp_ = 0;          // to count DISTINCT staged frames
+    int           canvas_fed_ = 0;
+    // ★WHAT THE SCENE RENDERS TO, not what was staged into it. See Viewer2D::paint_probe.
+    std::uint32_t canvas_paint_hash_ = 0;          // last heartbeat's off-screen render hash
+    int           canvas_paint_static_ = 0;        // consecutive heartbeats with an IDENTICAL hash
+    DisplaySnapshot snapshot_;
+};
