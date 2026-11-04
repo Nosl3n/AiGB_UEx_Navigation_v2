@@ -32,7 +32,7 @@ DEFAULT_ROUTE = "3.75,-9.5 3.75,8 3.75,-9.5 -1.25,-9.5 -1.25,8 -1.25,-9.5 -3.75,
 
 
 def find_world(g):
-    for t in ("world", "room"):
+    for t in ("field", "room"):
         nodes = g.get_nodes_by_type(t)
         if nodes:
             return nodes[0]

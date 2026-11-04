@@ -57,12 +57,6 @@ name = "plot_metaconcept"
 cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/plot_metaconcept"
 cmd  = "bin/plot_metaconcept etc/config.toml"
 
-# The FIELD as a metaconcept: field_0 = the set of plots (group_member -> each plot), born once the plots stop
-# changing. Not the world frame (that is `world`, openfield_concept). world -> field -> plot -> row -> plant.
-[[components]]
-name = "field_metaconcept"
-cwd  = "~/robocomp/AiGB_UEx_Navigation_v2/active_inference/field_metaconcept"
-cmd  = "bin/field_metaconcept etc/config.toml"
 
 # People (part 1 of retina in the field): ZED -> YOLO-seg + YOLO-pose -> 'masks' and 'skeleton' nodes.
 [[components]]

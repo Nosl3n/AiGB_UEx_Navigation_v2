@@ -30,9 +30,17 @@ bool OpenFieldSceneGraph::ensure_world(const std::vector<Eigen::Vector2f> &polyg
     std::vector<float> px, py;
     for (const auto &v : polygon) { px.push_back(v.x()); py.push_back(v.y()); }
 
-    // ADOPT: a world node may survive from a previous run (persisted graph) or a crashed one. Make sure
+    // A `world` node is the frame of the 2026-11-03 contract, now gone: if one survives from an older run, it is
+    // stale — every child would hang from the wrong frame. Remove it (we owned it).
+    for (const auto &stale : G_->get_nodes_by_type("world"))
+    {
+        qInfo() << "[openfield] removing a stale 'world' node" << stale.id() << "(the frame is now the field)";
+        G_->delete_node(stale.id());
+    }
+
+    // ADOPT: a field node may survive from a previous run (persisted graph) or a crashed one. Make sure
     // it carries OUR polygon — every consumer's containment prior reads it.
-    if (const auto rooms = G_->get_nodes_by_type("world"); not rooms.empty())
+    if (const auto rooms = G_->get_nodes_by_type("field"); not rooms.empty())
     {
         auto rn = rooms.front();
         world_id_ = rn.id();
@@ -40,15 +48,15 @@ bool OpenFieldSceneGraph::ensure_world(const std::vector<Eigen::Vector2f> &polyg
         G_->add_or_modify_attrib_local<delimiting_polygon_y_att>(rn, py);
         G_->add_or_modify_attrib_local<room_height_att>(rn, world_height);
         G_->update_node(rn);
-        qInfo() << "[openfield] adopted existing world node" << world_id_ << "and set its polygon ("
+        qInfo() << "[openfield] adopted existing field node" << world_id_ << "and set its polygon ("
                 << static_cast<int>(px.size()) << "vertices)";
         return true;
     }
 
-    // Type AND name `world`: the open-field world frame (cortex dsr_node_type.h). Consumers find it through
-    // common/world_frame (rc::world::frame_node), which prefers `world` and falls back to `room`. (It was `field`
-    // until 2026-11-03; `field` is now the metaconcept of the set of plots, active_inference/conceptos.md.)
-    DSR::Node world = DSR::Node::create<world_node_type>("world");
+    // Type AND name `field`: the robot's frame in the open field AND the concept of the place (its plots are its
+    // group_member children; active_inference/conceptos.md). Consumers find it through common/world_frame
+    // (rc::world::frame_node), which prefers `field` and falls back to `room`.
+    DSR::Node world = DSR::Node::create<field_node_type>("field");
     G_->add_or_modify_attrib_local<delimiting_polygon_x_att>(world, px);
     G_->add_or_modify_attrib_local<delimiting_polygon_y_att>(world, py);
     // Outdoors there is no ceiling; this is the obstacle-cloud ceiling consumers crop the LiDAR with.
@@ -66,6 +74,26 @@ bool OpenFieldSceneGraph::ensure_world(const std::vector<Eigen::Vector2f> &polyg
     qInfo() << "[openfield] field node created, id" << world_id_ << "," << static_cast<int>(px.size())
             << "vertices, height" << world_height << "m";
     return true;
+}
+
+// The field's MEMBERS: every plot (plot_metaconcept) is a part of this field, `field —group_member→ plot_<id>`.
+// This was field_metaconcept's job when the field was a separate node; now the field is the frame, and its owner
+// groups its plots. Idempotent: adds the missing edges, drops the ones to plots that are gone.
+void OpenFieldSceneGraph::group_plots()
+{
+    if (world_id_ == 0) return;
+    std::set<std::uint64_t> want;
+    for (const auto &n : G_->get_nodes_by_type("metaconcept"))
+        if (n.name().starts_with("plot_")) want.insert(n.id());
+    for (const auto to : members_)
+        if (not want.contains(to))
+            G_->delete_edge(world_id_, to, "group_member");
+    for (const auto to : want)
+        if (not members_.contains(to) and not G_->get_edge(world_id_, to, "group_member").has_value())
+            G_->insert_or_assign_edge(DSR::Edge::create<group_member_edge_type>(world_id_, to));
+    if (want != members_)
+        qInfo() << "[openfield] the field groups" << static_cast<int>(want.size()) << "plots";
+    members_ = std::move(want);
 }
 
 bool OpenFieldSceneGraph::publish(const PoseSample &s)

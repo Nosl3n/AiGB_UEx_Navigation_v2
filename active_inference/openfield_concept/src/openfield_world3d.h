@@ -9,7 +9,7 @@
 //             of a trunk whose canopy has not been seen.
 //   rows    — row_metaconcept's rectangles, dark-green outlines on the ground
 //   plots   — plot_metaconcept's rectangles, orange outlines
-//   field   — field_metaconcept's rectangle, a white outline
+//   field   — the field node's polygon (the frame and the place), a white outline
 //   inspection — the explorer's belief: ground still UNKNOWN tinted blue (stronger = less seen), and the offered
 //             standpoint as a cyan ring with a bar toward where it will look
 #pragma once
@@ -111,7 +111,13 @@ inline rc::viewers::World3DScene build_world3d(DSR::DSRGraph &G, DSR::InnerEigen
     };
     const int n_rows = rects("row_", 0.03f, 0.06f, row_c);
     const int n_plots = rects("plot_", 0.04f, 0.10f, plot_c);
-    const int n_fields = rects("field_", 0.05f, 0.14f, field_c);
+    // The field: its own polygon (the frame node is the field; there is no separate field rectangle any more).
+    for (std::size_t i = 0, n = field_polygon.size(); i < n; ++i)
+    {
+        const auto &a = field_polygon[i], &b = field_polygon[(i + 1) % n];
+        const Eigen::Vector2f m = 0.5f * (a + b), d = b - a;
+        s.outline(m.x(), m.y(), std::atan2(d.y(), d.x()), d.norm(), 0.0f, 0.05f, 0.07f, field_c);   // a 0.14 m band
+    }
 
     // The robot (Husky A300: ~0.99 x 0.69 m, ~0.4 m tall), at the localised pose.
     if (robot_known)
@@ -124,7 +130,8 @@ inline rc::viewers::World3DScene build_world3d(DSR::DSRGraph &G, DSR::InnerEigen
 
     s.caption = std::format("{} plants ({} complete, {} without trunk, {} without canopy) · {} rows · {} plots · {}",
                             plants.size(), complete, no_trunk, no_canopy, n_rows, n_plots,
-                            n_fields > 0 ? "field closed" : "field not closed yet");
+                            exploration and exploration->mode() == OpenFieldExploration::Mode::Complete
+                                ? "field inspected" : "field being inspected");
     if (exploration)
         s.caption += std::format(" · inspection {} ({:.0f}% of the field still unknown)",
                                  OpenFieldExploration::mode_name(exploration->mode()),

@@ -1,24 +1,21 @@
 #pragma once
 /*
- * common/world_frame/world_frame.h — which node is "the world" in this graph: a `room` indoors, a `world`
+ * common/world_frame/world_frame.h — which node is the robot's frame in this graph: a `room` indoors, a `field`
  * in the open field (openfield_concept, agricultural worlds).
  *
- * ★2026-11-03: the open-field frame was RENAMED `field` -> `world` (type and name). `field` is now a METACONCEPT
- * there (field_<id>: the set of plots, active_inference/conceptos.md), not a frame — never resolve it here.
+ * ★2026-11-04: the open-field frame IS the `field` (type and name `field`). The robot exists by itself and then
+ * locates itself in a field: the field is both the frame every plant/row/plot hangs from and the concept of the
+ * place (its plots are its group_member children, its GPS georeference places it in a larger map). The
+ * intermediate `world` node (2026-11-03) is gone. (Before that, too, the frame was called `field`.)
  *
- * WHY THIS EXISTS. Every consumer used to find the world frame with get_nodes_by_type("room") and, worse,
- * by the LITERAL name "room" in transform queries (inner_eigen->get_transformation_matrix("room", ...),
- * LidarPlaneReader::poll("room")). That hard-wired the whole fleet to one localizer. The open-field
- * localizer publishes a node of type `world` (registered in cortex's dsr_node_type.h) with the same contract
- * — delimiting_polygon_x/y, room_height, the robot->world RT edge — so a consumer only needs to ask which of
- * the two is present, and use that node's NAME as its frame.
+ * WHY THIS EXISTS. Every consumer used to find the frame with get_nodes_by_type("room") and, worse, by the
+ * LITERAL name "room" in transform queries. That hard-wired the whole fleet to one localizer. The open-field
+ * localizer publishes a node of type `field` with the same contract — delimiting_polygon_x/y, room_height, the
+ * robot->field RT edge — so a consumer only needs to ask which of the two is present, and use its NAME as frame.
  *
- * RESOLUTION ORDER: `world` first, then `room`. A graph never carries both in normal operation; if it does
- * (a stale node from a previous run), the open-field one wins because only openfield_concept publishes a
- * world, and it would not be running indoors.
+ * RESOLUTION ORDER: `field` first, then `room`. A graph never carries both in normal operation.
  *
- * Header-only, no state. The lookups walk the node map, so CACHE the result per cycle in hot loops — the
- * name of the world frame does not change while its node exists.
+ * Header-only, no state. The lookups walk the node map, so CACHE the result per cycle in hot loops.
  */
 #include <array>
 #include <optional>
@@ -31,12 +28,12 @@
 namespace rc::world
 {
 
-inline constexpr std::array<std::string_view, 2> kFrameTypes = {"world", "room"};
+inline constexpr std::array<std::string_view, 2> kFrameTypes = {"field", "room"};
 
 // True for a node type that IS a world frame (so it is never an obstacle, never drawn as furniture, ...).
 inline bool is_frame_type(std::string_view type)
 {
-    return type == "world" or type == "room";
+    return type == "field" or type == "room";
 }
 
 // The world-frame node, if any.

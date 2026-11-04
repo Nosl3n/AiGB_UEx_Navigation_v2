@@ -3,11 +3,10 @@
 //
 //   * field_explorer.h decides WHERE to look next (expected entropy reduction of the field map).
 //   * This class offers that standpoint to the controller as the affordance `afford_openfield` (type
-//     `affordance`, parented to the `world` node; affordance_protocol: Offered → Executing → Completed), and
+//     `affordance`, parented to the `field` node; affordance_protocol: Offered → Executing → Completed), and
 //     follows the consumer's outcome: a standpoint it could not reach is suppressed, one it reached is done.
-//   * It publishes the inspection state on the `world` node: model_stable = the inspection is COMPLETE (no
+//   * It publishes the inspection state on the `field` node: model_stable = the inspection is COMPLETE (no
 //     standpoint left is worth its travel), model_uncertainty = the fraction of the field's entropy left.
-//     field_metaconcept closes the field (field_0) on model_stable.
 //
 // Modes: Waiting (no pose / no field polygon yet) → Inspecting → Complete. Complete is sticky for the run.
 //
@@ -26,6 +25,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -84,6 +84,7 @@ private:
     float best_dist_ = 0.f;
     std::future<std::optional<ExplorerTarget>> search_;
     int legs_done_ = 0, legs_failed_ = 0;
+    std::set<std::string> open_names_;   // incomplete plants seen at the last refresh
 
     void refresh_obstacles(const std::string &world_frame);
     void follow_protocol(std::int64_t now_ms, const Eigen::Vector2f &robot);

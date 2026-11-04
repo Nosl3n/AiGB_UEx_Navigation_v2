@@ -98,6 +98,30 @@ void FieldExplorer::set_polygon(const std::vector<Eigen::Vector2f> &polygon)
             }
 }
 
+void FieldExplorer::set_open_plants(const std::vector<OpenPlant> &open)
+{
+    std::vector<PlantQuestion> next;
+    for (const auto &o : open)
+    {
+        PlantQuestion q{o, p_.part_prior, 0.f};
+        for (const auto &old : questions_)
+            if (old.plant.name == o.name and old.plant.missing_trunk == o.missing_trunk)
+            {
+                q.b = old.b;
+                q.looked_s = old.looked_s;
+            }
+        next.push_back(q);
+    }
+    questions_ = std::move(next);
+}
+
+float FieldExplorer::concept_entropy() const
+{
+    float h = 0.f;
+    for (const auto &q : questions_) h += binary_entropy(q.b);
+    return h;
+}
+
 void FieldExplorer::set_obstacles(std::vector<RowRect> rows, std::vector<Disc> plants)
 {
     rows_ = std::move(rows);
@@ -139,6 +163,25 @@ void FieldExplorer::observe(const Eigen::Vector2f &pos, float dt)
     if (not ready() or dt <= 0.f) return;
     for_cells_near(pos, [&](std::size_t k, const Eigen::Vector2f &c)
                    { u_[k] *= std::exp(-p_.detect_rate * p_det(pos, c) * dt); });
+    // Negative evidence about each missing part: a look that would have found it with probability 1 - e^{-q} did
+    // not (the plant is still listed as incomplete), so b ← b·e^{-q} / (b·e^{-q} + 1 − b).
+    for (auto &q : questions_)
+    {
+        const float rate = p_.detect_rate * part_det(pos, q.plant.c) * dt;
+        const float miss = std::exp(-rate);
+        q.b = q.b * miss / (q.b * miss + 1.f - q.b);
+        q.looked_s += rate;
+    }
+}
+
+float FieldExplorer::part_det(const Eigen::Vector2f &from, const Eigen::Vector2f &to) const
+{
+    const float d = (to - from).norm() / p_.part_range_m;
+    float p = std::exp(-d * d);
+    for (const auto &r : rows_)
+        if (not inside_rect(r, to, 0.f) and not inside_rect(r, from, 0.f) and segment_crosses(r, from, to))
+            p *= p_.canopy_transmittance;
+    return p;
 }
 
 float FieldExplorer::gain_at(const Eigen::Vector2f &v) const
@@ -146,6 +189,16 @@ float FieldExplorer::gain_at(const Eigen::Vector2f &v) const
     float g = 0.f;
     for_cells_near(v, [&](std::size_t k, const Eigen::Vector2f &c)
                    { g += u_[k] * h0_ * (1.f - std::exp(-p_.detect_rate * p_det(v, c) * p_.dwell_s)); });
+    // What is INSIDE: the expected entropy removed from each open plant question by a dwell here. Exact for the
+    // binary belief: if the look finds the part (prob b·(1−m)) the question closes (H = 0); otherwise b goes to b'.
+    for (const auto &q : questions_)
+    {
+        const float m = std::exp(-p_.detect_rate * part_det(v, q.plant.c) * p_.dwell_s);
+        const float p_miss = q.b * m + 1.f - q.b;
+        const float b_after = q.b * m / p_miss;
+        const float h_after = p_miss * binary_entropy(b_after);
+        g += p_.concept_weight * std::max(0.f, binary_entropy(q.b) - h_after);
+    }
     return g;
 }
 
@@ -158,6 +211,12 @@ float FieldExplorer::facing(const Eigen::Vector2f &v) const
                        const float n = d.norm();
                        if (n > 1e-3f) acc += u_[k] * p_det(v, c) * d / n;
                    });
+    for (const auto &q : questions_)
+    {
+        const Eigen::Vector2f d = q.plant.c - v;
+        const float n = d.norm();
+        if (n > 1e-3f) acc += p_.concept_weight * binary_entropy(q.b) * part_det(v, q.plant.c) * d / n;
+    }
     return acc.squaredNorm() > 1e-12f ? std::atan2(acc.y(), acc.x()) : 0.f;
 }
 
@@ -169,6 +228,8 @@ bool FieldExplorer::standpoint_ok(const Eigen::Vector2f &v) const
         if (inside_rect(r, v, p_.row_clearance)) return false;
     for (const auto &d : plants_)
         if ((v - d.c).norm() < d.r + p_.plant_clearance) return false;
+    for (const auto &q : questions_)
+        if ((v - q.plant.c).norm() < p_.open_plant_keepout_m) return false;
     return true;
 }
 
@@ -261,6 +322,34 @@ bool FieldExplorer::self_test(std::string *report)
     }
     const bool finished = legs < 200;
     ok = ok and finished and saw_west and saw_east;
+
+    // A canopy without a trunk in a corner the coverage already explained: the inspection must still go and look
+    // at it, and come back with the question answered (b low) — not complete while it is open.
+    FieldExplorer ex2;
+    ex2.set_polygon({{-10.f, -6.f}, {10.f, -6.f}, {10.f, 6.f}, {-10.f, 6.f}});
+    Eigen::Vector2f r2(0.f, 0.f);
+    for (int k = 0; k < 400; ++k) ex2.observe(Eigen::Vector2f(-9.f + 18.f * (k % 20) / 19.f, -5.f + 10.f * (k / 20) / 19.f), 1.f);
+    ex2.set_open_plants({OpenPlant{"plant_7", {8.5f, 4.5f}, true}});
+    float min_d = 1e9f;
+    int legs2 = 0;
+    for (; legs2 < 50; ++legs2)
+    {
+        const auto t = ex2.select(r2, legs2 * 10.0);
+        if (not t) break;
+        while ((t->pos - r2).norm() > 0.25f)
+        {
+            r2 += (t->pos - r2).normalized() * std::min(0.5f, (t->pos - r2).norm());
+            ex2.observe(r2, 0.5f);
+        }
+        ex2.observe(r2, ex2.params().dwell_s);
+        min_d = std::min(min_d, (r2 - Eigen::Vector2f(8.5f, 4.5f)).norm());
+    }
+    const float b = ex2.questions().front().b;
+    const bool looked = min_d < 3.f and min_d >= ex2.params().open_plant_keepout_m - 0.3f;
+    const bool answered = b < 0.2f, done = legs2 < 50;
+    ok = ok and looked and answered and done;
+    log += std::format("open plant: closest approach {:.2f} m, b {:.3f} (prior {:.2f}), legs {}, complete {}\n",
+                       min_d, b, ex2.params().part_prior, legs2, done);
     log += std::format("legs={} remaining={:.1f}% finished={} west={} east={}\n", legs,
                        100.f * ex.remaining_fraction(), finished, saw_west, saw_east);
     if (report) *report = log;

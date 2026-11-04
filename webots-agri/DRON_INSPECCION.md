@@ -13,13 +13,15 @@ El mundo nuevo conserva el terreno y los árboles de `dos_fields.wbt`. Usa una v
 ## Hardware añadido
 
 - `InspectionDrone.proto`: derivado del Mavic2Pro oficial de Cyberbotics R2025a, con hélices físicas, GPS, IMU, giróscopo y brújula.
+- Campo `scale` (por defecto 0.5, tamaño tipo DJI Mini; 1 = Mavic 2 Pro): escala geometría, articulaciones y colisiones; masas de cuerpo y hélices y empuje ×s³, par de hélice ×s⁴. La dinámica de vuelo no está ajustada.
 - Se han sustituido las articulaciones de yaw y roll de cámara por uniones rígidas. Solo queda `camera pitch` y su encoder `camera pitch sensor`.
 - Cámara RGB de 1280 × 720, FOV horizontal de 60 grados. Pitch 0: frontal (+X local del dron). Pitch pi/2: inferior (-Z local). La orientación global también depende de la actitud del dron.
 - Servo limitado a [0, pi/2], velocidad máxima 1 rad/s y par máximo 0.5 N·m. Son parámetros de simulación, no especificaciones verificadas de un servo comercial.
 - GPS con desviación configurada de 0.05 m y correlación 0.9. En este mundo sus coordenadas son WGS84, como indica `WorldInfo`.
 - Emisor `inspection telemetry`, canal 42, y receptor `inspection command`, canal 43, disponibles para una integración futura. No hay un protocolo de imágenes o conexión RoboComp implementado.
-- Plataforma solidaria al Husky de 0.70 × 0.70 m, centrada en (0, 0.35, 0.65) en su marco, con soporte, geometría de colisión y masa añadida de 0.8 kg. El centro de su cara superior queda a z=0.6625 m respecto al origen del Husky.
-- Marcador ArUco `DICT_4X4_50`, ID 23. Lado exterior negro: **0.24 m**; textura con margen blanco: 0.32 m. Centro respecto al Husky: (0, 0.51, 0.663). Usar el lado negro, no el tamaño de la textura, para estimar pose.
+- Plataforma solidaria al Husky de 0.40 × 0.40 m, apoyada sobre la placa superior y centrada en (0, 0.15, 0.383) en su marco; cara superior a z=0.395 m. `InspectionDeck.proto` es paramétrico (`size`, `markerSize`, `markerOffset`, `postHeight`); la versión anterior era 0.70 m sobre un soporte de 0.28 m (cara superior a 0.6625 m).
+- Motivo (2026-11-04): la plataforma alta y el Mavic tapaban al LiDAR el suelo de delante entre 0.5 y 6 m. Medido en Webots (Helios, canales −55..+15°): impactos en plataforma+dron 2989 → 641 por barrido; rayos bajos del sector frontal ±30° que llegan más allá de 1 m: 25 % → 67 %, igual que el Husky sin plataforma. Los impactos que quedan están en los laterales, pegados al robot.
+- Marcador ArUco `DICT_4X4_50`, ID 23. Lado exterior negro: **0.17 m**; textura con margen blanco: 0.227 m. Centro respecto al Husky: (0, 0.23, 0.396). Usar el lado negro, no el tamaño de la textura, para estimar pose.
 - El dron empieza físicamente apoyado sobre la plataforma, orientado hacia el frente del Husky. No está soldado al robot: esta versión está pensada para la prueba con Husky detenido. No incluye anclaje de transporte para conducir con el dron encima.
 
 ## Prueba manual de cámara

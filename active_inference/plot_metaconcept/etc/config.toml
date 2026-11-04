@@ -30,7 +30,7 @@ MessageSizeMax = "20004800"
 
 [Presence]
 required_agent_names = ["row_metaconcept"]
-optional_agent_names = ["openfield_concept", "field_metaconcept"]
+optional_agent_names = ["openfield_concept"]
 config_dir = "etc"
 monitor_period_ms = 500
 heartbeat_timeout_ms = 15000

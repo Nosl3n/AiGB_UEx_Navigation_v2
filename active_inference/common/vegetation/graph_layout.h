@@ -12,7 +12,7 @@
 //
 // plant_concept places a new plant in the unassigned zone; row_metaconcept places the rows and moves a plant under
 // its row when it joins one (back to the unassigned zone when it leaves every row); plot_metaconcept places each
-// plot over its rows, field_metaconcept the field over its plots.
+// plot over its rows; the field (the frame node itself, openfield_concept) sits above its plots.
 
 #include <utility>
 

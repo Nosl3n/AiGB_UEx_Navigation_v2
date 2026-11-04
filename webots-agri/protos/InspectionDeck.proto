@@ -1,36 +1,57 @@
 #VRML_SIM R2025a utf8
-# Deck fixed to the carrier; marker black square = 0.24 m, texture including margin = 0.32 m.
-PROTO InspectionDeck [ field SFVec3f translation 0 0 0 ] {
+# Landing deck fixed to the carrier. `translation` is the CENTRE of the deck plate (thickness 0.025 m).
+# The ArUco texture (inspection_aruco_23.png) is the black marker plus a white margin: black side = 0.75 x texture side.
+# 2026-11-04: parametric. Default = the small deck that sits on the Husky top plate (0.40 m, black marker 0.17 m),
+# chosen so the deck and the half-size drone stay inside the LiDAR's lower blind cone as much as possible.
+# The original deck was size 0.70, markerSize 0.24, postHeight 0.28.
+PROTO InspectionDeck [
+  field SFVec3f translation   0 0 0
+  field SFFloat size          0.40    # m, square plate side
+  field SFFloat markerSize    0.17    # m, side of the BLACK ArUco square (use this for pose estimation)
+  field SFFloat markerOffset  0.08    # m, marker centre ahead of the plate centre (+Y of the carrier)
+  field SFFloat postHeight    0       # m, support column under the plate (0 = plate rests on the carrier)
+]
+{
+%<
+  const a = fields.size.value;
+  const tex = fields.markerSize.value / 0.75;
+  const off = Math.min(fields.markerOffset.value, a / 2 - tex / 2);
+  const ph = fields.postHeight.value;
+>%
 Solid {
   translation IS translation
   name "inspection landing deck"
   children [
     Shape {
       appearance PBRAppearance { baseColor 0.85 0.85 0.85 roughness 1 metalness 0 }
-      geometry Box { size 0.70 0.70 0.025 }
+      geometry Box { size %<= a >% %<= a >% 0.025 }
     }
     Pose {
-      translation 0 0.16 0.013
+      translation 0 %<= off >% 0.013
       children [ Shape {
         appearance PBRAppearance {
           baseColorMap ImageTexture { url [ "textures/inspection_aruco_23.png" ] filtering 0 }
           roughness 1 metalness 0
         }
-        geometry Plane { size 0.32 0.32 }
+        geometry Plane { size %<= tex >% %<= tex >% }
       } ]
     }
+    %< if (ph > 0) { >%
     Pose {
-      translation 0 0 -0.14
+      translation 0 0 %<= -(0.0125 + ph / 2) >%
       children [ Shape {
         appearance PBRAppearance { baseColor 0.2 0.2 0.2 roughness 1 metalness 0 }
-        geometry Box { size 0.10 0.10 0.28 }
+        geometry Box { size 0.10 0.10 %<= ph >% }
       } ]
     }
+    %< } >%
   ]
-  physics Physics { density -1 mass 0.8 }
+  physics Physics { density -1 mass %<= 0.8 * (a * a) / (0.70 * 0.70) + 0.1 >% }
   boundingObject Group { children [
-    Box { size 0.70 0.70 0.025 }
-    Pose { translation 0 0 -0.14 children [ Box { size 0.10 0.10 0.28 } ] }
+    Box { size %<= a >% %<= a >% 0.025 }
+    %< if (ph > 0) { >%
+    Pose { translation 0 0 %<= -(0.0125 + ph / 2) >% children [ Box { size 0.10 0.10 %<= ph >% } ] }
+    %< } >%
   ] }
 }
 }

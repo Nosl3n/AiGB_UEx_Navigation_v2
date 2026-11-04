@@ -52,6 +52,30 @@ struct ExplorerParams
     float plant_clearance = 0.6f;      // m around a plant keep-out disc
     float failed_suppress_s = 60.0f;   // decay time of the suppression of an unreachable standpoint
     float failed_radius_m = 1.5f;      // ... and its reach: the neighbouring cells fail for the same reason
+    // ── WHAT IS INSIDE: plants whose concept is incomplete ──────────────────────────────────────────────────────
+    // A canopy without a trunk (or a trunk without a canopy) is an open question about a plant. Its belief
+    // b = P(the missing part exists and has not been seen yet) starts at the prior below and falls with every look
+    // that should have seen the part (Bayes with negative evidence); each look is worth the entropy it removes. Once
+    // looking again keeps not finding it, b is low, the question is answered ("the plant really is like that") and
+    // the plant stops attracting the robot: it stays as it is in the semantic map, reviewed.
+    // A plant seen with only one part means something is wrong — the part may be hidden, or really absent: maximal
+    // doubt, 0.5. (A confident prior would make the question nearly worthless, which is the opposite of the intent.)
+    float part_prior = 0.5f;
+    float part_range_m = 2.5f;         // e-folding range of p_det for a missing PART (a closer look than coverage)
+    // PREFERENCE (the C of active inference): knowing what the field CONTAINS matters more than covering ground.
+    // One open plant question (≤ ln 2 nats) is worth this many times its information: at 10 it justifies ~35 m of
+    // travel at the controller's 0.2 nats/m — any plant in a field like dos_fields.
+    float concept_weight = 10.0f;
+    // An incomplete plant may hide its trunk exactly where nothing has been seen: never stand closer than this to it.
+    float open_plant_keepout_m = 1.0f;
+};
+
+// A plant whose concept is incomplete: the part that has not been seen (world frame).
+struct OpenPlant
+{
+    std::string name;
+    Eigen::Vector2f c{0.f, 0.f};
+    bool missing_trunk = true;         // false = the canopy is missing
 };
 
 // An oriented rectangle (a row's footprint) and a disc (a plant's keep-out) in the world frame.
@@ -85,6 +109,9 @@ public:
     // (Re)build the grid over the polygon. Resets the belief only if the polygon changed.
     void set_polygon(const std::vector<Eigen::Vector2f> &polygon);
     void set_obstacles(std::vector<RowRect> rows, std::vector<Disc> plants);
+    // The plants whose concept is incomplete right now. A plant that is no longer listed has been completed (its
+    // part was found) and its question is closed; a new one starts at the prior. Keeps each plant's belief.
+    void set_open_plants(const std::vector<OpenPlant> &open);
 
     // The robot looked for dt seconds from `pos`: decay the unknown belief of every cell it can see.
     void observe(const Eigen::Vector2f &pos, float dt);
@@ -105,6 +132,10 @@ public:
     // For the viewers: cell centres and their unknown belief u_c.
     [[nodiscard]] std::vector<std::pair<Eigen::Vector2f, float>> cells() const;
     [[nodiscard]] float cell_m() const { return p_.cell_m; }
+    // For logs and viewers: each incomplete plant and b = P(its missing part exists, unseen).
+    struct PlantQuestion { OpenPlant plant; float b = 0.f; float looked_s = 0.f; };
+    [[nodiscard]] const std::vector<PlantQuestion> &questions() const { return questions_; }
+    [[nodiscard]] float concept_entropy() const;    // Σ H_bin(b) over the open plants (nats)
 
     static bool self_test(std::string *report = nullptr);
 
@@ -119,9 +150,11 @@ private:
     float h0_ = 0.f, h_init_ = 0.f;
     struct Failed { Eigen::Vector2f pos; double t; };
     std::vector<Failed> failed_;
+    std::vector<PlantQuestion> questions_;
 
     [[nodiscard]] Eigen::Vector2f centre(int ix, int iy) const;
     [[nodiscard]] float p_det(const Eigen::Vector2f &from, const Eigen::Vector2f &to) const;
+    [[nodiscard]] float part_det(const Eigen::Vector2f &from, const Eigen::Vector2f &to) const;
     [[nodiscard]] bool standpoint_ok(const Eigen::Vector2f &v) const;
     [[nodiscard]] float facing(const Eigen::Vector2f &v) const;
     template <typename F> void for_cells_near(const Eigen::Vector2f &v, F &&f) const;

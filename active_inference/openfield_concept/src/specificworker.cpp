@@ -167,6 +167,10 @@ void SpecificWorker::load_config()
 		optf("Exploration.PlantClearanceM", ep.plant_clearance);
 		optf("Exploration.FailedSuppressS", ep.failed_suppress_s);
 		optf("Exploration.FailedRadiusM", ep.failed_radius_m);
+		optf("Exploration.PartPrior", ep.part_prior);
+		optf("Exploration.PartRangeM", ep.part_range_m);
+		optf("Exploration.ConceptWeight", ep.concept_weight);
+		optf("Exploration.OpenPlantKeepoutM", ep.open_plant_keepout_m);
 		std::println("[openfield] inspection mode {}: cells {} m, sensor range {} m, canopy transmittance {}, travel cost "
 		             "{} nats/m", x.enabled ? "ON" : "OFF", ep.cell_m, ep.sensor_range_m, ep.canopy_transmittance,
 		             ep.travel_cost);
@@ -292,10 +296,12 @@ void SpecificWorker::compute()
 		if (not field_polygon_.empty() and scene_graph_->ensure_world(field_polygon_, cfg_.world_height))
 		{
 			publish_pose();
+			if ((compute_ticks_ % 50) == 0)        // ~1 Hz: the field's plots as its members
+				scene_graph_->group_plots();
 			const auto &x = ekf_.state();
 			exploration_->tick(QDateTime::currentMSecsSinceEpoch(), field_polygon_,
 			                   Eigen::Vector2f(static_cast<float>(x(0)), static_cast<float>(x(1))),
-			                   scene_graph_->world_id(), rc::world::frame_name(*G, "world"));
+			                   scene_graph_->world_id(), rc::world::frame_name(*G, "field"));
 		}
 	}
 	log_status();
@@ -781,7 +787,7 @@ void SpecificWorker::push_viewer()
 // The 3D semantic map: rebuilt from the graph (plants, rows, plots, field) and the filter's own pose.
 void SpecificWorker::push_world3d()
 {
-	const auto frame = rc::world::frame_name(*G, "world");
+	const auto frame = rc::world::frame_name(*G, "field");
 	world3d_->set_scene(rc::openfield::build_world3d(*G, *world3d_eigen_, frame, ekf_.state(), ekf_.initialized(),
 	                                                 field_polygon_, exploration_.get()));
 }

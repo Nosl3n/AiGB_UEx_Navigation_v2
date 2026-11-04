@@ -93,7 +93,11 @@ Robot {
   synchronization IS synchronization
   supervisor IS supervisor
   children [
-    InspectionDeck { translation 0 0.35 0.65 }
+    # Landing deck (2026-11-04): 0.40 m plate lying on the top plate, centred 0.15 m ahead of the wheel centre.
+    # With the half-size drone on it, deck + drone sit almost entirely inside the helios' lower blind cone
+    # (beams steeper than -55 deg): in the centre plane the ground they hide is only y = 0.42..0.78 m, under
+    # the nose. The old raised deck (0.70 m at z 0.65) hid 0.5..6 m of ground straight ahead.
+    InspectionDeck { translation 0 0.15 %<= 2 * R + 0.04 + 0.0125 >% }
     # ---------------------------------------------------------------- body (visual only)
     DEF CHASSIS Pose {
       translation 0 0 %<= R + 0.06 >%

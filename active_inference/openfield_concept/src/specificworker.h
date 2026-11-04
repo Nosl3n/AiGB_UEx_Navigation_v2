@@ -20,7 +20,8 @@
 // openfield_concept — robot localization in an OPEN FIELD; the room_concept replacement for
 // agricultural worlds. GPS (bridge, Ice) + IMU (media plane) + wheel odometry (robot node) are fused
 // by an SE(2) EKF (openfield_ekf.h), and the result is published with room_concept's exact DSR
-// contract, with a "world" node (not "room"; it was "field" until 2026-11-03) carrying the field polygon and the robot->world RT edge.
+// contract, with a "field" node (not "room") carrying the field polygon, the robot->field RT edge, the field's plots
+// (group_member) and the inspection state. The robot exists by itself and then locates itself in the field.
 
 #ifndef SPECIFICWORKER_H
 #define SPECIFICWORKER_H

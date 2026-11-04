@@ -5,6 +5,7 @@
 #include "../../common/vegetation/plant_discs.h"
 
 #include <chrono>
+#include <set>
 #include <cmath>
 #include <print>
 
@@ -64,9 +65,11 @@ void OpenFieldExploration::tick(std::int64_t now_ms, const std::vector<Eigen::Ve
     if (now_ms - last_log_ms_ >= 5000)
     {
         last_log_ms_ = now_ms;
-        std::println("[explore] {} · field entropy left {:.1f}% ({:.0f} of {:.0f} nats) · legs done {} failed {}{}",
+        std::println("[explore] {} · field entropy left {:.1f}% ({:.0f} of {:.0f} nats) · open plant questions {} "
+                     "({:.2f} nats) · legs done {} failed {}{}",
                      mode_name(mode_), 100.f * explorer_.remaining_fraction(), explorer_.entropy(),
-                     explorer_.initial_entropy(), legs_done_, legs_failed_,
+                     explorer_.initial_entropy(), explorer_.questions().size(), explorer_.concept_entropy(),
+                     legs_done_, legs_failed_,
                      target_ ? std::format(" · target ({:.2f},{:.2f}) gain {:.1f} nats", target_->pos.x(),
                                            target_->pos.y(), target_->gain)
                              : std::string());
@@ -91,9 +94,31 @@ void OpenFieldExploration::refresh_obstacles(const std::string &world_frame)
                                static_cast<float>(std::atan2(m(1, 0), m(0, 0))), len, wid});
     }
     std::vector<Disc> plants;
-    for (const auto &d : rc::veg::read_plant_discs(*G_, *inner_eigen_, world_frame, rc::veg::PlantPart::Trunk))
-        plants.push_back(Disc{d.c, d.r});
+    std::vector<OpenPlant> open;
+    for (const auto &v : rc::veg::read_plants(*G_, *inner_eigen_, world_frame))
+    {
+        if (v.has_trunk and v.keepout_r > 0.f)
+            plants.push_back(Disc{v.origin, v.keepout_r});
+        // An incomplete concept is an open question: a canopy without a trunk, or a trunk without a canopy.
+        if (v.has_canopy and not v.has_trunk)
+            open.push_back(OpenPlant{v.name, v.origin, true});
+        else if (v.has_trunk and not v.has_canopy)
+            open.push_back(OpenPlant{v.name, v.origin, false});
+    }
     explorer_.set_obstacles(std::move(rows), std::move(plants));
+    // Report questions that opened, and those that closed because the missing part was FOUND (the plant is no longer
+    // listed as incomplete) — the answer the exploration went looking for.
+    std::set<std::string> now;
+    for (const auto &o : open) now.insert(o.name);
+    for (const auto &o : open)
+        if (not open_names_.contains(o.name))
+            std::println("[explore] open question: {} has a {} but no {} — will look again", o.name,
+                         o.missing_trunk ? "canopy" : "trunk", o.missing_trunk ? "trunk" : "canopy");
+    for (const auto &n : open_names_)
+        if (not now.contains(n))
+            std::println("[explore] question closed: {} is complete now (its missing part was found)", n);
+    open_names_ = std::move(now);
+    explorer_.set_open_plants(open);
 }
 
 // The consumer's side of the protocol: did it finish, is it still on it, did it ever take it?
@@ -185,9 +210,16 @@ void OpenFieldExploration::select_and_offer(std::int64_t now_ms, const Eigen::Ve
     if (not best)
     {
         if (mode_ != Mode::Complete)
+        {
             std::println("[explore] INSPECTION COMPLETE — no standpoint left is worth its travel; field entropy "
                          "left {:.1f}% · legs done {} failed {}",
                          100.f * explorer_.remaining_fraction(), legs_done_, legs_failed_);
+            // The plants that stay incomplete after being looked at again: reviewed, kept as they are in the map.
+            for (const auto &q : explorer_.questions())
+                std::println("[explore]   reviewed: {} still has no {} — P(it is there, unseen) = {:.3f} after {:.1f} "
+                             "looks; kept as it is in the semantic map", q.plant.name,
+                             q.plant.missing_trunk ? "trunk" : "canopy", q.b, q.looked_s);
+        }
         mode_ = Mode::Complete;
         publish_world_state(world_id);
         return;

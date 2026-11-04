@@ -90,7 +90,6 @@ for bin in webots-bridge/bin/Webots2Robocomp \
            active_inference/plant_concept/bin/plant_concept \
            active_inference/row_metaconcept/bin/row_metaconcept \
            active_inference/plot_metaconcept/bin/plot_metaconcept \
-           active_inference/field_metaconcept/bin/field_metaconcept \
            active_inference/retina/bin/retina \
            active_inference/human_concept/bin/human_concept; do
     [[ -x "$REPO/$bin" ]] || missing+=("$bin")

@@ -20,7 +20,7 @@ AGENT_ID = 98
 
 
 def find_world(g):
-    for t in ("world", "room"):
+    for t in ("field", "room"):
         nodes = g.get_nodes_by_type(t)
         if nodes:
             return nodes[0]

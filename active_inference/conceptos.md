@@ -17,47 +17,56 @@ concepto (por ejemplo, frutos en la planta), se documenta aquí *antes* de publi
 ## Jerarquía
 
 ```
-world                               openfield_concept    marco de referencia exterior (x este, y norte, origen GPS)
- └─ field_<id>       metaconcept    field_metaconcept    campo: el conjunto de parcelas
-     └─ plot_<id>    metaconcept    plot_metaconcept     parcela: hileras plantadas juntas
-         └─ row_<id> metaconcept    row_metaconcept      hilera: conjunto de plantas
-             └─ plant_<id>  plant   plant_concept        planta: un individuo (tronco, dosel, … como atributos)
+robot                               robot_concept        el robot existe por sí mismo …
+field                field          openfield_concept    … y se ubica en un campo: el marco Y el concepto del lugar
+ └─ plot_<id>        metaconcept    plot_metaconcept     parcela: hileras plantadas juntas
+     └─ row_<id>     metaconcept    row_metaconcept      hilera: conjunto de plantas
+         └─ plant_<id>  plant       plant_concept        planta: un individuo (tronco, dosel, … como atributos)
 ```
 
-> **2026-11-03:** el marco de referencia se llamaba `field`; ahora es `world` (tipo y nombre). `field` es el
-> metaconcepto del conjunto de parcelas. `common/world_frame/world_frame.h` resuelve el marco (`world` o `room`).
+> **2026-11-04:** desaparece el nodo `world`. El **`field` es a la vez el marco de referencia del robot y el concepto
+> del lugar** ("creo que estoy en un campo"); lleva su polígono y, en el futuro, su georreferencia GPS para situarse
+> en un mapa mayor. `field_metaconcept` (que creaba un `field_0` aparte) queda obsoleto: `openfield_concept` agrupa
+> las parcelas en el `field`. `common/world_frame/world_frame.h` resuelve el marco (`field` o `room`).
 
 | Relación | Arista | Quién la escribe |
 |---|---|---|
-| dónde está cada cosa | `world —RT→ field_<id> / plot_<id> / row_<id> / plant_<id>` | el dueño de cada nodo |
-| parcelas del campo | `field_<id> —group_member→ plot_<id>` | field_metaconcept |
+| dónde está el robot | `robot —RT→ field` (guarda T_robot←field, como room_concept) | openfield_concept |
+| dónde está cada cosa | `field —RT→ plot_<id> / row_<id> / plant_<id>` | el dueño de cada nodo |
+| parcelas del campo | `field —group_member→ plot_<id>` | openfield_concept |
 | hileras de una parcela | `plot_<id> —group_member→ row_<id>` | plot_metaconcept |
 | plantas de una hilera | `row_<id> —group_member→ plant_<id>` | row_metaconcept |
 
-Las posiciones cuelgan siempre de `world` (nada cuelga de su grupo): la pertenencia es la arista `group_member`,
+Las posiciones cuelgan siempre de `field` (nada cuelga de su grupo): la pertenencia es la arista `group_member`,
 no la cadena de transformaciones.
 
 ---
 
-## `world` — el marco y el modo de inspección (openfield_concept)
+## `field` — el campo: marco, concepto del lugar y modo de inspección (openfield_concept)
 
-- **Nodo**: tipo `world`, nombre `world`. **Dueño**: `openfield_concept` (id de agente 25). Marco exterior (x este,
-  y norte, origen GPS), con el polígono del campo (`delimiting_polygon_x/y`) y la pose del robot (RT `robot → world`).
+- **Nodo**: tipo `field`, nombre `field`. **Dueño**: `openfield_concept` (id de agente 25). Es el marco del robot en el
+  exterior (x este, y norte, origen GPS) y el concepto del lugar: lleva el polígono del campo (`delimiting_polygon_x/y`,
+  una entrada: la zona que da el agricultor), la pose del robot (RT `robot → field`) y sus parcelas (`group_member`).
 - **Modo de inspección** (`openfield_concept/src/field_explorer.h`, `openfield_exploration.h`): la versión de campo
   abierto de la exploración de room_concept. El campo es una rejilla cuyas celdas están **sin ver** hasta que el robot
   las mira; el punto que más reduce esa entropía (menos el coste de llegar, en nats) se ofrece al controller como
   el affordance **`afford_openfield`**. Estados: `Waiting → Inspecting → Complete`.
+- **Qué hay dentro antes que cubrir terreno**: una planta con solo una parte (dosel sin tronco o tronco sin dosel)
+  es una pregunta abierta. P(la parte falta pero existe sin verse) empieza en 0,5 (algo anda mal) y baja con cada
+  mirada que debería haberla visto; el robot vuelve a mirarla mientras la duda es alta, y cuando la duda se resuelve
+  la planta queda tal cual en el mapa semántico, revisada. Esa información pesa más que la cobertura
+  (`Exploration.ConceptWeight`).
 - **Fin de la inspección**: cuando ningún punto del campo compensa su recorrido (signo de la energía libre esperada,
-  no un umbral). Entonces `field_metaconcept` cierra `field_0` (`Field.CloseOn = "inspection"`).
+  no un umbral): ni cobertura ni preguntas sobre plantas que valga la pena ir a resolver.
 
-| Atributo en `world` | Tipo | Significado |
+| Atributo en `field` | Tipo | Significado |
 |---|---|---|
 | `model_stable` | bool | la inspección está completa |
 | `model_uncertainty` | float [0, 1] | fracción de la entropía del campo que queda por ver |
 
 ### `afford_openfield` (affordance de exploración)
 
-- **Nodo**: tipo `affordance`, nombre `afford_openfield`, hijo de `world` (atributo `parent` y arista de affordance).
+- **Nodo**: tipo `affordance`, nombre `afford_openfield`, hijo de `field` (atributo `parent` y arista de affordance).
   **Dueño**: `openfield_concept`. Sustituye a `afford_room` de room_concept.
 - **Contrato** (`common/affordance_protocol`): política `Reach`; `epistemic_target_x_m/_y_m/_yaw_rad` = el punto y
   hacia dónde mirar (lo que queda sin ver); `epistemic_gain` = la ganancia **marginal** en nats (lo que aporta ir allí
@@ -73,7 +82,7 @@ no la cadena de transformaciones.
 
 - **Nodo**: tipo `plant`, nombre `plant_<id>`. Un nodo por planta.
 - **Dueño**: `plant_concept` (id de agente 29). Ningún otro agente escribe en él.
-- **Origen (RT `world → plant`)**: donde está la planta. Es el **eje del tronco** si el tronco se ha visto; si no,
+- **Origen (RT `field → plant`)**: donde está la planta. Es el **eje del tronco** si el tronco se ha visto; si no,
   el **centro del dosel**. La arista lleva `rt_covariance` (varianza de la posición en x, y).
 - **Planta incompleta**: una planta puede tener solo tronco (dosel aún no visto) o solo dosel (tronco tapado por el
   follaje). Cuando aparece la parte que falta, **se completa la misma planta** y conserva su `id`.
@@ -142,7 +151,7 @@ Se añadirán como atributos `plant_*` del mismo nodo, nunca como nodos nuevos:
 
 - **Nodo**: tipo `metaconcept`, nombre `row_<id>`. Un nodo por hilera.
 - **Dueño**: `row_metaconcept` (id de agente 28).
-- **Origen (RT `world → row`)**: centro del rectángulo de la hilera, con su rumbo como giro (yaw).
+- **Origen (RT `field → row`)**: centro del rectángulo de la hilera, con su rumbo como giro (yaw).
 - **Cómo se infiere**: no se ve; sale de dónde están los **troncos** de las plantas (`common/vegetation/rows.h`):
   troncos cercanos sobre una línea forman una hilera (mínimo 3), un rectángulo que crece al unirse más troncos.
 - **Miembros** (`group_member`): las plantas cuyos troncos forman la hilera, y las plantas con solo dosel (tronco
@@ -177,25 +186,12 @@ Se añadirán como atributos `plant_*` del mismo nodo, nunca como nodos nuevos:
 | `obj_id` | int | — | identificador estable de la parcela |
 | `width_m` | float | m | longitud del rectángulo **a lo largo** de las hileras |
 | `depth_m` | float | m | anchura del rectángulo **a través** de las hileras |
-| RT `world → plot` | — | m, rad | centro del rectángulo y rumbo de las hileras (yaw) |
+| RT `field → plot` | — | m, rad | centro del rectángulo y rumbo de las hileras (yaw) |
 
-## `field` — el campo (metaconcepto)
+## (obsoleto) `field_0` — el campo como metaconcepto aparte
 
-- **Nodo**: tipo `metaconcept`, nombre `field_0`. **Dueño**: `field_metaconcept` (id de agente 31).
-- **Qué es**: el conjunto de todas las parcelas. **No es el marco de referencia** (ese es `world`).
-- **Cuándo nace**: cuando la **inspección de `openfield_concept` termina** (`model_stable` en el nodo `world`):
-  ya no queda ningún sitio del campo que compense ir a mirar, así que no quedan parcelas por encontrar. Después
-  sigue a las parcelas: si aparece una nueva, se une al campo. La regla anterior (parcelas sin cambios durante
-  `Field.StableForMs`) sigue disponible con `Field.CloseOn = "stable"`, pero cerraba el campo antes de tiempo con el
-  robot parado.
-- **Miembros**: `field_0 —group_member→ plot_<id>`.
-
-| Atributo | Tipo | Unidad | Significado |
-|---|---|---|---|
-| `obj_id` | int | — | 0 |
-| `width_m` | float | m | longitud del rectángulo que contiene todas las parcelas, a lo largo de las hileras |
-| `depth_m` | float | m | su anchura a través de las hileras |
-| RT `world → field` | — | m, rad | centro y rumbo de las hileras (yaw) |
+Hasta 2026-11-04 `field_metaconcept` publicaba un nodo `field_0` (tipo `metaconcept`) con el rectángulo que envolvía
+las parcelas. Ya no existe: el campo es el nodo `field` de arriba.
 
 ---
 
