@@ -40,6 +40,9 @@ Period.Compute = 8
 # cloud and image processing cost. Clamped up to Period.Compute if set lower.
 # Defaults to Period.Compute when absent.
 Period.Sensors = 50   # 20 Hz: the field world is far heavier to render than piso.wbt
+# The LIDARS' own rate (upstream 2773ae5). A real Helios scans at 20 Hz; snapped at startup to a
+# multiple of Period.Compute (8 ms step -> 48 ms = 20.8 Hz). Absent, the lidars follow Period.Sensors.
+Period.Lidar = 50
 
 # Running gear of the robot in the LOADED world -- these must agree or the bridge opens motors that
 # do not exist.
@@ -173,6 +176,17 @@ Component.Debug.Verbose = true
 # behind whatever lidar or camera call is being marshalled at that instant.
 omnirobot.ThreadPool.Size = "2"
 omnirobot.ThreadPool.SizeMax = "4"
+# Per-adapter pools for the LONG-POLLING sensor interfaces (upstream 2773ae5): the sensor servants
+# now wait for the NEXT frame, so each blocked driver holds a dispatch thread for up to one source
+# period. Out of the shared pool they would starve the interfaces that do not block.
+lidar3d.ThreadPool.Size = "3"
+lidar3d.ThreadPool.SizeMax = "6"
+camera360rgb.ThreadPool.Size = "2"
+camera360rgb.ThreadPool.SizeMax = "4"
+camerargbdsimple.ThreadPool.Size = "2"
+camerargbdsimple.ThreadPool.SizeMax = "4"
+imu.ThreadPool.Size = "2"
+imu.ThreadPool.SizeMax = "4"
 
 # Shared pool for the remaining adapters: still enough that a large Lidar3D or
 # Camera360 payload does not serialise the small IMU/VisualElements calls.

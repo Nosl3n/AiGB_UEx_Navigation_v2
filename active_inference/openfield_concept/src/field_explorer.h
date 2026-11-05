@@ -124,6 +124,15 @@ public:
     // The consumer could not get there: suppress that standpoint for a while (decaying, not a ban).
     void mark_failed(const Eigen::Vector2f &pos, double now_s);
 
+    // ── A STANDPOINT CAN BECOME INVALID AFTER IT WAS OFFERED ───────────────────────────────────────────────
+    // It was chosen against what the robot knew THEN; while it drives there it keeps seeing rows and plants, and the
+    // chosen spot may turn out to be on a row or next to a trunk. Why `v` is not a valid standpoint now ("" = it is).
+    [[nodiscard]] std::string standpoint_conflict(const Eigen::Vector2f &v) const;
+    // The nearest valid standpoint to `v` (cell centres within `max_r`; ties -> nearer the robot), with the facing and
+    // marginal gain select() would give it. nullopt = no free spot near enough to count as the same standpoint.
+    [[nodiscard]] std::optional<ExplorerTarget> nearest_valid(const Eigen::Vector2f &v, const Eigen::Vector2f &robot,
+                                                              float max_r) const;
+
     [[nodiscard]] bool ready() const { return nx_ > 0 and ny_ > 0; }
     [[nodiscard]] float entropy() const;           // Σ H_c (nats)
     [[nodiscard]] float initial_entropy() const { return h_init_; }

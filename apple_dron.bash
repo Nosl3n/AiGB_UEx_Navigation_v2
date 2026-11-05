@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Inspection drone: flown with the Xbox controller (A = drone, B = robot); camera -> DDS rc/drone/rgb (webots-drone-bridge).
+# Inspection drone: flown by ArduCopter SITL (~/robocomp/ardupilot) with the Xbox controller (A = drone, B = robot;
+# left stick up = take off, held down near the ground = land); camera -> DDS rc/drone/rgb (webots-drone-bridge).
+# This world steps physics at 2 ms (the others at 8) because the autopilot runs in lockstep with it.
 # apple_dron.bash — launch the whole Husky A300 stack in the TWO-FIELD orchard (webots-agri/worlds/dos_fields_dron.wbt).
 #
 #   ./apple_dron.bash            Webots + sensorimotor layer + cognitive layer, each launcher in its own terminal
@@ -51,13 +53,13 @@ if (( STOP )); then
     if pid=$(pgrep -f "^python3 cognitive.py" | head -1); then
         say "stopping the cognitive layer (SIGINT to cognitive.py $pid)"
         run kill -INT "$pid"
-        (( DRY )) || wait_gone "bin/(robot_concept|openfield_concept|residual_concept|controller|retina|human_concept|plant_concept|row_metaconcept|plot_metaconcept|field_metaconcept) " 40 \
+        (( DRY )) || wait_gone "bin/(robot_concept|openfield_concept|residual_concept|controller|retina|human_concept|plant_concept|row_metaconcept|plot_metaconcept) " 40 \
             || say "some agents are still running after 40 s"
     fi
     if pid=$(pgrep -f "^python3 subcognitive.py" | head -1); then
         say "stopping the sensorimotor layer (SIGINT to subcognitive.py $pid)"
         run kill -INT "$pid"
-        (( DRY )) || wait_gone "bin/(Webots2Robocomp|drone_bridge|lidar3d_dds|imu_dds|zed_camera) " 40 \
+        (( DRY )) || wait_gone "bin/(Webots2Robocomp|drone_bridge|lidar3d_dds|imu_dds|zed_camera|arducopter) " 40 \
             || say "some drivers are still running after 40 s"
     fi
     if pid=$(pgrep -x webots-bin | head -1); then
@@ -96,6 +98,11 @@ for bin in webots-bridge/bin/Webots2Robocomp \
            active_inference/human_concept/bin/human_concept; do
     [[ -x "$REPO/$bin" ]] || missing+=("$bin")
 done
+ARDUCOPTER="${ARDUPILOT_HOME:-$HOME/robocomp/ardupilot}/build/sitl/bin/arducopter"
+if [[ ! -x "$ARDUCOPTER" ]]; then
+    say "ArduCopter SITL not built: $ARDUCOPTER (see webots-drone-bridge/README.md)"
+    exit 1
+fi
 if (( ${#missing[@]} )); then
     say "not built yet (cmake -B build && make -C build -j8 in each component):"
     printf '         %s\n' "${missing[@]}"
@@ -136,7 +143,7 @@ else
     sleep 8   # the world loads its PROTOs (the first time it also downloads Webots' own ones)
 fi
 
-say "2/3 sensorimotor layer (bridge, helios, IMU, ZED, joystick) — terminal 'Husky · sensorimotor'"
+say "2/3 sensorimotor layer (bridge, helios, IMU, ZED, joystick, drone + ArduCopter SITL) — terminal 'Husky · sensorimotor'"
 open_terminal "Husky · sensorimotor" "cd '$UTILS' && WEBOTS_WORLD='$WORLD' python3 subcognitive.py sub_husky.toml"
 (( DRY )) || sleep "$SUB_WAIT_S"
 

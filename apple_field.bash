@@ -50,7 +50,7 @@ if (( STOP )); then
     if pid=$(pgrep -f "^python3 cognitive.py" | head -1); then
         say "stopping the cognitive layer (SIGINT to cognitive.py $pid)"
         run kill -INT "$pid"
-        (( DRY )) || wait_gone "bin/(robot_concept|openfield_concept|residual_concept|controller|retina|human_concept|plant_concept|row_metaconcept|plot_metaconcept|field_metaconcept) " 40 \
+        (( DRY )) || wait_gone "bin/(robot_concept|openfield_concept|residual_concept|controller|retina|human_concept|plant_concept|row_metaconcept|plot_metaconcept) " 40 \
             || say "some agents are still running after 40 s"
     fi
     if pid=$(pgrep -f "^python3 subcognitive.py" | head -1); then

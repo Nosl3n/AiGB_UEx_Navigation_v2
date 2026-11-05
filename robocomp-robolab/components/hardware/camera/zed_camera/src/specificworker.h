@@ -39,6 +39,8 @@
 #include <omp.h>
 #include "CloudCompressor.h"
 #include <shared_mutex>
+#include <fstream>
+#include <chrono>
 
 //#include <FPS1    
 // Zero-copy DDS media-plane publisher (RGB + depth), gated by config. FastDDS
@@ -77,6 +79,15 @@ struct TimestampHandler {
     sl::Timestamp ts_imu = 0, ts_baro = 0, ts_mag = 0; // Initial values
 };
 #endif
+
+// Per-frame wall-clock breakdown of publish_and_store's sub-stages, for perf_trace.csv
+// (see SpecificWorker::write_trace). Diagnostic instrumentation for periodic FPS drops.
+// The *_ok fields are tri-state: -1 not attempted (feature disabled), 0 dropped, 1 published.
+struct StageTimings
+{
+    double ice_ms = 0, dds_ms = 0, color_cloud_ms = 0, store_ms = 0, display_ms = 0;
+    int ice_ok = -1, dds_rgb_ok = -1, dds_depth_ok = -1;
+};
 
 /**
  * \brief Class SpecificWorker implements the core functionality of the component.
@@ -129,7 +140,12 @@ class SpecificWorker : public GenericWorker
         bool compute_xyz = true;
         bool compute_color_cloud = false;
         bool publish_dds = false;            // gate the DDS media plane (Config.PublishDDS)
+        bool imu_calibration = false;        // gate IMU 5s calibration at init (Config.IMUCalibration)
+        bool trace_perf = false;             // gate perf_trace.csv diagnostic logging (Config.TimeDebug)
         int  camera_fps = 30;                // Config.FPS — caps the processing/publish rate
+#ifdef HAVE_ZED_SDK
+        sl::DEPTH_MODE depth_mode = sl::DEPTH_MODE::NEURAL_PLUS;  // Config.DepthMode
+#endif
         Eigen::Affine3f extrinsic;
 
 #ifdef HAVE_ZED_SDK
@@ -151,6 +167,11 @@ class SpecificWorker : public GenericWorker
         float wrapToPi(float angle_rad);
 #ifdef HAVE_ZED_SDK
         void transformPose(sl::Transform &pose, sl::Transform transform);
+        // ---- IMU calibration (static orientation from accelerometer) ----
+        void calibrate_imu_orientation();
+        Eigen::Quaternionf initial_orientation = Eigen::Quaternionf::Identity();
+        float init_roll = 0.f, init_pitch = 0.f, init_yaw = 0.f;
+        bool imu_calibrated = false;
 #endif
 
     public slots:
@@ -208,10 +229,21 @@ class SpecificWorker : public GenericWorker
         long build_simulated_rgbd(RoboCompCameraRGBDSimple::TRGBD &rgbd, RoboCompLidar3D::TColorCloudData &colorCloud);
         // Common tail: publish (Ice + DDS) from the local frame (no lock held during
         // serialization), store it into the shared buffers, then optionally display.
-        void publish_and_store(RoboCompCameraRGBDSimple::TRGBD &&rgbd, RoboCompLidar3D::TColorCloudData &colorCloud, long num_points);
+        void publish_and_store(RoboCompCameraRGBDSimple::TRGBD &&rgbd, RoboCompLidar3D::TColorCloudData &colorCloud, long num_points, StageTimings *timings = nullptr);
         void store_rgbd(RoboCompCameraRGBDSimple::TRGBD &&rgbd);
+        RoboCompCameraRGBDSimple::TRGBD take_recycled_rgbd();  // reclaim previous frame's buffers for reuse
         void store_color_cloud(RoboCompLidar3D::TColorCloudData &colorCloud, long num_points);
-        void publish_dds_frames(const RoboCompCameraRGBDSimple::TRGBD &rgbd);
+        // Diagnostic perf trace (perf_trace.csv): wall-clock breakdown per pipeline stage,
+        // to localize periodic FPS drops to a specific stage (grab/build/publish/display/pose).
+        std::ofstream trace_file;
+        int trace_frame_count = 0;
+        void write_trace(std::chrono::steady_clock::time_point t_start,
+                          std::chrono::steady_clock::time_point t_grab,
+                          std::chrono::steady_clock::time_point t_build,
+                          std::chrono::steady_clock::time_point t_publish,
+                          std::chrono::steady_clock::time_point t_pose,
+                          const StageTimings &st);
+        void publish_dds_frames(const RoboCompCameraRGBDSimple::TRGBD &rgbd, int &rgb_ok, int &depth_ok);
         void show_frames();
 
         // DDS media-plane publisher (null unless Config.PublishDDS is enabled).

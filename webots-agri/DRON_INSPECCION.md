@@ -8,31 +8,34 @@ Desde la raíz del repositorio:
 
 Abre `webots-agri/worlds/dos_fields_dron.wbt` (el huerto de dos campos con el Husky portador y el dron) y arranca las capas sensoriomotora y cognitiva. `--help`, `--dry-run` y `--stop` funcionan igual que en `apple_field.bash`. No lanzar dos mundos a la vez.
 
-## Qué hace (2026-11-04)
+## Qué hace (2026-11-05)
 
 | Pieza | Qué hace |
 |---|---|
-| `webots-drone-bridge/` (`drone_bridge`) | Controlador *extern* del dron. Publica la **cámara RGB en DDS** (`rc/drone/rgb`, dominio 7, `ImageFrame` RGB8, igual que la ZED), sirve el **descriptor** (`MediaPlaneDDS`, puerto 12110) y la **pose** (`FullPoseEstimation`, puerto 12111), y **vuela** el dron con el mando. |
+| `webots-drone-bridge/` (`drone_bridge`) | Controlador *extern* del dron. Publica la **cámara RGB en DDS** (`rc/drone/rgb`, dominio 7, `ImageFrame` RGB8, igual que la ZED), sirve el **descriptor** (`MediaPlaneDDS`, puerto 12110) y la **pose** (`FullPoseEstimation`, puerto 12111). Es la **física de ArduCopter SITL** y traduce el mando a órdenes **MAVLink** para él. |
+| ArduCopter SITL (`~/robocomp/ardupilot`, `scripts/run_sitl.sh`) | El autopiloto real de ArduPilot (4.7.2) ejecutándose en el PC: estima la posición (EKF3 con GPS, IMU, barómetro y brújula simulados) y vuela el dron. Lo arranca `sub_husky.toml` (componente `drone_sitl`) con la misma condición que el dron. |
 | `robot_concept` (`src/drone_link.*`) | Si `drone_bridge` responde, cuelga del cuerpo del robot `body ──RT──▶ dron ──RT──▶ camera`. El nodo `camera` lleva el `media_descriptor` (topic DDS) y los intrínsecos (`cam_rgb_width/height`, `cam_fov`, focales). Si deja de responder 3 s, borra los nodos. |
 | Mando Xbox (`python_xbox_controller`) | **A** = controlar el dron, **B** = volver al robot. El objetivo viaja en `TData.id` (`"drone"` / `"robot"`). |
 | Puente del Husky (`webots-bridge`) | Con el control en el dron, para el robot e ignora los sticks hasta pulsar B. |
-| Lanzadores | Exportan `WEBOTS_WORLD`; el componente `drone` de `sub_husky.toml` lleva `when = …` y **solo arranca si el mundo contiene un `InspectionDrone`**. Sin dron, todo corre solo con el robot, como antes. |
+| Lanzadores | Exportan `WEBOTS_WORLD`; los componentes `drone` y `drone_sitl` de `sub_husky.toml` llevan `when = …` y **solo arrancan si el mundo contiene un `InspectionDrone`**. Sin dron, todo corre solo con el robot, como antes. |
+| Mundo `dos_fields_dron.wbt` | Física a **2 ms** (los demás mundos siguen a 8) y el dron con `externalPropulsion TRUE`. Lo exige el autopiloto; ver `webots-drone-bridge/src/control_dron.md`. |
 
 ### Mando en modo dron (estilo "modo 2" de emisora)
 
 | Control | Acción |
 |---|---|
-| **A** | El dron toma el control: las hélices giran al ralentí (sin despegar). |
-| Stick izquierdo ↑/↓ | Subir / bajar (máx. 1 m/s). Subir con el dron posado = despegar (~2 s). |
+| **A** | El mando pasa a controlar el dron. |
+| Stick izquierdo ↑ con el dron posado | **Despegue**: ArduCopter pasa a GUIDED, arma y sube solo a 1 m (`Pilot.TakeoffAltitude`). Hay que esperar ~50 s tras lanzar a que el EKF use el GPS; si el autopiloto rechaza el armado, lo dice en el log (`[ardupilot] PreArm: …`) y se reintenta mientras se mantenga el stick. |
+| Stick izquierdo ↑/↓ en vuelo | Subir / bajar (máx. 1 m/s). |
 | Stick izquierdo ←/→ | Girar (máx. 1 rad/s). |
 | Stick derecho ↑/↓ | Avanzar / retroceder (máx. 2 m/s). |
 | Stick derecho ←/→ | Desplazarse de lado. |
-| Soltar los sticks | Se queda flotando en el sitio. |
-| Bajar sostenido hasta tocar | Aterriza y apaga el armado (vuelve al ralentí). |
+| Soltar los sticks | Se queda quieto: el autopiloto mantiene la posición con su GPS/EKF (deriva típica ~10–20 cm). |
+| Stick izquierdo ↓ sostenido cerca del suelo | Por debajo de 0,5 m sobre el punto de despegue (`Pilot.LandAltitude`) pasa a **LAND**: el autopiloto baja, detecta el contacto y **desarma solo**. Subir el stick durante el LAND lo cancela. |
 | **LB / RB** | Cámara frontal / cámara hacia abajo (también `F` / `D` en el teclado de Webots). |
-| **B** | Vuelve el control al robot. El dron, si está volando, se queda flotando; si está posado, para las hélices. |
+| **B** | Vuelve el control al robot. El dron, si está volando, se queda quieto donde está. |
 
-No hay despegue ni aterrizaje automáticos.
+El aterrizaje es "a ciegas" sobre la posición GPS: todavía no hay aterrizaje de precisión sobre la plataforma (fase 3 de `control_dron.md`). Si el Husky se ha movido, el dron aterriza en el suelo.
 
 ### Grafo
 
@@ -52,9 +55,13 @@ Un consumidor de la imagen usa el patrón de siempre: `rc::media::make_image_sub
 - Cámara RGB 1280 × 720, FOV horizontal 60°. Solo `camera pitch` es móvil (0 = frontal, π/2 = abajo); arranca mirando abajo.
 - GPS (0,05 m, correlación 0,9), IMU, giróscopo y brújula.
 
-## Estabilizador de vuelo (`webots-drone-bridge/src/flight_controller.h`)
+## Control de vuelo
 
-Consigna de velocidad → inclinación → actitud → mezcla de rotores (la de Cyberbotics). Altura con PID e integrador anti-saturación. Valores medidos en Webots:
+**Actual: ArduCopter SITL** (`Flight.Backend = "ardupilot"` en `webots-drone-bridge/etc/config.toml`). Diseño, problemas resueltos y medidas: `webots-drone-bridge/src/control_dron.md`. Prueba sin interfaz: `webots-drone-bridge/scripts/sitl_selftest.sh`.
+
+### Estabilizador propio anterior (`flight_controller.h`, `Flight.Backend = "internal"`)
+
+Se conserva como alternativa; necesita el mundo a 8 ms y `externalPropulsion FALSE`. Consigna de velocidad → inclinación → actitud → mezcla de rotores (la de Cyberbotics). Altura con PID e integrador anti-saturación. Valores medidos en Webots:
 
 - Equilibrio: 97 rad/s (el Mavic oficial, 68,6 rad/s; ×√(1/s)).
 - Ganancias de actitud del ejemplo oficial `mavic2pro.c` (alabeo 50, cabeceo 30, velocidad angular 1).

@@ -29,6 +29,15 @@ cmd = "env WEBOTS_CONTROLLER_URL=ipc://1234/inspection_drone bin/drone_bridge et
 ice_name = "mediaplanedds:tcp -h localhost -p 12110"
 when = "test -n \"$WEBOTS_WORLD\" && grep -q 'InspectionDrone {' \"$WEBOTS_WORLD\""
 
+# The drone's autopilot: ArduCopter SITL (~/robocomp/ardupilot), physics = drone_bridge (Flight.Backend =
+# "ardupilot"), joystick -> MAVLink by drone_bridge's pilot (tcp 5762). Same `when` as the drone: only in a drone world.
+# --wipe: every launch starts from etc/ardupilot/inspection_drone.parm, not from parameters a previous run saved.
+[[components]]
+name = "drone_sitl"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/webots-drone-bridge"
+cmd = "scripts/run_sitl.sh --wipe"
+when = "test -n \"$WEBOTS_WORLD\" && grep -q 'InspectionDrone {' \"$WEBOTS_WORLD\""
+
 [[components]]
 name = "helios"
 cwd = "~/robocomp/AiGB_UEx_Navigation_v2/robocomp-robolab/components/hardware/laser/lidar3d_dds"

@@ -49,6 +49,7 @@ void OpenFieldExploration::tick(std::int64_t now_ms, const std::vector<Eigen::Ve
     {
         last_obstacles_ms_ = now_ms;
         refresh_obstacles(world_frame);
+        revalidate_target(now_ms, *robot, world_id);   // what was just learned may put the target on a plant
     }
 
     // What the robot sees from where it is, every step (also while it drives between standpoints).
@@ -119,6 +120,71 @@ void OpenFieldExploration::refresh_obstacles(const std::string &world_frame)
             std::println("[explore] question closed: {} is complete now (its missing part was found)", n);
     open_names_ = std::move(now);
     explorer_.set_open_plants(open);
+}
+
+// ★SAFETY: NEVER SEND THE ROBOT ONTO A ROW OR A PLANT IT HAS NOW SEEN. A standpoint is valid against the map known
+// when it was chosen; during the mapping drive the rows and plants keep appearing, and the offered spot may now lie
+// on one. Re-check it against the current map every time the map is re-read and, if it is no longer a valid
+// standpoint, move it to the nearest free one — or drop it and let the planner choose again.
+// ★IF THE CONTROLLER HAS ALREADY CLAIMED IT, A REPUBLISH IS NOT ENOUGH — the proposal must be WITHDRAWN. The
+// controller latches the standpoint for one approach (ControllerSession::hold_approach_commitment: an approach is a
+// commitment, so a gain-driven republish cannot turn the goal into a carrot on a stick) and keeps driving to the
+// epoch it accepted; releasing the claim only clears `active`, which it re-takes the next cycle. Measured live
+// (2026-11-05): two corrections of (3.96,2.78) were re-offered and the controller logged "HOLDING" on the invalid
+// pose until its own last-metres LiDAR check pushed the goal aside. The protocol already has the one signal that
+// ends a commitment without a new attribute: the affordance's identity. So a claimed, now-invalid proposal is
+// withdrawn by deleting our node — which also erases the consumer's `executing` edge into it — and the corrected
+// standpoint is offered on a fresh node. Our node, our write: this is what cleanup() does at shutdown.
+// Not a failure either way: the standpoint was not unreachable, it was wrong.
+void OpenFieldExploration::revalidate_target(std::int64_t now_ms, const Eigen::Vector2f &robot, std::uint64_t world_id)
+{
+    if (not target_) return;
+    const std::string why = explorer_.standpoint_conflict(target_->pos);
+    if (why.empty()) return;
+    const auto alt = explorer_.nearest_valid(target_->pos, robot, cfg_.relocate_radius_m);
+    bool claimed = aff_.is_executing(G_);
+    if (const auto n = G_->get_node(kNodeName); n.has_value())
+    {
+        bool edge = false;
+        (void)rc::AffordanceManager::read_executing(G_, n->id(), &edge);
+        claimed = claimed or edge;
+    }
+    bool released = false;
+    if (claimed)
+    {
+        if (const auto n = G_->get_node(kNodeName); n.has_value())
+            released = G_->delete_node(n->id());
+        aff_.reset();
+    }
+    const ExplorerTarget old = *target_;
+    if (not alt)
+    {
+        drop_target(std::format("standpoint ({:.2f},{:.2f}) is now {}; no free standpoint within {:.1f} m{} — the "
+                                "planner chooses again", old.pos.x(), old.pos.y(), why, cfg_.relocate_radius_m,
+                                released ? " (withdrawn from the controller)" : ""));
+        return;
+    }
+    if (aff_.publish_target(G_, world_id, alt->pos.x(), alt->pos.y(), alt->yaw, alt->gain))
+    {
+        target_ = alt;
+        armed_ms_ = now_ms;
+        executing_since_ms_ = progress_ms_ = 0;
+        std::println("[explore] SAFETY: standpoint ({:.2f},{:.2f}) is now {} — moved {:.2f} m to the nearest free "
+                     "standpoint ({:.2f},{:.2f}) facing {:.0f}°{}", old.pos.x(), old.pos.y(), why,
+                     (alt->pos - old.pos).norm(), alt->pos.x(), alt->pos.y(), alt->yaw * 180.0 / M_PI,
+                     released ? " (proposal withdrawn from the controller and re-offered on a new node)" : "");
+    }
+    else
+        drop_target(std::format("standpoint ({:.2f},{:.2f}) is now {}; the corrected one could not be published{} — "
+                                "the planner chooses again", old.pos.x(), old.pos.y(), why,
+                                released ? " (withdrawn from the controller)" : ""));
+}
+
+void OpenFieldExploration::drop_target(const std::string &why)
+{
+    std::println("[explore] SAFETY: {}", why);
+    target_.reset();
+    armed_ms_ = executing_since_ms_ = progress_ms_ = 0;
 }
 
 // The consumer's side of the protocol: did it finish, is it still on it, did it ever take it?

@@ -17,7 +17,10 @@ EXTERNPROTO "../protos/InspectionDrone.proto"
 
 WorldInfo {
   info [ "AiGB UEx - Husky A300 apple orchard, two fields (tall spindle, raised beds, no people)" ]
-  basicTimeStep 8
+  # 2 ms (the other worlds: 8): the drone is flown by ArduCopter SITL in lockstep with this step, one IMU sample
+  # per step, and the autopilot needs IMU >= 1.8 x its 250 Hz loop. Measured cost with the whole Husky
+  # sensorimotor layer: real-time factor 0.93 -> 0.89. See webots-drone-bridge/src/control_dron.md.
+  basicTimeStep 2
   # GPS: WGS84 so the "gps" device returns latitude / longitude / altitude.
   # Reference = world origin, near the UEx campus in Badajoz. With northDirection 0 1 0, world +Y is
   # geographic north, +X is east (ENU).
@@ -1390,9 +1393,13 @@ DEF APPLE_F2_R4_11 AppleTree {
 DEF INSPECTION_DRONE InspectionDrone {
   translation 0 -10.35 0.482
   scale 0.5
+  # Rotor thrust/torque applied by drone_bridge (30 ms motor lag): Webots' propellers here take seconds to build
+  # thrust, which no autopilot can fly. The propellers still spin.
+  externalPropulsion TRUE
   rotation 0 0 1 1.57079632679
   name "inspection_drone"
-  # Driven by webots-drone-bridge (extern; supervisor for the ground-truth pose relative to the Husky).
+  # Driven by webots-drone-bridge (extern; supervisor for the ground-truth pose relative to the Husky), which is the
+  # physics of ArduCopter SITL (webots-drone-bridge/scripts/run_sitl.sh, launched by sub_husky.toml).
   controller "<extern>"
   supervisor TRUE
 }

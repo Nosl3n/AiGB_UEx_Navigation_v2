@@ -33,7 +33,13 @@ HistoryDepth = 2
 SharedMemoryOnly = true
 DataSharing = false            # the drone appears and disappears: keep the churn-safe path
 
-[Flight]                       # flight_controller.h; tuned with Test.Script = "hover" (headless Webots)
+[Flight]
+# Who flies the drone:
+#   "internal"  = flight_controller.h, flown by the joystick (world at 8 ms, InspectionDrone externalPropulsion FALSE)
+#   "ardupilot" = ArduCopter SITL over its JSON interface (scripts/run_sitl.sh; world at 2 ms and the
+#                 InspectionDrone with externalPropulsion TRUE). See src/control_dron.md, "Estado".
+Backend = "ardupilot"
+# internal stabiliser (flight_controller.h); tuned with Test.Script = "hover" (headless Webots)
 HoverOmega = 97.0              # rad/s; official Mavic hovers at 68.6, x sqrt(1/scale) for scale 0.5 (measured 97)
 MaxOmega = 576.0
 KzP = 10.0
@@ -45,6 +51,18 @@ KRollP = 50.0                  # attitude: the gains of Cyberbotics' mavic2pro.c
 KPitchP = 30.0
 KRate = 1.0
 KYaw = 2.0
+
+[ArduPilot]                    # used when Flight.Backend = "ardupilot"
+Port = 9002                    # UDP where SITL sends its servo frames (--model JSON:127.0.0.1)
+MaxOmega = 165.0               # rad/s at PWM 2000; omega = MaxOmega*sqrt(u): thrust linear in u, hover u = 0.35
+TimeoutMs = 1000               # no servo frame for this long -> SITL gone, rotors off
+MotorTimeConstant = 0.03       # s, rotor speed lag of the rotor model (externalPropulsion); small motors 20-50 ms
+
+[Pilot]                        # joystick -> ArduPilot over MAVLink (src/mavlink_pilot.h), Backend = "ardupilot"
+Host = "127.0.0.1"
+Port = 5762                    # SITL SERIAL1; SERIAL0 (5760) stays free for a ground station / mission scripts
+TakeoffAltitude = 1.0          # m above the take-off point when the climb stick arms the drone
+LandAltitude = 0.5             # m: holding the stick DOWN below this hands over to LAND (lands + disarms itself)
 
 [Test]
 Script = ""                    # "hover": scripted flight for tuning (ignores the joystick, exits after 40 s)

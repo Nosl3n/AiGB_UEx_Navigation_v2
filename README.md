@@ -170,8 +170,8 @@ cycle (≈ 760 000 expansions, the control loop dropped to 0.8 Hz) and it held t
 ### Pending: reference map and localization without GPS
 
 **State today.** The inspection mode works. `openfield_concept` offers standpoints (`afford_openfield`), the
-controller drives to them, and the inspection ends when no standpoint is worth its travel. `field_metaconcept` then
-closes `field_0`. In `dos_fields.wbt` it inspected the whole field: 11 standpoints reached and 1 failed, with 0.8 %
+controller drives to them, and the inspection ends when no standpoint is worth its travel; the `field` node then carries
+the outcome (`model_stable`, `model_uncertainty`). In `dos_fields.wbt` it inspected the whole field: 11 standpoints reached and 1 failed, with 0.8 %
 of the field's entropy left. The plants, rows, plots and field it finds live only in the graph of the current run.
 Nothing is saved, and nothing corrects the pose when the GPS fails.
 

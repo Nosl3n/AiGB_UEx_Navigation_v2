@@ -45,6 +45,8 @@
 
 #include "camera_publisher.h"
 #include "flight_controller.h"
+#include "ardupilot_link.h"
+#include "mavlink_pilot.h"
 
 class SpecificWorker : public GenericWorker
 {
@@ -90,6 +92,13 @@ private:
 		// dds
 		CameraPublisher::Config dds;
 		drone::FlightGains gains;
+		// flight backend: "internal" = flight_controller.h; "ardupilot" = ArduCopter SITL over the JSON interface
+		std::string flight_backend = "internal";
+		int    ap_port      = 9002;                // UDP port SITL sends its servo frames to
+		double ap_max_omega = 165.0;               // rad/s at PWM 2000 (thrust linear in PWM: omega = max·sqrt(u))
+		int    ap_timeout_ms = 1000;               // no servo frame for this long -> SITL gone, rotors off
+		double motor_tau_s   = 0.03;               // rotor speed first-order lag (s); used with externalPropulsion
+		drone::PilotConfig pilot;                  // joystick -> ArduPilot (MAVLink), Flight.Backend = "ardupilot"
 	} params;
 
 	// shared between the Ice threads and the simulation thread
@@ -107,6 +116,7 @@ private:
 	Shared shared_;
 
 	CameraPublisher camera_pub_;
+	drone::MavlinkPilot pilot_;
 	std::thread sim_thread_;
 	std::atomic_bool stop_{false};
 	std::atomic_bool connected_{false};

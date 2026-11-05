@@ -155,6 +155,7 @@ void SpecificWorker::load_config()
 		ms = static_cast<int>(x.lease_ms); opt("Exploration.LeaseMs", ms); x.lease_ms = ms;
 		ms = static_cast<int>(x.stall_ms); opt("Exploration.StallMs", ms); x.stall_ms = ms;
 		optf("Exploration.StallProgressM", x.stall_progress_m);
+		optf("Exploration.RelocateRadiusM", x.relocate_radius_m);
 		optf("Exploration.CellM", ep.cell_m);
 		optf("Exploration.SensorRangeM", ep.sensor_range_m);
 		optf("Exploration.CanopyTransmittance", ep.canopy_transmittance);

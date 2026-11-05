@@ -23,9 +23,11 @@
 #include <span>
 #include <cmath>
 #include <cstdlib>
+#include <format>
 #include <print>
 #include <vector>
 
+#include <webots/Accelerometer.hpp>
 #include <webots/Camera.hpp>
 #include <webots/Gyro.hpp>
 #include <webots/InertialUnit.hpp>
@@ -96,6 +98,7 @@ SpecificWorker::SpecificWorker(const ConfigLoader& configLoader, TuplePrx tprx, 
 SpecificWorker::~SpecificWorker()
 {
 	stop_ = true;
+	pilot_.stop();
 	if (sim_thread_.joinable())
 	{
 		// Still waiting for Webots to accept the connection (no drone in the world): the constructor of
@@ -142,6 +145,15 @@ void SpecificWorker::initialize()
 	opt("Flight.KPitchP", g.k_pitch_p);
 	opt("Flight.KRate", g.k_rate);
 	opt("Flight.KYaw", g.k_yaw);
+	opt("Flight.Backend", params.flight_backend);
+	opt("ArduPilot.Port", params.ap_port);
+	opt("ArduPilot.MaxOmega", params.ap_max_omega);
+	opt("ArduPilot.TimeoutMs", params.ap_timeout_ms);
+	opt("ArduPilot.MotorTimeConstant", params.motor_tau_s);
+	opt("Pilot.Host", params.pilot.host);
+	opt("Pilot.Port", params.pilot.port);
+	opt("Pilot.TakeoffAltitude", params.pilot.takeoff_alt_m);
+	opt("Pilot.LandAltitude", params.pilot.land_alt_m);
 
 	// WEBOTS_CONTROLLER_URL names the robot this extern controller drives. The Husky's bridge names its own,
 	// so two extern controllers share one Webots without racing for the same robot.
@@ -150,6 +162,15 @@ void SpecificWorker::initialize()
 	std::print("[drone_bridge] connecting to Webots robot at {} (waits here until that robot exists)\n",
 	           std::getenv("WEBOTS_CONTROLLER_URL"));
 	sim_thread_ = std::thread(&SpecificWorker::sim_loop, this);
+	if (params.flight_backend == "ardupilot")
+		pilot_.start(params.pilot, [this] {
+			drone::PilotInput in;
+			std::lock_guard lk(mtx_);
+			in.selected = shared_.selected;
+			if (std::chrono::steady_clock::now() - shared_.cmd_stamp < std::chrono::milliseconds(params.command_timeout_ms))
+				in.cmd = shared_.cmd;                 // quiet joystick -> zero velocity -> the autopilot holds
+			return in;
+		});
 	setPeriod("Compute", 2000);
 }
 
@@ -177,6 +198,65 @@ void SpecificWorker::sim_loop()
 	}
 	imu->enable(dt_ms);
 	gyro->enable(dt_ms);
+	auto* accel = sup.getAccelerometer("accelerometer");
+	if (accel) accel->enable(dt_ms);
+
+	// ArduCopter SITL: it flies the drone; this loop is only its physics. Motor order is ArduPilot's
+	// FRAME_TYPE 18 (X_REV): our propellers spin opposite to the standard X — FL and RR anticlockwise seen from
+	// above, FR and RL clockwise — which is exactly X_REV with 1 = rear right, 2 = front right, 3 = rear left,
+	// 4 = front left. Rotor array here: 0 FL, 1 FR, 2 RL, 3 RR; spin signs {+, -, -, +}.
+	const bool use_ap = params.flight_backend == "ardupilot";
+	drone::ArduPilotLink ap;
+	bool ap_live = false;
+	std::array<double, 4> ap_omega{};
+	constexpr std::array<int, 4> kServoToRotor = {3, 1, 2, 0};
+	constexpr std::array<double, 4> kRotorSign = {+1.0, -1.0, -1.0, +1.0};
+	bool ext_prop = false;
+	double kT = 0.0, kQ = 0.0;
+	std::array<std::array<double, 3>, 4> rotor_pos{};
+	std::array<double, 4> rotor_w{};                  // actual (lagged) rotor speeds, signed
+	if (use_ap)
+	{
+		if (accel == nullptr)
+		{
+			std::print(stderr, "[drone_bridge] Flight.Backend = ardupilot needs an Accelerometer named 'accelerometer'\n");
+			finished_ = true;
+			QMetaObject::invokeMethod(QCoreApplication::instance(), "quit", Qt::QueuedConnection);
+			return;
+		}
+		if (not ap.open(params.ap_port))
+		{
+			std::print(stderr, "[drone_bridge] cannot bind UDP {} for ArduPilot SITL\n", params.ap_port);
+			finished_ = true;
+			QMetaObject::invokeMethod(QCoreApplication::instance(), "quit", Qt::QueuedConnection);
+			return;
+		}
+		std::print("[drone_bridge] flight backend: ArduPilot SITL (JSON) on UDP {}, max omega {} rad/s\n",
+		           params.ap_port, params.ap_max_omega);
+		// Rotor forces. Webots' Propeller builds thrust over SECONDS here (measured: a 0.23 kg drone in free air
+		// still had no thrust 0.5 s after a step to 1.3x hover, and only ~1 g after ~3.5 s), and no autopilot can
+		// fly through that. With the proto's externalPropulsion = TRUE the propellers only spin and this loop
+		// applies each rotor's thrust and reaction torque itself: speed through a first-order lag (time constant
+		// ArduPilot.MotorTimeConstant, a real small motor is ~20-50 ms), thrust kT·w² at the rotor's centre of
+		// thrust, yaw reaction -kQ·|w|·w. kT, kQ and the rotor positions are the proto's own, at its scale.
+		webots::Node* me = sup.getSelf();
+		if (auto* f = me->getField("externalPropulsion"); f != nullptr and f->getSFBool())
+		{
+			const double sc = me->getField("scale") ? me->getField("scale")->getSFFloat() : 1.0;
+			ext_prop = true;
+			kT = 0.00026 * sc * sc * sc;
+			kQ = 0.0000052 * sc * sc * sc * sc;
+			rotor_pos = {{{ 0.0548537 * sc,  0.151294 * sc, -0.00280468 * sc},     // FL
+			              { 0.0548537 * sc, -0.151294 * sc, -0.00280468 * sc},     // FR
+			              {-0.177179 * sc,   0.127453 * sc, -0.0320282 * sc},      // RL
+			              {-0.177179 * sc,  -0.127453 * sc, -0.0320282 * sc}}};    // RR
+			std::print("[drone_bridge]   rotor model: externalPropulsion, tau {} s, kT {:.3g}, kQ {:.3g}\n",
+			           params.motor_tau_s, kT, kQ);
+		}
+		else
+			std::print(stderr, "[drone_bridge]   WARNING: externalPropulsion = FALSE: thrust comes from Webots' propellers, "
+			                   "which respond in seconds — set it TRUE on the InspectionDrone for ArduPilot\n");
+	}
 	camera->enable(params.camera_period_ms);
 	for (auto* m : rotors) { m->setPosition(INFINITY); m->setVelocity(0.0); }
 	if (pitch_m) pitch_m->setPosition(params.camera_pitch);
@@ -199,6 +279,7 @@ void SpecificWorker::sim_loop()
 	std::vector<std::uint8_t> rgb(static_cast<std::size_t>(params.dds.width) * params.dds.height * 3);
 	double next_cam_s = 0.0, next_log_s = 0.0;
 	const double t0 = sup.getTime();
+	const std::array<double, 3> start_pos = {self->getPosition()[0], self->getPosition()[1], self->getPosition()[2]};
 	std::print("[drone_bridge] connected: basic step {} ms, camera {}x{} @ {} ms, carrier '{}'{}\n", dt_ms,
 	           params.dds.width, params.dds.height, params.camera_period_ms, params.carrier_def,
 	           params.test_script.empty() ? "" : "  — TEST SCRIPT '" + params.test_script + "'");
@@ -251,9 +332,74 @@ void SpecificWorker::sim_loop()
 			std::lock_guard lk(mtx_);
 			selected = selected or shared_.selected;
 		}
-		const auto omega = fc.step(cmd, st, dt, selected);
+		std::array<double, 4> omega{};
+		if (not use_ap)
+		{
+			omega = fc.step(cmd, st, dt, selected);
+			armed_ = fc.armed();
+		}
+		else
+		{
+			// 1) reply to the servo frame that produced the step just taken (state AFTER it)
+			drone::PhysicsState ps;
+			ps.time_s = t;
+			const double* gv = gyro->getValues();
+			const double* av = accel->getValues();
+			const double* R  = self->getOrientation();
+			ps.gyro_flu  = {gv[0], gv[1], gv[2]};
+			ps.accel_flu = {av[0], av[1], av[2]};
+			ps.pos_enu   = {pos[0] - start_pos[0], pos[1] - start_pos[1], pos[2] - start_pos[2]};
+			ps.vel_enu   = {vel[0], vel[1], vel[2]};
+			for (int i = 0; i < 9; ++i) ps.R_enu_flu[i] = R[i];
+			if (ap_live) ap.send(ps);
+			// 2) lockstep: wait for the autopilot's next output before stepping the world again
+			if (auto f = ap.receive(ap_live ? params.ap_timeout_ms : 0); f.has_value())
+			{
+				if (not ap_live) std::print("[drone_bridge] ArduPilot SITL connected (frame rate {} Hz)\n", f->frame_rate);
+				ap_live = true;
+				for (int k = 0; k < 4; ++k)
+				{
+					const double u = std::clamp((f->pwm[k] - 1000.0) / 1000.0, 0.0, 1.0);
+					const int r = kServoToRotor[k];
+					ap_omega[r] = kRotorSign[r] * params.ap_max_omega * std::sqrt(u);
+				}
+			}
+			else if (ap_live)
+			{
+				ap_live = false;
+				ap_omega = {};
+				std::print(stderr, "[drone_bridge] ArduPilot SITL silent for {} ms: rotors off, waiting for it\n",
+				           params.ap_timeout_ms);
+			}
+			if (ext_prop)
+			{
+				const double a = 1.0 - std::exp(-dt / std::max(params.motor_tau_s, 1e-4));
+				double tz = 0.0;
+				for (int r = 0; r < 4; ++r)
+				{
+					rotor_w[r] += a * (ap_omega[r] - rotor_w[r]);
+					const double thrust[3] = {0.0, 0.0, kT * rotor_w[r] * rotor_w[r]};
+					self->addForceWithOffset(thrust, rotor_pos[r].data(), true);
+					tz -= kQ * std::abs(rotor_w[r]) * rotor_w[r];
+				}
+				const double torque[3] = {0.0, 0.0, tz};
+				self->addTorque(torque, true);
+				omega = rotor_w;                          // the propellers spin for show; they make no force
+			}
+			else
+				omega = ap_omega;
+			armed_ = std::ranges::any_of(ap_omega, [](double w) { return std::abs(w) > 1.0; });
+			// DRONE_AP_DEBUG=1: 20 Hz trace of rotor speeds, attitude and altitude while armed
+			if (static const bool dbg = std::getenv("DRONE_AP_DEBUG") != nullptr; dbg and armed_ and t >= next_log_s)
+			{
+				next_log_s = t + 0.05;
+				const double* e = imu->getRollPitchYaw();
+				std::print("[apdbg] t={:7.3f} w(FL,FR,RL,RR)=({:+6.1f},{:+6.1f},{:+6.1f},{:+6.1f}) rpy=({:+6.3f},{:+6.3f},{:+6.3f}) "
+				           "gyro=({:+5.2f},{:+5.2f},{:+5.2f}) z={:5.3f}\n", t, omega[0], omega[1], omega[2], omega[3],
+				           e[0], e[1], e[2], gv[0], gv[1], gv[2], pos[2] - start_pos[2]);
+			}
+		}
 		for (int i = 0; i < 4; ++i) rotors[i]->setVelocity(omega[i]);
-		armed_ = fc.armed();
 		altitude_ = pos[2];
 
 		// ── poses (robot convention: +Y forward / optical axis, +X right, +Z up) ──
@@ -341,8 +487,24 @@ void SpecificWorker::compute()
 	}
 	static std::uint64_t last_frames = 0;
 	const auto f = frames_.load();
-	std::print("[drone_bridge] {} | altitude {:.2f} m | camera frames +{} | rotors {}\n",
-	           finished_ ? "finished" : "running", altitude_.load(), f - last_frames, armed_ ? "ON" : "off");
+	std::string ap;
+	if (params.flight_backend == "ardupilot")
+	{
+		const auto ps = pilot_.status();
+		static constexpr const char* kLanded[] = {"?", "on ground", "in air", "taking off", "landing"};
+		ap = not ps.connected ? " | ArduPilot: not connected"
+		     : std::format(" | ArduPilot: {} mode {} {} rel.alt {:.2f} m", ps.armed ? "ARMED" : "disarmed", ps.mode,
+		                   kLanded[std::clamp(ps.landed, 0, 4)], ps.rel_alt_m);
+	}
+	std::string rel;
+	{
+		std::lock_guard lk(mtx_);
+		if (shared_.pose_valid)
+			rel = std::format(" | from Husky (x right, y fwd, z up) ({:+.2f}, {:+.2f}, {:+.2f}) m", shared_.drone_in_carrier.x,
+			                  shared_.drone_in_carrier.y, shared_.drone_in_carrier.z);
+	}
+	std::print("[drone_bridge] {} | altitude {:.2f} m{} | camera frames +{} | rotors {}{}\n",
+	           finished_ ? "finished" : "running", altitude_.load(), rel, f - last_frames, armed_ ? "ON" : "off", ap);
 	last_frames = f;
 }
 

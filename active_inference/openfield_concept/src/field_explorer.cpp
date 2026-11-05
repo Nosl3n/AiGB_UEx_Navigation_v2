@@ -263,6 +263,48 @@ std::optional<ExplorerTarget> FieldExplorer::select(const Eigen::Vector2f &robot
     return best;
 }
 
+std::string FieldExplorer::standpoint_conflict(const Eigen::Vector2f &v) const
+{
+    if (not point_in_polygon(v, polygon_) or distance_to_polygon_edge(v, polygon_) < p_.boundary_clearance)
+        return "too close to the field edge";
+    for (const auto &r : rows_)
+        if (inside_rect(r, v, p_.row_clearance)) return "on a row (or within its clearance)";
+    for (const auto &d : plants_)
+        if ((v - d.c).norm() < d.r + p_.plant_clearance) return "within a plant's keep-out";
+    for (const auto &q : questions_)
+        if ((v - q.plant.c).norm() < p_.open_plant_keepout_m) return std::format("next to {} (incomplete plant)", q.plant.name);
+    return {};
+}
+
+std::optional<ExplorerTarget> FieldExplorer::nearest_valid(const Eigen::Vector2f &v, const Eigen::Vector2f &robot,
+                                                           float max_r) const
+{
+    if (not ready()) return std::nullopt;
+    const int r = static_cast<int>(std::ceil(max_r / p_.cell_m));
+    const Eigen::Vector2f g = (v - origin_) / p_.cell_m;
+    const int cx = static_cast<int>(std::lround(g.x())), cy = static_cast<int>(std::lround(g.y()));
+    std::optional<Eigen::Vector2f> best;
+    float best_d = 0.f, best_dr = 0.f;
+    for (int iy = std::max(0, cy - r); iy <= std::min(ny_ - 1, cy + r); ++iy)
+        for (int ix = std::max(0, cx - r); ix <= std::min(nx_ - 1, cx + r); ++ix)
+        {
+            if (u_[static_cast<std::size_t>(iy * nx_ + ix)] < 0.f) continue;
+            const Eigen::Vector2f c = centre(ix, iy);
+            const float d = (c - v).norm();
+            if (d > max_r or not standpoint_ok(c)) continue;
+            const float dr = (c - robot).norm();
+            if (not best or d < best_d - 1e-3f or (std::abs(d - best_d) <= 1e-3f and dr < best_dr))
+            {
+                best = c;
+                best_d = d;
+                best_dr = dr;
+            }
+        }
+    if (not best) return std::nullopt;
+    const float marginal = std::max(0.f, gain_at(*best) - gain_at(robot));
+    return ExplorerTarget{*best, facing(*best), marginal, marginal - p_.travel_cost * best_dr};
+}
+
 void FieldExplorer::mark_failed(const Eigen::Vector2f &pos, double now_s)
 {
     std::erase_if(failed_, [&](const Failed &f) { return now_s - f.t > 5.0 * p_.failed_suppress_s; });
@@ -352,6 +394,37 @@ bool FieldExplorer::self_test(std::string *report)
                        min_d, b, ex2.params().part_prior, legs2, done);
     log += std::format("legs={} remaining={:.1f}% finished={} west={} east={}\n", legs,
                        100.f * ex.remaining_fraction(), finished, saw_west, saw_east);
+
+    // SAFETY: a standpoint chosen before the map knew it, then a row / a plant turns up on it. It must be reported
+    // invalid and moved to the nearest free standpoint — never onto the row or the plant, never further than asked.
+    {
+        FieldExplorer ex3;
+        ex3.set_polygon({{-10.f, -6.f}, {10.f, -6.f}, {10.f, 6.f}, {-10.f, 6.f}});
+        const Eigen::Vector2f spot(0.f, 0.f), r3(0.f, -5.f);
+        const bool valid_before = ex3.standpoint_conflict(spot).empty();
+        // a row through the spot, along y (yaw 90°), 0.8 m wide: invalid within 0.4 + row_clearance of its axis
+        ex3.set_obstacles({RowRect{{0.f, 0.f}, 1.5708f, 8.f, 0.8f}}, {});
+        const std::string why_row = ex3.standpoint_conflict(spot);
+        const auto alt_row = ex3.nearest_valid(spot, r3, 3.f);
+        const float min_row = 0.4f + ex3.params().row_clearance;
+        const bool row_ok = not why_row.empty() and alt_row and ex3.standpoint_conflict(alt_row->pos).empty()
+                            and std::abs(alt_row->pos.x()) > min_row and (alt_row->pos - spot).norm() <= 3.f;
+        // a trunk right on the spot
+        ex3.set_obstacles({}, {Disc{{0.f, 0.f}, 0.3f}});
+        const std::string why_plant = ex3.standpoint_conflict(spot);
+        const auto alt_plant = ex3.nearest_valid(spot, r3, 3.f);
+        const bool plant_ok = not why_plant.empty() and alt_plant
+                              and (alt_plant->pos - spot).norm() >= 0.3f + ex3.params().plant_clearance
+                              and ex3.standpoint_conflict(alt_plant->pos).empty();
+        // nothing free close enough: no substitute (the planner must decide again)
+        const bool none_ok = not ex3.nearest_valid(spot, r3, 0.5f).has_value();
+        ok = ok and valid_before and row_ok and plant_ok and none_ok;
+        log += std::format("safety relocation: row -> \"{}\" -> ({:.1f},{:.1f}) {}; plant -> \"{}\" -> ({:.1f},{:.1f}) {}; "
+                           "nothing within 0.5 m -> {}\n",
+                           why_row, alt_row ? alt_row->pos.x() : NAN, alt_row ? alt_row->pos.y() : NAN, row_ok ? "OK" : "FAIL",
+                           why_plant, alt_plant ? alt_plant->pos.x() : NAN, alt_plant ? alt_plant->pos.y() : NAN,
+                           plant_ok ? "OK" : "FAIL", none_ok ? "OK (none)" : "FAIL");
+    }
     if (report) *report = log;
     return ok;
 }

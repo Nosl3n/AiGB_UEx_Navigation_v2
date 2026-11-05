@@ -22,6 +22,7 @@
 #include <dsr/api/dsr_inner_eigen_api.h>
 
 #include <cstdint>
+#include <format>
 #include <future>
 #include <memory>
 #include <optional>
@@ -48,6 +49,11 @@ public:
         // a liveness guarantee about another agent, not a belief, so there is no model term it could live in.
         std::int64_t stall_ms = 30000;
         float stall_progress_m = 0.3f;       // what counts as "came closer"
+        // ★A STANDPOINT CAN TURN OUT TO BE ON A ROW OR A PLANT. It was chosen with the map known THEN; when the
+        // robot later sees that it lies on a row or by a trunk, the target is moved to the nearest free standpoint
+        // within this radius (the same look, from beside it). Further than that it is no longer "the same
+        // standpoint" but a new decision, and the planner makes it from scratch.
+        float relocate_radius_m = 3.0f;
     };
     enum class Mode { Waiting, Inspecting, Complete };
 
@@ -87,6 +93,8 @@ private:
     std::set<std::string> open_names_;   // incomplete plants seen at the last refresh
 
     void refresh_obstacles(const std::string &world_frame);
+    void revalidate_target(std::int64_t now_ms, const Eigen::Vector2f &robot, std::uint64_t world_id);
+    void drop_target(const std::string &why);
     void follow_protocol(std::int64_t now_ms, const Eigen::Vector2f &robot);
     void select_and_offer(std::int64_t now_ms, const Eigen::Vector2f &robot, std::uint64_t world_id);
     void publish_world_state(std::uint64_t world_id);

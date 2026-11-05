@@ -13,6 +13,7 @@
 
 PROTO InspectionDrone [
   field SFFloat    scale               0.5                                 # Uniform size factor (1 = Mavic 2 Pro, 0.5 ~ DJI Mini class). Masses x s^2, thrust x s^3.
+  field SFBool     externalPropulsion  FALSE                               # TRUE: Webots' propellers make no thrust/torque (they only spin); the controller applies rotor forces itself (drone_bridge, Flight.Backend = "ardupilot").
   field SFVec3f    translation         0 0 0.065                           # Is `Pose.translation`.
   field SFRotation rotation            0 0 1 0                             # Is `Pose.rotation`.
   field SFString   name                "inspection_drone"                       # Is `Solid.name`.
@@ -27,7 +28,7 @@ PROTO InspectionDrone [
   field MFNode     cameraSlot          [ Camera { name "camera" width 1280 height 720 fieldOfView 1.04719755 near 0.02 } ] # Extends the robot with a Camera.
 ]
 {
-%< const s = fields.scale.value; >%
+%< const s = fields.scale.value; const prop = fields.externalPropulsion.value ? 0 : 1; >%
 Robot {
   translation IS translation
   rotation IS rotation
@@ -74,13 +75,18 @@ Robot {
     }
     DEF GYRO Gyro {
     }
+    # Specific force in the body frame (+9.81 m/s^2 on z at rest): the IMU accelerometer an autopilot fuses.
+    # Needed by Flight.Backend = "ardupilot" (drone_bridge feeds it to ArduCopter SITL as imu.accel_body).
+    DEF ACCELEROMETER Accelerometer {
+      name "accelerometer"
+    }
     DEF INERTIAL_UNIT InertialUnit {
     }
     DEF REAR_LEFT_HP_HELIX Propeller {
       shaftAxis 0 0 1
       centerOfThrust %<= -0.177179 * s >% %<= 0.127453 * s >% %<= -0.0320282 * s >%
-      thrustConstants %<= -0.00026 * s * s * s >% 0
-      torqueConstants %<= 0.0000052 * s * s * s * s >% 0
+      thrustConstants %<= prop * -0.00026 * s * s * s >% 0
+      torqueConstants %<= prop * 0.0000052 * s * s * s * s >% 0
       fastHelixThreshold 50
       device RotationalMotor {
         name "rear left propeller"
@@ -199,8 +205,8 @@ Robot {
     DEF REAR_RIGHT_HP_HELIX Propeller {
       shaftAxis 0 0 1
       centerOfThrust %<= -0.177179 * s >% %<= -0.127453 * s >% %<= -0.0320282 * s >%
-      thrustConstants %<= 0.00026 * s * s * s >% 0
-      torqueConstants %<= 0.0000052 * s * s * s * s >% 0
+      thrustConstants %<= prop * 0.00026 * s * s * s >% 0
+      torqueConstants %<= prop * 0.0000052 * s * s * s * s >% 0
       fastHelixThreshold 50
       device RotationalMotor {
         name "rear right propeller"
@@ -321,8 +327,8 @@ Robot {
     DEF FRONT_RIGHT_HP_HELIX Propeller {
       shaftAxis 0 0 1
       centerOfThrust %<= 0.0548537 * s >% %<= -0.151294 * s >% %<= -0.00280468 * s >%
-      thrustConstants %<= -0.00026 * s * s * s >% 0
-      torqueConstants %<= 0.0000052 * s * s * s * s >% 0
+      thrustConstants %<= prop * -0.00026 * s * s * s >% 0
+      torqueConstants %<= prop * 0.0000052 * s * s * s * s >% 0
       fastHelixThreshold 50
       device RotationalMotor {
         name "front right propeller"
@@ -609,8 +615,8 @@ Robot {
     DEF FRONT_LEFT_HP_HELIX Propeller {
       shaftAxis 0 0 1
       centerOfThrust %<= 0.0548537 * s >% %<= 0.151294 * s >% %<= -0.00280468 * s >%
-      thrustConstants %<= 0.00026 * s * s * s >% 0
-      torqueConstants %<= 0.0000052 * s * s * s * s >% 0
+      thrustConstants %<= prop * 0.00026 * s * s * s >% 0
+      torqueConstants %<= prop * 0.0000052 * s * s * s * s >% 0
       fastHelixThreshold 50
       device RotationalMotor {
         name "front left propeller"

@@ -1,0 +1,38 @@
+# ArduCopter parameters for the simulated inspection drone (InspectionDrone.proto, scale 0.5, ~0.23 kg).
+# Loaded ON TOP of ArduPilot's Tools/autotest/default_params/copter.parm (see scripts/run_sitl.sh).
+# Only what differs from a stock ArduCopter belongs here; every line says why.
+
+# Frame. Our propellers spin opposite to the standard X (FL and RR anticlockwise seen from above, FR and RL
+# clockwise), which is X_REV; drone_bridge maps servo 1..4 = rear right, front right, rear left, front left.
+FRAME_CLASS      1
+FRAME_TYPE       18
+
+# Thrust. drone_bridge sets omega = MaxOmega * sqrt(u) and a Webots propeller makes thrust ~ omega^2, so thrust
+# is LINEAR in the motor command: no expo. Hover = (97 / 165)^2 = 0.35 of full throttle (thrust/weight ~2.9).
+MOT_THST_EXPO    0
+MOT_THST_HOVER   0.35
+
+# Estimator: the real EKF3, as on hardware (not the simulator's ideal attitude, AHRS_EKF_TYPE 10).
+AHRS_EKF_TYPE    3
+
+# Loop rate. SITL runs in lockstep with the Webots physics step and gets ONE IMU sample per step, and the
+# autopilot refuses to arm unless the IMU rate is >= 1.8x the loop rate. Measured: 8 ms steps -> gyro 221 Hz
+# (arming refused even at 125 Hz); 2 ms steps -> gyro ~505 Hz, so the loop can be at most ~280 Hz. 250 Hz is a
+# common rate on small flight controllers. The world must therefore step at 2 ms (WorldInfo.basicTimeStep 2);
+# 400 Hz (ArduCopter's default) would need 1 ms steps, twice the physics cost.
+SCHED_LOOP_RATE  250
+
+# No RC transmitter in this setup: the drone is commanded over MAVLink (GUIDED) by drone_bridge / scripts.
+ARMING_SKIPCHK   64
+FS_THR_ENABLE    0
+
+# Rate gains. ArduCopter's defaults are for ~1.5 kg frames; this one is 0.23 kg with ~10 cm arms, so the same
+# command produces several times the angular acceleration. Measured in SITL (3 m hover, 15 s): defaults ->
+# roll up to 7.2 deg, altitude 2.86-3.30 m; these -> roll 2.7 deg, 2.87-3.11 m. Hand-reduced, NOT autotuned:
+# on the real airframe run AUTOTUNE and replace them.
+ATC_RAT_RLL_P    0.03
+ATC_RAT_RLL_I    0.03
+ATC_RAT_RLL_D    0.0008
+ATC_RAT_PIT_P    0.03
+ATC_RAT_PIT_I    0.03
+ATC_RAT_PIT_D    0.0008

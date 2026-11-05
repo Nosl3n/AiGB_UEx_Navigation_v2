@@ -73,6 +73,18 @@ no la cadena de transformaciones.
   frente a quedarse); protocolo `Offered → Executing → Completed` (`epistemic_pending`, `active`).
 - **Resultado**: si el controller no pudo llegar (`unreachable`, `infeasible`, `outside_world`) el punto queda
   suprimido un tiempo (decae con `Exploration.FailedSuppressS`).
+- **Seguridad: el punto se re-comprueba mientras el robot va hacia él.** Se eligió con el mapa de ese momento; durante
+  la exploración aparecen hileras y plantas, y puede resultar que el punto quede encima de una hilera o junto a un
+  tronco. Cada vez que se releen hileras y plantas (1 s) se vuelve a validar (`FieldExplorer::standpoint_conflict`:
+  dentro del campo, fuera de las hileras + `RowClearanceM`, de los troncos + `PlantClearanceM` y de las plantas
+  incompletas + `open_plant_keepout_m`). Si ya no vale, se mueve al **punto libre más cercano** dentro de
+  `Exploration.RelocateRadiusM` (3 m; `nearest_valid`); si no hay ninguno, se descarta y el planificador elige otro.
+  No cuenta como fallo. Log: `[explore] SAFETY: …`.
+  - Si el controller **ya lo había reclamado**, republicarlo no basta: el controller mantiene el punto aceptado durante
+    toda la aproximación (`hold_approach_commitment`, para que el objetivo no se convierta en una zanahoria). La
+    propuesta se **retira**: `openfield_concept` borra su nodo `afford_openfield` (con él desaparece la arista
+    `executing` del controller) y ofrece el punto corregido en un nodo nuevo. El cambio de identidad del affordance
+    es lo que termina un compromiso en el protocolo actual.
 - En el controller compite con los affordances de objetos con `ganancia − λ·distancia`; mientras un objeto compite,
   su ganancia se escala por `Controller.AffordanceExplorationGainScale` (antes `AffordanceRoomGainScale`).
 

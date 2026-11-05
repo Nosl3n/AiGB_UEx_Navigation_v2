@@ -215,8 +215,8 @@ para escribir el puente bag → capa sensoriomotora.
    interfaces que hoy dan `lidar3d_dds`, `zed_camera`, `imu_dds` y el GPS del webots-bridge. Diferencias a tener en
    cuenta: el LiDAR (128 capas frente a helios) y la cámara (monocular frente a la estéreo ZED; sin profundidad
    habrá que apoyarse en el LiDAR).
-3. Ejecutar `openfield_concept` (localización), `plant_concept`, `row_metaconcept`, `plot_metaconcept` y
-   `field_metaconcept`, y revisar el mapa semántico resultante.
+3. Ejecutar `openfield_concept` (localización y campo), `plant_concept`, `row_metaconcept` y `plot_metaconcept`, y
+   revisar el mapa semántico resultante.
 
 ### Paso 2 — Validar la medición del tronco
 - Con **TreeScope**: comparar `plant_trunk_radius_m` con los diámetros medidos en campo. Hoy, en simulación, la
