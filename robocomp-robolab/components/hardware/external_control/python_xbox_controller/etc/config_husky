@@ -17,19 +17,31 @@ Period.Emergency = 500
 # Units as the bridge expects them: advance in mm/s, rotate in rad/s.
 # Husky A300 tops out at ~2 m/s; 1000 mm/s is a safer teleop ceiling.
 joystickUniversal.Device = "/dev/input/js0"
-joystickUniversal.NumAxes = 2
+joystickUniversal.NumAxes = 6
 #                          name     axis  min    max   inverted  dead_zone
 joystickUniversal.Axis_0 = "advance, 1, -1000, 1000, true, 0.1"
 # Rotate on the RIGHT stick's horizontal axis (3), advance on the left stick: two-stick driving, so
 # a straight run is not disturbed by sideways drift of the left stick. (Axis 0, the left stick's
 # horizontal, is unused: config_shadow had "side" there, and a skid-steer cannot strafe.)
 joystickUniversal.Axis_1 = "rotate,  3,   -1,    1,  true, 0.1"
+# Drone (webots-drone-bridge), "mode 2" like a drone transmitter, normalised to [-1, 1]; drone_bridge scales
+# them to m/s and rad/s. Signs: vertical + = up, yaw + = counter-clockwise (stick left), forward + = ahead,
+# side + = LEFT. The robot's bridge ignores the drone_* axes, the drone ignores advance/rotate.
+joystickUniversal.Axis_2 = "drone_vertical, 1, -1, 1, true, 0.1"
+joystickUniversal.Axis_3 = "drone_yaw,      0, -1, 1, true, 0.1"
+joystickUniversal.Axis_4 = "drone_forward,  4, -1, 1, true, 0.1"
+joystickUniversal.Axis_5 = "drone_side,     3, -1, 1, true, 0.1"
 
-joystickUniversal.NumButtons = 3
+joystickUniversal.NumButtons = 5
 #                            name              button  step
 joystickUniversal.Button_0 = "block,            1, 1"
 joystickUniversal.Button_1 = "stop,             3, 1"
 joystickUniversal.Button_2 = "joystick_control, 2, 1"
+joystickUniversal.Button_3 = "drone_cam_front,  4, 1"
+joystickUniversal.Button_4 = "drone_cam_down,   5, 1"
+
+# Control target, published as TData.id: A (0) -> the drone, B (1) -> back to the robot. Starts on "robot".
+joystickUniversal.ModeButtons = "drone:0, robot:1"
 
 Ice.Warn.Connections = "0"
 Ice.Trace.Network = "0"

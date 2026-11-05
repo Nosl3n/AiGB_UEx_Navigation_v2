@@ -4,13 +4,15 @@
 # documentation url: https://webots.cloud/run?url=https://github.com/cyberbotics/webots/blob/released/projects/robots/dji/mavic/protos/Mavic2Pro.proto
 # keywords: robot/flying
 # Derived from Cyberbotics R2025a Mavic2Pro: fixed yaw/roll, one pitch servo.
-# Uniform `scale` field (2026-11-04): geometry, joints and collision shapes x s; masses of body and rotors and thrust x s^3,
-# rotor torque x s^4. Flight dynamics are not tuned (motors stay off in this world).
+# Uniform `scale` field (2026-11-04): geometry, joints and collision shapes x s; EVERY mass x s^2 (uniform, so
+# the centre of mass stays over the centre of thrust: s = 0.5 -> 0.23 kg, a DJI Mini class), thrust x s^3, rotor
+# torque x s^4. Scaling only some masses moved the centre of mass ~3 cm ahead of the rotors and the drone pitched
+# over on take-off. Flown by webots-drone-bridge (src/flight_controller.h).
 # Pitch 0 = forward (+X drone); pi/2 = down (-Z). No vendor SDK/autopilot included.
 
 
 PROTO InspectionDrone [
-  field SFFloat    scale               0.5                                 # Uniform size factor (1 = Mavic 2 Pro, 0.5 ~ DJI Mini class). Masses and thrust scale with it.
+  field SFFloat    scale               0.5                                 # Uniform size factor (1 = Mavic 2 Pro, 0.5 ~ DJI Mini class). Masses x s^2, thrust x s^3.
   field SFVec3f    translation         0 0 0.065                           # Is `Pose.translation`.
   field SFRotation rotation            0 0 1 0                             # Is `Pose.rotation`.
   field SFString   name                "inspection_drone"                       # Is `Solid.name`.
@@ -138,7 +140,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
       slowHelix Solid {
@@ -190,7 +192,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
     }
@@ -258,7 +260,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
       slowHelix Solid {
@@ -312,7 +314,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
     }
@@ -380,7 +382,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
       slowHelix Solid {
@@ -434,7 +436,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
     }
@@ -505,7 +507,7 @@ Robot {
                     }
                     physics Physics {
                       density -1
-                      mass 0.0333
+                      mass %<= 0.0333 * s * s >%
                     }
                   }
               ]
@@ -520,7 +522,7 @@ Robot {
               }
               physics Physics {
                 density -1
-                mass 0.0333
+                mass %<= 0.0333 * s * s >%
               }
             }
           }
@@ -536,7 +538,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass 0.0333
+          mass %<= 0.0333 * s * s >%
         }
       }
     DEF LED_RIGHT LED {
@@ -568,7 +570,7 @@ Robot {
       }
       physics Physics {
         density -1
-        mass 0.0035
+        mass %<= 0.0035 * s * s >%
       }
     }
     DEF LED_LEFT LED {
@@ -601,7 +603,7 @@ Robot {
       }
       physics Physics {
         density -1
-        mass 0.0035
+        mass %<= 0.0035 * s * s >%
       }
     }
     DEF FRONT_LEFT_HP_HELIX Propeller {
@@ -668,7 +670,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
       slowHelix Solid {
@@ -722,7 +724,7 @@ Robot {
         }
         physics Physics {
           density -1
-          mass %<= 0.1 * s * s * s >%
+          mass %<= 0.1 * s * s >%
         }
       }
     }
@@ -805,8 +807,12 @@ Robot {
   }
   physics Physics {
     density -1
-    mass %<= 0.4 * s * s * s >%
+    mass %<= 0.4 * s * s >%
     centerOfMass [ %<= -0.088 * s >% %<= 0 * s >% %<= -0.04 * s >% ]
+    # Aerodynamic drag. Cyberbotics' Mavic world sets WorldInfo.defaultDamping 0.5 / 0.5, and the Mavic is only
+    # flyable with it (without it attitude oscillations grow). Here it lives on the drone, so the rest of the world
+    # (the Husky, the trees) keeps its own physics.
+    damping Damping { linear 0.5 angular 0.5 }
   }
   controller IS controller
   controllerArgs IS controllerArgs

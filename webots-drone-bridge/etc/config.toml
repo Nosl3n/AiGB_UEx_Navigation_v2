@@ -1,0 +1,63 @@
+# drone_bridge — inspection drone of webots-agri/worlds/dos_fields_dron.wbt (InspectionDrone.proto, scale 0.5).
+#   camera -> DDS (rc/drone/rgb) · pose -> FullPoseEstimation · joystick (TData.id == "drone") -> flight
+
+[Proxies]
+TopicManager = "IceStorm/TopicManager:default -p 9999"
+
+[Endpoints]
+JoystickAdapterTopic = "tcp -p 0"
+JoystickAdapterPrefix = ""
+MediaPlaneDDS = "tcp -p 12110"        # robot_concept: Proxies.MediaPlaneDDS5 (descriptor -> `camera` node)
+FullPoseEstimation = "tcp -p 12111"   # robot_concept: Proxies.FullPoseEstimation (body->dron, dron->camera)
+
+[Webots]
+Url = "ipc://1234/inspection_drone"   # the drone's Robot.name; ignored if WEBOTS_CONTROLLER_URL is set
+CarrierDef = "husky"                  # pose is reported in this node's frame
+
+[Camera]
+Name = "camera"
+PeriodMs = 64          # multiple of WorldInfo.basicTimeStep (8 ms) -> ~15 Hz
+Pitch = 1.5707963      # start looking DOWN; joystick LB = front, RB = down (Webots keys F / D too)
+
+[Joystick]
+ModeId = "drone"               # python_xbox_controller sets TData.id: A -> "drone", B -> "robot"
+MaxHorizontalSpeed = 2.0       # m/s at full stick
+MaxVerticalSpeed = 1.0         # m/s
+MaxYawRate = 1.0               # rad/s
+CommandTimeoutMs = 500         # no message for this long -> hold position (the controller goes quiet when idle)
+
+[DDS]
+Domain = 7
+RGBTopic = "rc/drone/rgb"
+HistoryDepth = 2
+SharedMemoryOnly = true
+DataSharing = false            # the drone appears and disappears: keep the churn-safe path
+
+[Flight]                       # flight_controller.h; tuned with Test.Script = "hover" (headless Webots)
+HoverOmega = 97.0              # rad/s; official Mavic hovers at 68.6, x sqrt(1/scale) for scale 0.5 (measured 97)
+MaxOmega = 576.0
+KzP = 10.0
+KzD = 10.0
+KzI = 1.0
+KV = 0.15                      # rad of tilt per m/s of velocity error
+MaxTilt = 0.25
+KRollP = 50.0                  # attitude: the gains of Cyberbotics' mavic2pro.c
+KPitchP = 30.0
+KRate = 1.0
+KYaw = 2.0
+
+[Test]
+Script = ""                    # "hover": scripted flight for tuning (ignores the joystick, exits after 40 s)
+
+[Period]
+Compute = 2000
+Emergency = 500
+
+[Component.Debug]
+Verbose = false
+
+[Ice]
+Warn.Connections = "0"
+Trace.Network = "0"
+Trace.Protocol = "0"
+MessageSizeMax = "20004800"

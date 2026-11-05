@@ -56,7 +56,7 @@ if (( STOP )); then
     if pid=$(pgrep -f "^python3 subcognitive.py" | head -1); then
         say "stopping the sensorimotor layer (SIGINT to subcognitive.py $pid)"
         run kill -INT "$pid"
-        (( DRY )) || wait_gone "bin/(Webots2Robocomp|lidar3d_dds|imu_dds|zed_camera) " 40 \
+        (( DRY )) || wait_gone "bin/(Webots2Robocomp|drone_bridge|lidar3d_dds|imu_dds|zed_camera) " 40 \
             || say "some drivers are still running after 40 s"
     fi
     if pid=$(pgrep -x webots-bin | head -1); then
@@ -135,7 +135,7 @@ else
 fi
 
 say "2/3 sensorimotor layer (bridge, helios, IMU, ZED, joystick) — terminal 'Husky · sensorimotor'"
-open_terminal "Husky · sensorimotor" "cd '$UTILS' && python3 subcognitive.py sub_husky.toml"
+open_terminal "Husky · sensorimotor" "cd '$UTILS' && WEBOTS_WORLD='$WORLD' python3 subcognitive.py sub_husky.toml"
 (( DRY )) || sleep "$SUB_WAIT_S"
 
 say "3/3 cognitive layer (DSR agents) — terminal 'Husky · cognitive'"

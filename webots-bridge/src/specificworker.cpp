@@ -1929,6 +1929,26 @@ void SpecificWorker::JoystickAdapter_sendData(RoboCompJoystickAdapter::TData dat
     }
     */
 
+    // ★ CONTROL TARGET. The Xbox controller publishes which vehicle its sticks are for in TData.id
+    //   (A -> "drone", B -> "robot"; python_xbox_controller ModeButtons). While the drone has the sticks the
+    //   robot must not move: one stop on the switch, then silence. Any other id (including the empty id of
+    //   older publishers) drives the robot as before.
+    {
+        static bool drone_has_control = false;
+        if (data.id == "drone")
+        {
+            if (not drone_has_control and pars.do_joystick)
+                OmniRobot_setSpeedBase(0.f, 0.f, 0.f);
+            if (not drone_has_control)
+                std::cout << "[ JoystickAdapter ] control -> drone: robot stopped, sticks ignored until B" << std::endl;
+            drone_has_control = true;
+            return;
+        }
+        if (drone_has_control)
+            std::cout << "[ JoystickAdapter ] control -> robot" << std::endl;
+        drone_has_control = false;
+    }
+
     // Iterate through the std::list of axes in the data structure
     for (RoboCompJoystickAdapter::AxisParams axis : data.axes)
     {
@@ -1939,6 +1959,8 @@ void SpecificWorker::JoystickAdapter_sendData(RoboCompJoystickAdapter::TData dat
             adv = axis.value;
         else if (axis.name == "side")
             side = axis.value;
+        else if (axis.name.starts_with("drone_"))
+            continue;   // the drone's sticks (drone_bridge), published alongside ours
         else
             std::cout << "[ JoystickAdapter ] Warning: Using a non-defined axes (" << axis.name << ")." << std::endl;
     }

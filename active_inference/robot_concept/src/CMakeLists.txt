@@ -27,6 +27,7 @@ LIST(APPEND SOURCES
   ../src/sensor_media_publisher.cpp
   ../src/specificworker.cpp
   ../src/specificworker_presence.cpp
+  ../src/drone_link.cpp
 )
 
 # no-char8_t to avoid a problem with ICE Connection lib.

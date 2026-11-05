@@ -1,0 +1,157 @@
+\documentclass[12pt,a4paper]{article}
+
+% --- PAQUETES DE CONFIGURACIÓN Y ESTILO ---
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english, spanish]{babel}
+\usepackage{microtype}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage[a4paper,top=16mm,bottom=16mm,left=15mm,right=7.5mm,headsep=6mm,footskip=8mm,headheight=17pt]{geometry}
+\usepackage{graphicx}                % Inclusión de imágenes/logos
+\usepackage{tabularx}                % Tablas ajustables al ancho
+\usepackage{array}                   % Formato de celdas de tabla
+\usepackage{xcolor}                  % Definición de colores
+\usepackage{colortbl}                % Color de fondo en tablas
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb,longtable,listings}
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,columns=fullflexible,frame=single}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\setlength{\emergencystretch}{3em}
+\usepackage{caption}
+\graphicspath{{imagenes/}{figures/}{./}}
+\usepackage{hyperref}                % Enlaces e hipervínculos
+\usepackage{fancyhdr}                % Encabezados y pies de página
+\usepackage{lastpage}
+\usepackage{titlesec}                % Estilo de secciones
+\titleformat{\section}
+    {\large\bfseries\sffamily\color{aigblue}}
+    {\thesection.}{0.5em}{}
+    [\color{aigblue}\titlerule]
+\titlespacing{\section}{0pt}{12pt}{6pt}
+
+% --- PROJECT COLOUR PALETTE ---
+\definecolor{aigblue}{HTML}{365F91}
+\definecolor{aiggreen}{HTML}{49A45B}
+\definecolor{aigteal}{HTML}{31849B}
+\definecolor{lightgray}{HTML}{F2F2F2}
+
+% --- CONFIGURACIÓN DE HIPERVÍNCULOS ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=aigblue,
+    citecolor=aigblue,
+    urlcolor=aigblue,
+    pdfauthor={Nelson Broyer Paco Chipana (redacción; revisión pendiente)},
+    pdftitle={Informe técnico del sistema de navegación y percepción agrícola}
+}
+
+% --- ENCABEZADOS Y PIES DE PÁGINA ---
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{%
+    \colorbox{aigteal}{\makebox[\dimexpr\textwidth-6pt\relax][l]{%
+        \hspace{2mm}\small\bfseries\sffamily\color{white}%
+        101169330 --- AIGreenBots --- Informe técnico de desarrollo%
+    }}%
+}
+\fancyfoot[C]{{\fontsize{7}{9}\selectfont Page~\thepage~of~\pageref{LastPage}}}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancypagestyle{plain}{
+    \fancyhf{}
+    \fancyfoot[C]{{\fontsize{7}{9}\selectfont Page~\thepage~of~\pageref{LastPage}}}
+    \renewcommand{\headrulewidth}{0pt}
+}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1\baselineskip}
+
+\begin{document}
+
+\thispagestyle{plain}
+\begin{titlepage}
+
+\noindent
+\begin{minipage}[t]{0.18\textwidth}
+    \includegraphics[width=\linewidth]{eu_commission_logo.jpeg}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.60\textwidth}
+    \raggedleft
+    \includegraphics[width=\linewidth]{msca_dn_banner.jpeg}
+\end{minipage}
+
+\vspace{8mm}
+% ==========================================
+% ENCABEZADO OFICIAL DEL PROYECTO (HORIZON/MSCA)
+% ==========================================
+\noindent
+\begin{tabularx}{\textwidth}{@{} X r @{}}
+    \textbf{Convocatoria:} HORIZON-MSCA-2023-DN-01 & \\
+    \textbf{Tema:} HORIZON-MSCA-2023-DN-01-01 & \\
+    \textbf{Tipo de acción:} HORIZON-TMA-MSCA-DN & \\
+    \textbf{Servicio:} REA/A/01 & \\
+    \textbf{Autoridad otorgante:} Agencia Ejecutiva Europea de Investigación (REA) & \\
+    \textbf{Número del proyecto:} 101169330 & \\
+    \textbf{Acrónimo del proyecto:} AIGreenBots & \\
+    \textbf{Fecha de inicio del proyecto:} 1 de octubre de 2024 & \\
+\end{tabularx}
+
+\vspace{0.6cm}
+
+\begin{center}
+    {\large \textbf{Título del proyecto:}} \\[0.2cm]
+    {\fontsize{13}{17}\bfseries\sffamily\color{aigblue} «Inteligencia artificial y sistemas de fusión de sensores en robótica sostenible (verde) para la agricultura de precisión»}
+\end{center}
+
+\vspace{8mm}
+
+\noindent
+{\fontsize{14}{18}\sffamily\color{aigblue}
+DOCUMENTO: Arquitectura, percepción, mapa semántico e inspección autónoma en huertos de manzanos}
+\vspace{8mm}
+
+% --- DELIVERABLE METADATA ---
+\noindent
+{\fontsize{9}{11}\selectfont
+\begin{tabular}{>{\columncolor{aigteal}\color{white}\bfseries}p{0.30\textwidth}
+                p{0.62\textwidth}}
+    Tipo de documento & Informe técnico \\[2pt]
+    Estado & Borrador de trabajo; adscripción formal a entregable pendiente \\[2pt]
+    Paquete de trabajo & WP 04 \\[2pt]
+    Autoría & Nelson Broyer Paco Chipana (redacción; revisión pendiente) \\[2pt]
+    Versión & 0.2 -- 4 de noviembre de 2026 \\
+\end{tabular}
+}
+\vspace{0.8cm}
+
+\vfill
+\noindent
+\begin{minipage}[b]{0.35\textwidth}
+    \includegraphics[width=0.75\linewidth]{aigreenbots_logo.png}
+\end{minipage}
+\hfill
+\begin{minipage}[b]{0.12\textwidth}
+    \raggedleft
+    \includegraphics[width=\linewidth]{eu_flag.png}
+\end{minipage}
+
+\vspace{2mm}
+
+\noindent\rule{\textwidth}{0.4pt}\\
+{\fontsize{8}{10}\sffamily
+Horizonte Europa -- Redes Doctorales MSCA\\
+Este proyecto ha recibido financiación del programa de investigación e
+innovación Horizonte Europa de la Unión Europea, en virtud del acuerdo de
+subvención Marie Sk\l{}odowska-Curie n.º~101169330.
+}
+
+\end{titlepage}
+\clearpage
+\setcounter{page}{2}
+\setlength{\parskip}{0.6\baselineskip}
+
+\tableofcontents
+\clearpage
+\input{contenido}
+\end{document}

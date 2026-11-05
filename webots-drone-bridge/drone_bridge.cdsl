@@ -1,0 +1,13 @@
+import "MediaPlaneDDS.idsl";
+import "FullPoseEstimation.idsl";
+import "JoystickAdapter.idsl";
+
+Component drone_bridge
+{
+    Communications
+    {
+        implements MediaPlaneDDS, FullPoseEstimation;
+        subscribesTo JoystickAdapter;
+    };
+    language Cpp11;
+};

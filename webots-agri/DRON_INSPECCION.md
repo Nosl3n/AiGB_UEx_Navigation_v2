@@ -1,4 +1,4 @@
-# Mundo de inspección aérea: hardware
+# Mundo de inspección aérea: Husky + dron
 
 Desde la raíz del repositorio:
 
@@ -6,46 +6,73 @@ Desde la raíz del repositorio:
 ./apple_dron.bash
 ```
 
-El lanzador es una copia de `apple_field.bash` que abre `webots-agri/worlds/dos_fields_dron.wbt`. Conserva el arranque de los componentes existentes. No modifica sus fuentes ni sus configuraciones. `--help`, `--dry-run` y `--stop` conservan el comportamiento del lanzador original. No lanzar ambos mundos simultáneamente con los mismos puertos y componentes.
+Abre `webots-agri/worlds/dos_fields_dron.wbt` (el huerto de dos campos con el Husky portador y el dron) y arranca las capas sensoriomotora y cognitiva. `--help`, `--dry-run` y `--stop` funcionan igual que en `apple_field.bash`. No lanzar dos mundos a la vez.
 
-El mundo nuevo conserva el terreno y los árboles de `dos_fields.wbt`. Usa una variante de hardware `HuskyDroneCarrier.proto`, copiada del original y con una plataforma añadida. `HuskyA300.proto`, el mundo original y el controlador/bridge del Husky permanecen intactos. La variante mantiene los motores, sensores, parámetros, nombre y controlador del Husky original. El soporte puede producir oclusiones físicas reales; no se ha modificado el filtrado de sensores del robot.
+## Qué hace (2026-11-04)
 
-## Hardware añadido
+| Pieza | Qué hace |
+|---|---|
+| `webots-drone-bridge/` (`drone_bridge`) | Controlador *extern* del dron. Publica la **cámara RGB en DDS** (`rc/drone/rgb`, dominio 7, `ImageFrame` RGB8, igual que la ZED), sirve el **descriptor** (`MediaPlaneDDS`, puerto 12110) y la **pose** (`FullPoseEstimation`, puerto 12111), y **vuela** el dron con el mando. |
+| `robot_concept` (`src/drone_link.*`) | Si `drone_bridge` responde, cuelga del cuerpo del robot `body ──RT──▶ dron ──RT──▶ camera`. El nodo `camera` lleva el `media_descriptor` (topic DDS) y los intrínsecos (`cam_rgb_width/height`, `cam_fov`, focales). Si deja de responder 3 s, borra los nodos. |
+| Mando Xbox (`python_xbox_controller`) | **A** = controlar el dron, **B** = volver al robot. El objetivo viaja en `TData.id` (`"drone"` / `"robot"`). |
+| Puente del Husky (`webots-bridge`) | Con el control en el dron, para el robot e ignora los sticks hasta pulsar B. |
+| Lanzadores | Exportan `WEBOTS_WORLD`; el componente `drone` de `sub_husky.toml` lleva `when = …` y **solo arranca si el mundo contiene un `InspectionDrone`**. Sin dron, todo corre solo con el robot, como antes. |
 
-- `InspectionDrone.proto`: derivado del Mavic2Pro oficial de Cyberbotics R2025a, con hélices físicas, GPS, IMU, giróscopo y brújula.
-- Campo `scale` (por defecto 0.5, tamaño tipo DJI Mini; 1 = Mavic 2 Pro): escala geometría, articulaciones y colisiones; masas de cuerpo y hélices y empuje ×s³, par de hélice ×s⁴. La dinámica de vuelo no está ajustada.
-- Se han sustituido las articulaciones de yaw y roll de cámara por uniones rígidas. Solo queda `camera pitch` y su encoder `camera pitch sensor`.
-- Cámara RGB de 1280 × 720, FOV horizontal de 60 grados. Pitch 0: frontal (+X local del dron). Pitch pi/2: inferior (-Z local). La orientación global también depende de la actitud del dron.
-- Servo limitado a [0, pi/2], velocidad máxima 1 rad/s y par máximo 0.5 N·m. Son parámetros de simulación, no especificaciones verificadas de un servo comercial.
-- GPS con desviación configurada de 0.05 m y correlación 0.9. En este mundo sus coordenadas son WGS84, como indica `WorldInfo`.
-- Emisor `inspection telemetry`, canal 42, y receptor `inspection command`, canal 43, disponibles para una integración futura. No hay un protocolo de imágenes o conexión RoboComp implementado.
-- Plataforma solidaria al Husky de 0.40 × 0.40 m, apoyada sobre la placa superior y centrada en (0, 0.15, 0.383) en su marco; cara superior a z=0.395 m. `InspectionDeck.proto` es paramétrico (`size`, `markerSize`, `markerOffset`, `postHeight`); la versión anterior era 0.70 m sobre un soporte de 0.28 m (cara superior a 0.6625 m).
-- Motivo (2026-11-04): la plataforma alta y el Mavic tapaban al LiDAR el suelo de delante entre 0.5 y 6 m. Medido en Webots (Helios, canales −55..+15°): impactos en plataforma+dron 2989 → 641 por barrido; rayos bajos del sector frontal ±30° que llegan más allá de 1 m: 25 % → 67 %, igual que el Husky sin plataforma. Los impactos que quedan están en los laterales, pegados al robot.
-- Marcador ArUco `DICT_4X4_50`, ID 23. Lado exterior negro: **0.17 m**; textura con margen blanco: 0.227 m. Centro respecto al Husky: (0, 0.23, 0.396). Usar el lado negro, no el tamaño de la textura, para estimar pose.
-- El dron empieza físicamente apoyado sobre la plataforma, orientado hacia el frente del Husky. No está soldado al robot: esta versión está pensada para la prueba con Husky detenido. No incluye anclaje de transporte para conducir con el dron encima.
+### Mando en modo dron (estilo "modo 2" de emisora)
 
-## Prueba manual de cámara
+| Control | Acción |
+|---|---|
+| **A** | El dron toma el control: las hélices giran al ralentí (sin despegar). |
+| Stick izquierdo ↑/↓ | Subir / bajar (máx. 1 m/s). Subir con el dron posado = despegar (~2 s). |
+| Stick izquierdo ←/→ | Girar (máx. 1 rad/s). |
+| Stick derecho ↑/↓ | Avanzar / retroceder (máx. 2 m/s). |
+| Stick derecho ←/→ | Desplazarse de lado. |
+| Soltar los sticks | Se queda flotando en el sitio. |
+| Bajar sostenido hasta tocar | Aterriza y apaga el armado (vuelve al ralentí). |
+| **LB / RB** | Cámara frontal / cámara hacia abajo (también `F` / `D` en el teclado de Webots). |
+| **B** | Vuelve el control al robot. El dron, si está volando, se queda flotando; si está posado, para las hélices. |
 
-Seleccionar el dron en Webots y enfocar la vista 3D para que reciba el teclado:
+No hay despegue ni aterrizaje automáticos.
 
-- `F`: frontal, pitch 0.
-- `D`: inferior, pitch pi/2.
+### Grafo
 
-El controlador local `inspection_hardware` activa cámara, encoder y sensores, y mantiene las cuatro hélices apagadas. Al arrancar orienta la cámara hacia abajo. La imagen puede verse en la ventana de dispositivos del dron. Esperar a que termine el movimiento del servo para interpretar una captura con la pose seleccionada.
+```
+husky (robot) ── body ──RT──▶ dron (vehicle) ──RT──▶ camera (camera)
+```
 
-**No implementa despegue, estabilización de vuelo, retorno, aterrizaje autónomo ni un SDK del fabricante.** El marcador y los sensores preparan esas funciones; disponer del modelo de Webots no proporciona el piloto automático comercial. Tampoco se ejecuta la detección ArUco durante el funcionamiento normal en esta entrega de hardware.
+Marcos con la convención del robot: **+Y adelante / eje óptico, +X derecha, +Z arriba** (como `zed`). `body→dron` es la pose del dron respecto al Husky; `dron→camera`, la de la cámara respecto al dron (incluye la inclinación de la cámara). Ambas con marca de tiempo. En simulación son la pose real del Supervisor de Webots (`source = webots-supervisor`).
 
-No usar `--route` para la prueba estática de inspección. El lanzador conserva esa opción heredada, pero no existe un bloqueo nuevo del movimiento del Husky ni retención del dron sobre la plataforma.
+Un consumidor de la imagen usa el patrón de siempre: `rc::media::make_image_subscriber_from_graph(G, "camera", "rgb")`.
+
+## Hardware del dron
+
+- `InspectionDrone.proto`: derivado del Mavic2Pro oficial de Cyberbotics R2025a.
+- Campo `scale` (por defecto 0.5, tamaño tipo DJI Mini; 1 = Mavic 2 Pro). Geometría, articulaciones y colisiones ×s; **todas** las masas ×s² (0,23 kg a escala 0,5); empuje ×s³; par de hélice ×s⁴. Escalar solo algunas masas adelantaba el centro de masas ~3 cm respecto al empuje y el dron volcaba al despegar.
+- Resistencia aerodinámica en el propio dron (`damping` lineal y angular 0,5), la misma que el mundo oficial del Mavic pone a todo el mundo. Sin ella las oscilaciones de actitud crecen.
+- Cámara RGB 1280 × 720, FOV horizontal 60°. Solo `camera pitch` es móvil (0 = frontal, π/2 = abajo); arranca mirando abajo.
+- GPS (0,05 m, correlación 0,9), IMU, giróscopo y brújula.
+
+## Estabilizador de vuelo (`webots-drone-bridge/src/flight_controller.h`)
+
+Consigna de velocidad → inclinación → actitud → mezcla de rotores (la de Cyberbotics). Altura con PID e integrador anti-saturación. Valores medidos en Webots:
+
+- Equilibrio: 97 rad/s (el Mavic oficial, 68,6 rad/s; ×√(1/s)).
+- Ganancias de actitud del ejemplo oficial `mavic2pro.c` (alabeo 50, cabeceo 30, velocidad angular 1).
+- Los rotores simulados aceleran como mucho ~45 rad/s por segundo: el empuje común se limita a 20 rad/s² para dejar siempre margen a la corrección de actitud, y al seleccionar el dron se ponen al ralentí (60 rad/s) para que despegue enseguida.
+- Prueba sin interfaz: `Test.Script = "hover"` en `etc/config.toml` hace un vuelo programado (subir, avanzar, girar, lateral, bajar, aterrizar). Resultado: altura estable ±5 cm, avance a 0,76 m/s, aterrizaje y desarmado correctos.
+
+## Plataforma
+
+- 0,40 × 0,40 m, apoyada en la placa superior, centrada en (0, 0,15, 0,383) del Husky; cara superior a 0,395 m. `InspectionDeck.proto` es paramétrico (`size`, `markerSize`, `markerOffset`, `postHeight`).
+- Motivo: la plataforma alta anterior (0,70 m a 0,66 m) y el Mavic tapaban al LiDAR el suelo de delante entre 0,5 y 6 m. Medido: impactos en plataforma+dron 2989 → 641 por barrido; rayos bajos del sector frontal que pasan de 1 m: 25 % → 67 %, igual que el Husky sin plataforma.
+- ArUco `DICT_4X4_50`, ID 23; lado negro **0,17 m**; centro (0, 0,23, 0,396) respecto al Husky.
+- El dron no va anclado: pensado para conducir con cuidado o con el robot parado.
+
+## Pendiente
+
+- La pose del dron es la verdad del simulador. En el robot real habrá que estimarla (GPS/IMU del dron, el ArUco, o el cruce semántico de copas con los nodos `plant`).
+- El dron no evita obstáculos: vuela donde lo lleva el piloto.
 
 ## Procedencia
 
-Modelo y meshes derivados de:
-https://github.com/cyberbotics/webots/tree/R2025a/projects/robots/dji/mavic
-
-Se conserva la atribución y referencia a la licencia de activos Webots en `InspectionDrone.proto`. Los meshes están en `protos/Mavic2Pro/meshes`; la textura de hélice procede del mismo release de Webots. El marcador se genera determinísticamente con OpenCV y no contiene datos de percepción reales.
-
-## Verificación
-
-Se probó en Webots un escenario aislado con la plataforma y el dron: el encoder alcanza frontal e inferior, no existen dispositivos móviles de yaw/roll de cámara y OpenCV identifica el marcador 23 desde la imagen inferior renderizada. La elevación y fijación de pose de ese escenario son exclusivamente un mecanismo de prueba externo, no un controlador de vuelo incluido.
-
-También se verifica la carga del mundo completo con controladores temporales de prueba, sin arrancar RoboComp, y el apoyo del dron sobre el Husky. La sintaxis del lanzador se comprueba con `bash -n`. Estos ensayos no validan vuelo ni aterrizaje autónomo.
+Modelo y meshes derivados de https://github.com/cyberbotics/webots/tree/R2025a/projects/robots/dji/mavic. Se conserva la atribución y la referencia a la licencia de activos de Webots en `InspectionDrone.proto`. El marcador se genera de forma determinista con OpenCV.

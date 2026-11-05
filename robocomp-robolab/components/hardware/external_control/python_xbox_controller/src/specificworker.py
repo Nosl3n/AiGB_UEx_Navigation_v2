@@ -63,6 +63,15 @@ class SpecificWorker(GenericWorker):
             self.past_values = np.zeros(len(self.axes))
             self.stop_counter = 0
             self.old_button = np.zeros(len(self.buttons), dtype=int)
+
+            # Control target ("robot" / "drone"), selected by mode buttons and published as TData.id, so every
+            # subscriber knows whether a message is for it (webots-bridge drives the robot only when the id is
+            # not "drone"; drone_bridge flies only when it is). Optional: without ModeButtons the id stays
+            # "robot" and the robot behaves exactly as before.
+            #   joystickUniversal.ModeButtons = "drone:0, robot:1"   (Xbox: A = 0, B = 1)
+            self.mode_buttons = self.load_mode_buttons(configData)
+            self.target = "robot"
+            self.mode_pressed = {idx: False for idx in self.mode_buttons}
             self.timer.timeout.connect(self.compute)
             self.timer.start(self.Period)
 
@@ -112,16 +121,43 @@ class SpecificWorker(GenericWorker):
 
         return axes, buttons
 
+    @staticmethod
+    def load_mode_buttons(configData):
+        """joystickUniversal.ModeButtons = "target:button_index, ..." -> {button_index: target}."""
+        try:
+            spec = str(configData["joystickUniversal"]["ModeButtons"]).strip()
+        except (KeyError, TypeError):
+            return {}
+        modes = {}
+        for item in filter(None, (s.strip() for s in spec.split(","))):
+            target, index = (s.strip() for s in item.split(":"))
+            modes[int(index)] = target
+        return modes
+
+    def update_target(self):
+        """Rising edge of a mode button switches the control target. Returns True if it changed."""
+        changed = False
+        for idx, target in self.mode_buttons.items():
+            pressed = bool(self.joystick.get_button(idx))
+            if pressed and not self.mode_pressed[idx] and target != self.target:
+                self.target = target
+                changed = True
+                console.print(f"[bold]control -> {target}[/bold]")
+            self.mode_pressed[idx] = pressed
+        return changed
+
 
     @QtCore.Slot()
     def compute(self):
         # Handle events to keep pygame in sync with the system
         pygame.event.pump()
+        target_changed = self.update_target()
         # Get odometry values and button states from the joystick, following the config mapping
         odom_values = np.array([self.read_axis(a) for a in self.axes])
         button_values = np.array([self.read_button(b) for b in self.buttons])
         # if joystick values are all 0 and buttons unchanged for 5 times, slow down and return
-        if np.all(odom_values == 0) and np.array_equal(self.old_button, button_values) :
+        # (a change of control target is always published, so the new target hears about it at once)
+        if not target_changed and np.all(odom_values == 0) and np.array_equal(self.old_button, button_values) :
             self.stop_counter += 1
             if self.stop_counter > 4:
                 self.Period = 100
@@ -155,7 +191,8 @@ class SpecificWorker(GenericWorker):
         button_data = ifaces.RoboCompJoystickAdapter.ButtonsList(
             [ifaces.RoboCompJoystickAdapter.ButtonParams(name=b["name"], step=int(v))
              for b, v in zip(self.buttons, button_values)])
-        self.joystickadapter_proxy.sendData(ifaces.RoboCompJoystickAdapter.TData(axes=axis_data, buttons=button_data))
+        self.joystickadapter_proxy.sendData(
+            ifaces.RoboCompJoystickAdapter.TData(id=self.target, axes=axis_data, buttons=button_data))
 
     def startup_check(self):
         print(f"Testing RoboCompJoystickAdapter.AxisParams from ifaces.RoboCompJoystickAdapter")

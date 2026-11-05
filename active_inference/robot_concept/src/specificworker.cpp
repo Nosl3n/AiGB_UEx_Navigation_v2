@@ -265,6 +265,10 @@ void SpecificWorker::request_shutdown()
 	if (ricoh_thread.joinable())
 		ricoh_thread.join();
 
+	// The drone's nodes go with this agent (graceful exit only, like every owned node).
+	if (drone_link_)
+		drone_link_->stop();
+
 	// The measured camera mounts, while the graph is still up and readable. GRACEFUL ONLY, which is
 	// the whole contract: a kill -9 never reaches this and the overlay simply keeps its last version.
 	persist_mount_overlay();
@@ -650,6 +654,21 @@ void SpecificWorker::initialize()
 	if (params.ENABLE_IMU)   imu_thread   = std::thread(&SpecificWorker::read_imu_thread,   this);
 	if (params.ENABLE_RICOH) ricoh_thread = std::thread(&SpecificWorker::read_ricoh_thread, this);
 	qInfo() << __FUNCTION__ << "Started reader threads (enabled sensors only)";
+
+	// The inspection drone joins the body (body -> dron -> camera) only while its driver answers; without a
+	// drone nothing is created and this agent behaves exactly as before. See drone_link.h.
+	{
+		DroneLink::Config dcfg;
+		try { dcfg.parent_node = configLoader.get<std::string>("Drone.parent_node"); } catch (...) {}
+		try { dcfg.lost_ms = configLoader.get<int>("Drone.lost_ms"); } catch (...) {}
+		bool drone_enabled = true;
+		try { drone_enabled = configLoader.get<bool>("Drone.enabled"); } catch (...) {}
+		if (drone_enabled)
+		{
+			drone_link_ = std::make_unique<DroneLink>(G, mediaplanedds5_proxy, fullposeestimation_proxy, dcfg);
+			drone_link_->start();
+		}
+	}
 
 	presence_coordinator_.configure(configLoader, G, static_cast<std::uint32_t>(agent_id));
 	// Colour this agent's node in the graph view by its live health: the coordinator already
@@ -1811,6 +1830,16 @@ void SpecificWorker::open_stream_viewer(std::uint64_t node_id, const std::string
 		// border cell layers → 3D risk-column field, mirroring the retina residual display.
 		viewer = new rc::viewers::GridNodeViewer(G, node_id, "residual — belief field (graph)");
 	}
+
+	// Any other node that ADVERTISES an RGB stream on the media plane (e.g. the drone's `camera`,
+	// added at runtime by DroneLink) gets the image viewer: dispatch on what the descriptor says the
+	// node carries, not on a list of names, so a new camera needs no change here.
+	if (viewer == nullptr)
+		if (auto desc = rc::media::descriptor_from_graph(*G, node_name);
+		    desc.has_value() and desc->streams.contains("rgb"))
+			if (auto sub = rc::media::make_image_subscriber_from_graph(*G, node_name, "rgb"))
+				viewer = new rc::viewers::ImageStreamViewer(
+					std::move(sub), QString::fromStdString(node_name + " — RGB (media plane)"));
 
 	if (viewer == nullptr)
 	{

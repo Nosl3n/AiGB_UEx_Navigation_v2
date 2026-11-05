@@ -1385,12 +1385,14 @@ DEF APPLE_F2_R4_11 AppleTree {
 }
 # ---- APPLE_ROWS_F2 END ----
 
-# Independent physical drone, parked on carrier deck; body +X points along Husky +Y.
+# Independent physical drone, parked on the carrier deck; body +X points along Husky +Y.
 # Deck top: world z=0.445 (robot z 0.395); drone (scale 0.5) feet approx. 0.035 m below its origin.
 DEF INSPECTION_DRONE InspectionDrone {
   translation 0 -10.35 0.482
   scale 0.5
   rotation 0 0 1 1.57079632679
   name "inspection_drone"
-  controller "inspection_hardware"
+  # Driven by webots-drone-bridge (extern; supervisor for the ground-truth pose relative to the Husky).
+  controller "<extern>"
+  supervisor TRUE
 }

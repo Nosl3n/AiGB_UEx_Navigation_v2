@@ -249,6 +249,8 @@ int robot_concept::run(int argc, char* argv[])
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds_proxy2;
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds_proxy3;
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds_proxy4;
+	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds_proxy5;
+	RoboCompFullPoseEstimation::FullPoseEstimationPrxPtr fullposeestimation_proxy;
 
 
 	//Require code
@@ -272,6 +274,15 @@ int robot_concept::run(int argc, char* argv[])
 	                    configLoader.get<std::string>("Proxies.MediaPlaneDDS3"), "MediaPlaneDDSProxy3", mediaplanedds_proxy3);
 	require<RoboCompMediaPlaneDDS::MediaPlaneDDSPrx, RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr>(communicator(),
 	                    configLoader.get<std::string>("Proxies.MediaPlaneDDS4"), "MediaPlaneDDSProxy4", mediaplanedds_proxy4);
+	// The drone proxies are OPTIONAL in the config (robots without a drone never list them): fall back to
+	// drone_bridge's default ports, where nobody answers unless a drone is running — which is the
+	// "no drone" answer robot_concept wants anyway.
+	const auto proxy_or = [this](const char* key, const char* fallback) {
+		try { return configLoader.get<std::string>(key); } catch (...) { return std::string(fallback); } };
+	require<RoboCompMediaPlaneDDS::MediaPlaneDDSPrx, RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr>(communicator(),
+	                    proxy_or("Proxies.MediaPlaneDDS5", "mediaplanedds:tcp -h localhost -p 12110"), "MediaPlaneDDSProxy5", mediaplanedds_proxy5);
+	require<RoboCompFullPoseEstimation::FullPoseEstimationPrx, RoboCompFullPoseEstimation::FullPoseEstimationPrxPtr>(communicator(),
+	                    proxy_or("Proxies.FullPoseEstimation", "fullposeestimation:tcp -h localhost -p 12111"), "FullPoseEstimationProxy", fullposeestimation_proxy);
 
 	//Topic Manager code
 
@@ -292,7 +303,7 @@ int robot_concept::run(int argc, char* argv[])
 		return EXIT_FAILURE;
 	}
 
-	tprx = std::make_tuple(camera360rgb_proxy,camera360rgbd_proxy,camerargbdsimple_proxy,imu_proxy,lidar3d_proxy,mediaplanedds_proxy,mediaplanedds_proxy1,mediaplanedds_proxy2,mediaplanedds_proxy3,mediaplanedds_proxy4);
+	tprx = std::make_tuple(camera360rgb_proxy,camera360rgbd_proxy,camerargbdsimple_proxy,imu_proxy,lidar3d_proxy,mediaplanedds_proxy,mediaplanedds_proxy1,mediaplanedds_proxy2,mediaplanedds_proxy3,mediaplanedds_proxy4,mediaplanedds_proxy5,fullposeestimation_proxy);
 	SpecificWorker *worker = new SpecificWorker(this->configLoader, tprx, startup_check_flag);
 	QObject::connect(worker, SIGNAL(kill()), &a, SLOT(quit()));
 

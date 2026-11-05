@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hardware-only drone: parked, motors off; camera keys F=front / D=down.
+# Inspection drone: flown with the Xbox controller (A = drone, B = robot); camera -> DDS rc/drone/rgb (webots-drone-bridge).
 # apple_dron.bash — launch the whole Husky A300 stack in the TWO-FIELD orchard (webots-agri/worlds/dos_fields_dron.wbt).
 #
 #   ./apple_dron.bash            Webots + sensorimotor layer + cognitive layer, each launcher in its own terminal
@@ -57,7 +57,7 @@ if (( STOP )); then
     if pid=$(pgrep -f "^python3 subcognitive.py" | head -1); then
         say "stopping the sensorimotor layer (SIGINT to subcognitive.py $pid)"
         run kill -INT "$pid"
-        (( DRY )) || wait_gone "bin/(Webots2Robocomp|lidar3d_dds|imu_dds|zed_camera) " 40 \
+        (( DRY )) || wait_gone "bin/(Webots2Robocomp|drone_bridge|lidar3d_dds|imu_dds|zed_camera) " 40 \
             || say "some drivers are still running after 40 s"
     fi
     if pid=$(pgrep -x webots-bin | head -1); then
@@ -81,6 +81,7 @@ fi
 [[ -f "$WORLD" ]]  || { say "world not found: $WORLD"; exit 1; }
 missing=()
 for bin in webots-bridge/bin/Webots2Robocomp \
+           webots-drone-bridge/bin/drone_bridge \
            robocomp-robolab/components/hardware/laser/lidar3d_dds/bin/lidar3d_dds \
            robocomp-robolab/components/hardware/imu/imu_dds/bin/imu_dds \
            robocomp-robolab/components/hardware/camera/zed_camera/bin/zed_camera \
@@ -136,7 +137,7 @@ else
 fi
 
 say "2/3 sensorimotor layer (bridge, helios, IMU, ZED, joystick) — terminal 'Husky · sensorimotor'"
-open_terminal "Husky · sensorimotor" "cd '$UTILS' && python3 subcognitive.py sub_husky.toml"
+open_terminal "Husky · sensorimotor" "cd '$UTILS' && WEBOTS_WORLD='$WORLD' python3 subcognitive.py sub_husky.toml"
 (( DRY )) || sleep "$SUB_WAIT_S"
 
 say "3/3 cognitive layer (DSR agents) — terminal 'Husky · cognitive'"

@@ -356,6 +356,18 @@ def run_launcher(toml_path, launcher, layer, start_webots=False, start_rcnode=Fa
         raise SystemExit(1)
     data = toml.load(path)
     components = data["components"]
+    # Optional per-component condition: `when = "<shell command>"`. The component is launched only if the
+    # command exits 0 — e.g. drone_bridge runs only when the loaded world has a drone. The launchers export
+    # WEBOTS_WORLD (the .wbt they opened) for such checks.
+    kept = []
+    for c in components:
+        cond = c.get("when")
+        if cond and subprocess.run(cond, shell=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL).returncode != 0:
+            console.print(f"[dim]skipping {c.get('name', '?')}: condition not met ({cond})[/dim]")
+            continue
+        kept.append(c)
+    components = kept
     general = data.get("general", {})
     start_webots = general.get("start_webots", start_webots)
     start_rcnode = general.get("start_rcnode", start_rcnode)

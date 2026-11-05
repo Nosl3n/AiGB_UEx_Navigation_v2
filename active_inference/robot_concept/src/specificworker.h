@@ -43,6 +43,7 @@
 #include "../../common/agent_presence_coordinator/agent_presence_coordinator.h"
 #include "../../common/agent_state_publisher/agent_status_overlay.h"
 #include "sensor_media_publisher.h"
+#include "drone_link.h"
 
 /**
  * \brief Class SpecificWorker implements the core functionality of the component.
@@ -78,6 +79,7 @@ private:
 	bool startup_check_flag;
 	AgentPresenceCoordinator presence_coordinator_;
 	bool owned_nodes_cleaned_ = false;
+	std::unique_ptr<DroneLink> drone_link_;   // body -> dron -> camera, only while a drone answers
 
 	struct Params
 	{

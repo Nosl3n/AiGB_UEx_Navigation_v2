@@ -13,8 +13,21 @@
 [[components]]
 name = "bridge"
 cwd = "~/robocomp/AiGB_UEx_Navigation_v2/webots-bridge"
-cmd = "bin/Webots2Robocomp etc/config_husky"
+# WEBOTS_CONTROLLER_URL names the robot: with a drone in the world there are TWO extern controllers, and an
+# unnamed one cannot tell which robot it is meant to drive. "husky" is the Robot.name of HuskyA300/HuskyDroneCarrier.
+cmd = "env WEBOTS_CONTROLLER_URL=ipc://1234/husky bin/Webots2Robocomp etc/config_husky"
 ice_name = "Webots2Robocomp:tcp -h localhost -p 10006"
+
+# Inspection drone (webots-drone-bridge): camera -> DDS rc/drone/rgb, pose + media descriptor for robot_concept,
+# flown with the Xbox controller (A = drone, B = robot). Launched ONLY when the loaded world has a drone
+# (`when`, netmon/launcher.py; the apple_*.bash launchers export WEBOTS_WORLD). Without it robot_concept never
+# creates the dron/camera nodes and everything runs robot-only, as before.
+[[components]]
+name = "drone"
+cwd = "~/robocomp/AiGB_UEx_Navigation_v2/webots-drone-bridge"
+cmd = "env WEBOTS_CONTROLLER_URL=ipc://1234/inspection_drone bin/drone_bridge etc/config.toml"
+ice_name = "mediaplanedds:tcp -h localhost -p 12110"
+when = "test -n \"$WEBOTS_WORLD\" && grep -q 'InspectionDrone {' \"$WEBOTS_WORLD\""
 
 [[components]]
 name = "helios"

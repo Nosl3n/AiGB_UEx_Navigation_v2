@@ -16,6 +16,10 @@ MediaPlaneDDS1 = "mediaplanedds:tcp -h localhost -p 10099" # ricoh_omni_dds: que
 MediaPlaneDDS2 = "mediaplanedds:tcp -h localhost -p 11890" # lidar3d_dds helios: query its DDS media descriptor
 MediaPlaneDDS3 = "mediaplanedds:tcp -h localhost -p 11889" # lidar3d_dds bpearl: query its DDS media descriptor
 MediaPlaneDDS4 = "mediaplanedds:tcp -h localhost -p 11891" # imu_dds: query its DDS media descriptor
+# Inspection drone (webots-drone-bridge). Nobody answering = no drone: the dron/camera nodes are only created
+# while drone_bridge answers (src/drone_link.h). [Owns] subtrees = ["husky"] covers them on a crash.
+MediaPlaneDDS5 = "mediaplanedds:tcp -h localhost -p 12110"           # drone camera descriptor -> `camera` node
+FullPoseEstimation = "fullposeestimation:tcp -h localhost -p 12111"  # body->dron and dron->camera poses
 
 [Endpoints]
 # Endpoints for subscriptions interfaces

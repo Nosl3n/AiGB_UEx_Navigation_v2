@@ -1,0 +1,79 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english,spanish]{babel}
+\usepackage{microtype,helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage[a4paper,top=20mm,bottom=20mm,left=22mm,right=22mm]{geometry}
+\usepackage{graphicx,tabularx,array,booktabs,xcolor,hyperref,fancyhdr,lastpage,titlesec}
+\definecolor{aigblue}{HTML}{365F91}
+\definecolor{aiggreen}{HTML}{49A45B}
+\definecolor{aigteal}{HTML}{31849B}
+\hypersetup{colorlinks=true,linkcolor=aigblue,citecolor=aigblue,urlcolor=aigblue,pdftitle={Informe técnico — Robótica agrícola AiGreenBots}}
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\color{aigteal}\small\bfseries AiGreenBots --- Informe técnico de navegación agrícola}
+\fancyfoot[C]{\fontsize{8}{10}\selectfont Página \thepage\ de \pageref{LastPage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\titleformat{\section}{\large\bfseries\color{aigblue}}{\thesection.}{0.5em}{}[\color{aigblue}\titlerule]
+\setlength{\parindent}{0pt}\setlength{\parskip}{0.55\baselineskip}
+\graphicspath{{figures/}{../images/}}
+\title{\color{aigblue}Navegación, percepción y mapeo semántico\ en un huerto de manzanos}
+\author{Nelson Broyer Paco \\ AiGreenBots --- Universidad de Extremadura}
+\date{Borrador técnico — \today}
+\begin{document}
+\maketitle
+\begin{abstract}
+Este informe documenta el procedimiento experimental y la arquitectura de un sistema de robótica agrícola desarrollado sobre un Husky A300 en Webots. El sistema integra sensores LiDAR, cámara estéreo, IMU y GNSS con agentes RoboComp/DSR para estimar la pose, percibir plantas y personas, construir filas y navegar por pasillos de un huerto. Se describen la simulación, la cadena de procesamiento, los procedimientos de ejecución y evaluación, así como las limitaciones conocidas. Los resultados cuantitativos se incorporarán cuando se completen las campañas de validación reproducibles.
+\end{abstract}
+\tableofcontents
+\listoffigures
+\listoftables
+\section{Introducción}
+La operación autónoma en huertos combina estructura repetitiva y condiciones variables: filas de árboles, copas que ocultan sensores, suelo irregular, cambios de iluminación y obstáculos dinámicos. El proyecto estudia una arquitectura cognitiva distribuida que transforma medidas heterogéneas en una representación semántica compartida y utiliza esa representación para navegación e inspección.
+
+El prototipo actual emplea un Husky A300 simulado en Webots. Los componentes se organizan en RoboComp y mantienen conceptos del entorno en un grafo DSR. El repositorio describe localización mediante GNSS, IMU y ruedas, percepción con ZED y LiDAR, y navegación autónoma por corredores. Este documento separa el comportamiento implementado de las extensiones aún propuestas.
+\section{Objetivos y alcance}
+El objetivo técnico es establecer una plataforma reproducible para estudiar navegación agrícola y percepción semántica en hileras de manzanos. Las preguntas experimentales son: (i) cómo estimar la pose bajo degradación de GNSS; (ii) cómo construir y utilizar representaciones de plantas y filas; (iii) cómo navegar de forma segura con terreno, oclusión y obstáculos; y (iv) cómo evaluar la transferencia desde simulación a datos de campo.
+
+El informe se limita al repositorio AiGB UEx Navigation v2 y a los procedimientos respaldados por su documentación y código. La detección de frutos, malezas, enfermedades, el mapeo persistente y la cooperación aérea se consideran trabajo futuro salvo que una sección futura aporte evidencia de implementación.
+\section{Plataforma experimental}
+\subsection{Robot y sensores}
+La plataforma simula un Husky A300 de tracción skid-steer. La configuración documentada incluye LiDAR 3D Helios, cámara estéreo ZED, IMU, GNSS y odometría de ruedas. El puente Webots--RoboComp publica datos de sensores y base; los drivers de la capa sensorimotora los hacen disponibles a los agentes cognitivos.
+\subsection{Entorno agrícola}
+Los mundos de Webots incluyen manzanos procedurales, filas, terreno labrado y pasillos. El generador permite reproducir instancias mediante semillas y variar dimensiones y perfiles de árbol. Se deben registrar el mundo, semilla, parámetros de cultivo y configuración de sensores en cada experimento.
+\subsection{Arquitectura software}
+\begin{table}[h]
+\centering\begin{tabularx}{\textwidth}{lX}\toprule
+Componente & Función documentada \\\midrule
+\texttt{webots-bridge} & Interfaz entre mundo simulado, base y sensores. \\
+\texttt{robot\_concept} & Representación del robot y sus sensores en DSR. \\
+\texttt{openfield\_concept} & Estimación de pose con GNSS, IMU y ruedas. \\
+\texttt{retina} & Procesamiento visual y publicación de resultados semánticos. \\
+\texttt{plant\_concept} & Representación de plantas y sus partes percibidas. \\
+\texttt{row\_metaconcept} & Inferencia y publicación de agrupaciones en filas. \\
+\texttt{residual\_concept} & Representación de evidencia ambiental no explicada por otros conceptos. \\
+\texttt{controller} & Planificación y control de la base móvil. \\
+\bottomrule\end{tabularx}\caption{Agentes principales; verificar la configuración de lanzamiento usada en cada experimento.}\end{table}
+El grafo DSR permite que los agentes publiquen conceptos con posición y relaciones. Las transformaciones espaciales y las relaciones semánticas de pertenencia tienen funciones diferentes y deben conservar marcos, unidades y propietarios coherentes.
+\section{Procedimiento experimental}
+\subsection{Preparación y configuración}
+Para cada campaña se registra: versión o commit del repositorio; versión de Webots; mundo utilizado; parámetros del robot y sensores; semillas del generador; configuración de agentes; y condición GNSS. Antes de ejecutar, se compilan los componentes requeridos y se verifica que los modelos de percepción estén disponibles. Los comandos concretos se mantienen en los scripts del repositorio y deben citarse aquí tras fijar la configuración experimental.
+\subsection{Inicio de la simulación}
+Se abre el mundo agrícola seleccionado y se inicia la capa sensorimotora para conectar Webots con RoboComp. Una vez que los sensores publican datos, se inicia la capa cognitiva con los agentes seleccionados. Se confirma en los registros que el Husky, su pose y los agentes requeridos aparecen en el grafo antes de habilitar movimiento.
+\subsection{Localización y navegación}
+El estimador combina predicción de movimiento con medidas GNSS y orientación inercial, según la configuración activa. El controlador recibe objetivos en el marco de navegación y genera órdenes para recorrer los corredores. Cada ensayo debe registrar trayectoria, pose estimada, incertidumbre, medidas GNSS y eventos de planificación; la verdad de Webots se usa únicamente como referencia de evaluación.
+\subsection{Percepción y construcción de filas}
+La cámara proporciona observaciones semánticas y el LiDAR aporta geometría y confirmación de partes estructurales cuando está habilitada. Las detecciones se asocian con individuos de planta; el metaconcepto de filas agrupa individuos según la geometría observada. Para evaluar la estabilidad, se comparan posiciones y asociaciones entre pasadas, conservando los timestamps y marcos de sensor y mundo.
+\subsection{Protocolo de evaluación}
+Los ensayos comparan condiciones de referencia y perturbadas, manteniendo fijo el mundo y las semillas cuando corresponda. Se reportan error de pose longitudinal, lateral y angular; éxito de llegada; fallos de navegación; asociaciones de plantas y filas; cobertura recorrida; tiempo y frecuencia efectiva del ciclo. Cada métrica debe especificar unidad, conjunto de ensayos y método de cálculo. No se presentan cifras sin registros reproducibles.
+\section{Resultados disponibles y problemas abiertos}
+El README del repositorio declara que la localización, el mapeo de troncos, el seguimiento de personas y la navegación funcionan en simulación. También documenta un problema de obstáculos fantasma en terreno irregular, asociado a la proyección plana de LiDAR y a la hipótesis de suelo z=0, y señala como trabajo pendiente el mapa persistente y la localización cuando falla GNSS. Estos puntos deben validarse con experimentos repetibles antes de formular conclusiones generales.
+
+No se atribuyen aquí resultados de campo ni prestaciones de diagnóstico de frutos, malezas o plagas: requieren protocolos y datos específicos.
+\section{Limitaciones y trabajo futuro}
+Las principales líneas pendientes son modelar inclinación del robot y elevación local del terreno, evaluar degradación GNSS, estabilizar asociaciones en filas repetitivas, persistir mapas de referencia, y validar percepción bajo cambios estacionales y de iluminación. La futura inspección aérea deberá aportar imágenes sincronizadas con pose y calibración de cámara; su inclusión no se considera resultado de este procedimiento hasta tener experimentos documentados.
+\section{Reproducibilidad y disponibilidad}
+El código, mundos de Webots, scripts y configuraciones se encuentran en el repositorio del proyecto: \url{https://github.com/Nosl3n/AiGB_UEx_Navigation_v2}. Los pesos de modelos y conjuntos de datos externos pueden requerir descarga y licencias independientes. Para reproducir resultados se debe indicar commit, configuración, semillas y versiones de dependencias.
+\section{Conclusiones}
+El repositorio proporciona una base simulada para estudiar navegación cognitiva en huertos de manzanos mediante fusión de sensores y conceptos distribuidos. El procedimiento descrito organiza la ejecución y evaluación de forma reproducible, y distingue el estado documentado de las extensiones en desarrollo. La validación cuantitativa y en campo será necesaria para determinar robustez y generalización.
+\end{document}

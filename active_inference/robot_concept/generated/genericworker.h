@@ -47,7 +47,7 @@
 
 #define BASIC_PERIOD 100
 
-using TuplePrx = std::tuple<RoboCompCamera360RGB::Camera360RGBPrxPtr,RoboCompCamera360RGBD::Camera360RGBDPrxPtr,RoboCompCameraRGBDSimple::CameraRGBDSimplePrxPtr,RoboCompIMU::IMUPrxPtr,RoboCompLidar3D::Lidar3DPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr>;
+using TuplePrx = std::tuple<RoboCompCamera360RGB::Camera360RGBPrxPtr,RoboCompCamera360RGBD::Camera360RGBDPrxPtr,RoboCompCameraRGBDSimple::CameraRGBDSimplePrxPtr,RoboCompIMU::IMUPrxPtr,RoboCompLidar3D::Lidar3DPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr,RoboCompFullPoseEstimation::FullPoseEstimationPrxPtr>;
 
 
 class GenericWorker : public QObject
@@ -76,6 +76,9 @@ public:
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds2_proxy;
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds3_proxy;
 	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds4_proxy;
+	// Hand-added 2026-11-04 (robot_concept.cdsl lists them too): the inspection drone's drone_bridge.
+	RoboCompMediaPlaneDDS::MediaPlaneDDSPrxPtr mediaplanedds5_proxy;          // drone camera descriptor
+	RoboCompFullPoseEstimation::FullPoseEstimationPrxPtr fullposeestimation_proxy;   // drone + camera pose
 
 	virtual void FullPoseEstimationPub_newFullPose (RoboCompFullPoseEstimation::FullPoseEuler pose) = 0;
 
